@@ -28,6 +28,29 @@ QUIET=0
 WITH_EXAMPLES=1
 WITH_GIT=0
 BACKEND=local
+BACKEND_EXPLICIT=0
+
+# Where NSX credentials come from at run time. GitLab is the default because
+# masked and protected CI/CD variables give the same read/write split the Vault
+# design was buying, with nothing extra to run: plan credentials are readable by
+# every branch, apply credentials only by protected ones. Vault is the stronger
+# production answer and is one flag away. It is not the floor.
+CREDS=gitlab # gitlab | vault | vcf | env | file
+CREDS_EXPLICIT=0
+
+# How an s3 backend takes its lock. 'native' is Terraform 1.10's lockfile,
+# 'dynamodb' the long-standing table. Only meaningful when BACKEND=s3.
+LOCK=dynamodb # dynamodb | native
+
+# Which tiers this tree serves. A manager whose tier is outside this set fails
+# validation offline, before the typo can write state into a new namespace.
+ENVS="prod,preprod,nonprod,lab"
+
+# lab — one command to a green pipeline: GitLab in Docker, its own CI variables
+#       for credentials, its own Terraform state, nothing external.
+# byo — bring your own everything. The historical behaviour, and the default,
+#       so no existing scripted invocation changes meaning.
+PROFILE=byo
 
 # Overwriting takes a flag AND this phrase, typed in full. See confirm_overwrite.
 CONFIRM_PHRASE="wipe everything & start fresh"
@@ -74,6 +97,54 @@ it teaches the flags below. Any flag on the command line means a script is
 driving, so the menu stays out of the way.
 
 Options:
+      --profile KIND  A set of defaults, not an override: any explicit flag
+                      still wins over what the profile would have chosen.
+
+                        byo   bring your own git host, secret store and state
+                              backend. The historical behaviour.   [default]
+                        lab   GitLab in Docker, credentials in its CI/CD
+                              variables, state in its Terraform state API.
+                              One command to a green pipeline, nothing
+                              external to stand up first. Runs
+                              scripts/one-touch.sh after generating.
+
+      --creds SOURCE  Where the pipeline gets NSX credentials at run time.
+
+                        gitlab  masked GitLab CI/CD variables.       [default]
+                                Plan credentials are readable by every branch;
+                                apply credentials are marked PROTECTED, so a
+                                feature branch cannot reach the account that
+                                can write to the firewall. Same read/write
+                                split Vault gives, with nothing extra to run.
+                        vault   the vault_path recorded per manager in
+                                inventory/managers.yaml. The stronger answer
+                                for production, and worth moving to; it needs
+                                a Vault you run and keep running.
+                        vcf     ask SDDC Manager for the current credentials.
+                        env     already exported as NSXT_USERNAME and
+                                NSXT_PASSWORD. For local work.
+                        file    .credentials/<site>.env, mode 0600 and
+                                gitignored. Refused for a prod-tier manager.
+
+                      Per manager, 'creds_source' in the inventory overrides
+                      this; the flag only sets the default written there.
+      --lock METHOD   How an s3 backend takes its state lock. Ignored for
+                      every other backend.
+
+                        dynamodb  a DynamoDB table (dynamodb_table). [default]
+                        native    Terraform's own S3 lockfile (use_lockfile).
+                                  Needs Terraform >= 1.10, so choosing it
+                                  raises required_version in the stacks.
+      --envs LIST     Comma-separated tiers this tree serves, out of prod,
+                      preprod, nonprod and lab. Default: all four. A manager
+                      whose tier is outside the list fails 'make validate'
+                      offline, before the typo can write state into a
+                      namespace nobody is watching.
+
+                      The tier is the environment boundary: it is part of the
+                      state address, so prod and nonprod cannot share state,
+                      and prod apply jobs are always manual regardless of
+                      NSX_APPLY_MODE.
       --vcs KIND      Where these files live and how changes are reviewed.
                       GitLab is the default: it is the only host this script can
                       set up end to end rather than leaving files to wire up.
@@ -147,16 +218,20 @@ months editing.
 
                         http     GitLab-managed Terraform state  [gitlab]
                                  Locking, encryption at rest and versioning
-                                 come from GitLab. Credentials come from
-                                 TF_HTTP_USERNAME and TF_HTTP_PASSWORD, never
-                                 from a committed file.
+                                 come from GitLab, with no object store to run.
+                                 The default whenever there is a GitLab to use,
+                                 and what --profile lab picks. Credentials come
+                                 from TF_HTTP_USERNAME and TF_HTTP_PASSWORD,
+                                 never from a committed file.
                         s3       S3 or an S3-compatible store  [minio, ceph]
-                                 Needs DynamoDB or native locking configured.
+                                 Locking per --lock. deploy/state/aws creates
+                                 the bucket and the lock table for you.
                         azurerm  Azure blob storage  [azure]
+                        gcs      Google Cloud Storage  [google, gs]
                         local    Filesystem on this server  [file, filesystem]
-                                 NO LOCKING. The default, and the placeholder:
-                                 it exists so the stacks initialise for offline
-                                 validation.
+                                 NO LOCKING. The placeholder: it exists so the
+                                 stacks initialise for offline validation, and
+                                 scripts/tf.sh refuses to apply through it.
 
                       Whatever you choose, state carries the full security
                       posture of the estate. It never goes in a git repository:
@@ -360,14 +435,63 @@ wizard_vcs() {
 	esac
 }
 
+# Only asked in advanced mode. The default is right for almost everyone, and
+# the interesting choice — Vault instead of GitLab — is one people arrive at
+# deliberately rather than by being asked at the wrong moment.
+wizard_creds() {
+	local choice
+	choice="$(ask_menu 1 "Where does the pipeline get NSX credentials?" \
+		"GitLab CI/CD variables — masked; apply credentials protected  (recommended)" \
+		"HashiCorp Vault — a Vault you run, path recorded per manager" \
+		"SDDC Manager — ask VCF for the current credentials each run" \
+		"Environment — already exported as NSXT_USERNAME / NSXT_PASSWORD")"
+	case "$choice" in
+	1)
+		CREDS=gitlab
+		CREDS_EXPLICIT=1
+		say ""
+		say "  Two accounts, not one. A read-only account for plan, readable by"
+		say "  every branch; an account that can write, in PROTECTED variables"
+		say "  only a protected branch can read. That split is the security"
+		say "  property — one account in both places quietly removes it."
+		;;
+	2)
+		CREDS=vault
+		CREDS_EXPLICIT=1
+		say ""
+		say "  Each manager records a vault_path — the path, never the secret."
+		say "  The pipeline needs VAULT_ADDR, a read-only VAULT_PLAN_TOKEN and a"
+		say "  protected VAULT_APPLY_TOKEN."
+		say ""
+		say "  No Vault yet?  scripts/vault-up.sh runs one in Docker and seeds it."
+		say "  That is a lab Vault: in memory, unsealed, gone on restart."
+		;;
+	3)
+		CREDS=vcf
+		CREDS_EXPLICIT=1
+		say ""
+		say "  Needs SDDC_MANAGER_HOST, SDDC_USERNAME and SDDC_PASSWORD in the"
+		say "  pipeline. Credentials follow VCF rotation, which is the appeal."
+		;;
+	4)
+		CREDS=env
+		CREDS_EXPLICIT=1
+		say ""
+		say "  Nothing is stored and nothing is fetched. Whatever runs the"
+		say "  pipeline has to put the credentials in the environment itself."
+		;;
+	esac
+}
+
 wizard_backend() {
 	local choice
 	choice="$(ask_menu 1 "State backend — where Terraform keeps its state." \
-		"GitLab-managed state  (locking, encryption and history from GitLab)" \
+		"GitLab-managed state  (locking, encryption and history from GitLab)  (recommended)" \
 		"S3 or S3-compatible   (MinIO, Ceph; needs locking configured)" \
 		"Azure blob storage" \
 		"Filesystem on this server   NO LOCKING — lab only" \
 		"Decide later   (placeholder; apply is blocked until you choose)")"
+	BACKEND_EXPLICIT=1
 	case "$choice" in
 	1) BACKEND=http ;;
 	2) BACKEND=s3 ;;
@@ -409,6 +533,8 @@ wizard_summary_and_go() {
 	none) cmd="$cmd --vcs none" ;;
 	esac
 	cmd="$cmd --ci $CI_PLATFORM"
+	[ "$CREDS" != gitlab ] && cmd="$cmd --creds $CREDS"
+	[ "$BACKEND" = s3 ] && [ "$LOCK" != dynamodb ] && cmd="$cmd --lock $LOCK"
 	[ "$WITH_EXAMPLES" = 0 ] && cmd="$cmd --no-examples"
 	[ "$WITH_GIT" = 1 ] && cmd="$cmd --git-init"
 	[ "$FORCE_DATA" = 1 ] && cmd="$cmd --force-data"
@@ -441,8 +567,18 @@ wizard_summary_and_go() {
 	none) ci_label="none — manual make plan / make apply" ;;
 	esac
 
+	local creds_label
+	case "$CREDS" in
+	gitlab) creds_label="GitLab CI/CD variables — apply credentials protected" ;;
+	vault) creds_label="Vault — vault_path per manager" ;;
+	vcf) creds_label="SDDC Manager" ;;
+	env) creds_label="the environment — NSXT_USERNAME / NSXT_PASSWORD" ;;
+	file) creds_label=".credentials/<site>.env — local use only" ;;
+	esac
+
 	say "  version control  : $vcs_label"
 	say "  review pipeline  : $ci_label"
+	say "  credentials      : $creds_label"
 	say "  state backend    : $backend_label"
 	say "  example data     : $([ "$WITH_EXAMPLES" = 1 ] && echo 'yes' || echo 'no')"
 	say "  git init         : $([ "$WITH_GIT" = 1 ] && echo 'yes' || echo 'no')"
@@ -478,6 +614,7 @@ wizard_advanced() {
 	say "Advanced — every option."
 	ROOT="$(ask "Directory to create the repository in" "$ROOT")"
 	wizard_vcs
+	wizard_creds
 	wizard_backend
 
 	if ask_yes_no "Include worked example data? (4 managers, 10 groups, 4 policy files)" y; then
@@ -649,10 +786,50 @@ while [ $# -gt 0 ]; do
 	--backend)
 		[ $# -ge 2 ] || die "--backend requires a type"
 		BACKEND="$2"
+		BACKEND_EXPLICIT=1
 		shift 2
 		;;
 	--backend=*)
 		BACKEND="${1#*=}"
+		BACKEND_EXPLICIT=1
+		shift
+		;;
+	--creds)
+		[ $# -ge 2 ] || die "--creds requires a source"
+		CREDS="$2"
+		CREDS_EXPLICIT=1
+		shift 2
+		;;
+	--creds=*)
+		CREDS="${1#*=}"
+		CREDS_EXPLICIT=1
+		shift
+		;;
+	--lock)
+		[ $# -ge 2 ] || die "--lock requires a method"
+		LOCK="$2"
+		shift 2
+		;;
+	--lock=*)
+		LOCK="${1#*=}"
+		shift
+		;;
+	--envs)
+		[ $# -ge 2 ] || die "--envs requires a comma-separated list of tiers"
+		ENVS="$2"
+		shift 2
+		;;
+	--envs=*)
+		ENVS="${1#*=}"
+		shift
+		;;
+	--profile)
+		[ $# -ge 2 ] || die "--profile requires lab or byo"
+		PROFILE="$2"
+		shift 2
+		;;
+	--profile=*)
+		PROFILE="${1#*=}"
 		shift
 		;;
 	--ci)
@@ -779,6 +956,26 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
+PROFILE="$(printf '%s' "$PROFILE" | tr '[:upper:]' '[:lower:]')"
+case "$PROFILE" in
+lab | demo | sandbox) PROFILE=lab ;;
+byo | bring-your-own | none | "") PROFILE=byo ;;
+*) die "unknown --profile: $PROFILE
+       Expected one of:
+         lab  GitLab in Docker, its own CI variables for credentials, its own
+              Terraform state. One command to a green pipeline, nothing external.
+         byo  bring your own git host, secret store and state backend (default)" ;;
+esac
+
+# The lab profile is a set of defaults, not an override: an explicit flag still
+# wins, so '--profile lab --backend azurerm' means what it says.
+if [ "$PROFILE" = lab ]; then
+	[ "$VCS" = ask ] && VCS=gitlab-docker
+	[ "$BACKEND_EXPLICIT" = 0 ] && BACKEND=http
+	[ "$CREDS_EXPLICIT" = 0 ] && CREDS=gitlab
+	WITH_GIT=1
+fi
+
 VCS="$(printf '%s' "$VCS" | tr '[:upper:]' '[:lower:]')"
 case "$VCS" in
 docker | local-gitlab | gitlab-local) VCS=gitlab-docker ;;
@@ -856,6 +1053,18 @@ elif [ "$ARGC" -eq 0 ] && [ "$NO_INTERACTIVE" = 0 ] && can_prompt; then
 	run_wizard
 fi
 
+# A GitLab means a state backend is already available: GitLab-managed Terraform
+# state gives locking, encryption at rest and history with nothing to stand up.
+# Defaulting to the local placeholder instead would leave every such tree one
+# forgotten step away from applying through an unlocked backend.
+#
+# Only a default. An explicit --backend, or an answer in the wizard, still wins.
+if [ "$BACKEND_EXPLICIT" = 0 ]; then
+	case "$VCS" in
+	gitlab | gitlab-docker) BACKEND=http ;;
+	esac
+fi
+
 # The Terraform backend type is what goes in backend.tf, but nobody thinks in
 # those terms — GitLab-managed state is the 'http' backend, and MinIO and Ceph
 # are the 's3' one. Accept what a person would actually type.
@@ -865,10 +1074,11 @@ gitlab | gitlab-managed | tfstate-http) BACKEND=http ;;
 file | filesystem | disk | server) BACKEND=local ;;
 minio | ceph) BACKEND=s3 ;;
 azure | blob) BACKEND=azurerm ;;
+google | gs | gcp) BACKEND=gcs ;;
 esac
 
 case "$BACKEND" in
-local | http | s3 | azurerm) ;;
+local | http | s3 | azurerm | gcs) ;;
 git | github | repo)
 	die "state does not belong in a git repository: it is plaintext, git history is
        permanent, and git has no locking, so two runs diverge silently. For
@@ -877,11 +1087,65 @@ git | github | repo)
 	;;
 *)
 	die "unknown backend: $BACKEND
-       Valid types: local, http, s3, azurerm
+       Valid types: local, http, s3, azurerm, gcs
        Also accepted: gitlab (=http), minio/ceph (=s3), azure (=azurerm),
-                      file/filesystem/disk/server (=local)"
+                      google/gs (=gcs), file/filesystem/disk/server (=local)"
 	;;
 esac
+
+CREDS="$(printf '%s' "$CREDS" | tr '[:upper:]' '[:lower:]')"
+case "$CREDS" in
+ci | ci-variables | gitlab-ci) CREDS=gitlab ;;
+hashicorp-vault) CREDS=vault ;;
+sddc | sddc-manager) CREDS=vcf ;;
+environment) CREDS=env ;;
+esac
+case "$CREDS" in
+gitlab | vault | vcf | env | file) ;;
+*)
+	die "unknown --creds: $CREDS
+       Where the pipeline gets NSX credentials at run time:
+         gitlab  masked GitLab CI/CD variables; apply credentials PROTECTED
+                 so only protected branches can reach them.      [default]
+         vault   read the vault_path recorded per manager in the inventory
+         vcf     ask SDDC Manager for the current NSX credentials
+         env     already exported as NSXT_USERNAME / NSXT_PASSWORD
+         file    .credentials/<site>.env, mode 0600, gitignored. Local use."
+	;;
+esac
+
+LOCK="$(printf '%s' "$LOCK" | tr '[:upper:]' '[:lower:]')"
+case "$LOCK" in
+lockfile | use-lockfile | s3) LOCK=native ;;
+ddb | table) LOCK=dynamodb ;;
+esac
+case "$LOCK" in
+dynamodb | native) ;;
+*) die "unknown --lock: $LOCK (expected dynamodb or native)" ;;
+esac
+
+# Every tier named must be one the schema knows, or the generated inventory
+# cannot validate against it — a mismatch here would surface as a confusing
+# schema error much later.
+ENVS="$(printf '%s' "$ENVS" | tr '[:upper:] ' '[:lower:],' | tr -s ',')"
+ENVS="${ENVS#,}"
+ENVS="${ENVS%,}"
+[ -n "$ENVS" ] || die "--envs cannot be empty"
+_saved_ifs="$IFS"
+IFS=,
+for _tier in $ENVS; do
+	case "$_tier" in
+	prod | preprod | nonprod | lab) ;;
+	uat)
+		die "--envs: 'uat' is spelled 'preprod' in this inventory's vocabulary.
+       The tiers are prod, preprod, nonprod and lab, and they are what
+       data/schema/managers.schema.json accepts. Use preprod."
+		;;
+	*) die "--envs: unknown tier '$_tier' (expected prod, preprod, nonprod or lab)" ;;
+	esac
+done
+IFS="$_saved_ifs"
+unset _saved_ifs _tier
 
 if [ ! -d "$ROOT" ]; then
 	if [ "$DRY_RUN" = 1 ]; then
@@ -915,6 +1179,11 @@ is_estate_data() {
 	case "$1" in
 	data/schema/*.json) return 1 ;; # regenerated: the schemas are this script's
 	data/schema/tag-scopes.yaml) return 0 ;;
+	# Generator settings that happen to live under envs/, not estate data. A
+	# re-run with --force must be able to change the tree's own configuration;
+	# treating these as estate would mean --creds or --envs silently did nothing.
+	envs/tree.env | envs/gitlab-state.env) return 1 ;;
+	envs/*.backend.hcl.example) return 1 ;;
 	data/* | inventory/* | envs/*) return 0 ;;
 	*) return 1 ;;
 	esac
@@ -1144,6 +1413,14 @@ override.tf.json
 # Placeholder local backend output. Never a real manager's state.
 .local-state/
 
+# Credentials for 'with-credentials.sh --from file'. Plaintext passwords on a
+# workstation: the script refuses to read them unless this line is here and the
+# file is mode 0600, because git history is permanent and cannot be pruned.
+.credentials/
+
+# Progress marker for scripts/one-touch.sh. Local to this machine's run.
+.one-touch-state
+
 # Drift reports and raw estate dumps. A plan reveals the security posture of
 # the estate; it is not a review attachment.
 reports/
@@ -1237,6 +1514,14 @@ import: ## Adopt an existing estate: SITE=<site> [DUMP=<file>]
 .PHONY: drift
 drift: ## Report drift for STACK at SITE. Reports only — never reverts, never writes data/.
 	@scripts/with-credentials.sh "$(SITE)" -- scripts/drift.sh "$(STACK)" "$(SITE)"
+
+.PHONY: unlock
+unlock: ## Break a stuck state lock. STACK= SITE= LOCK_ID=. Asks you to confirm.
+	@test -n "$(LOCK_ID)" || { \
+		echo "LOCK_ID is required. It is in the error from the run that was refused:"; \
+		echo "  make unlock STACK=local-security SITE=lon1 LOCK_ID=1234-5678"; \
+		exit 1; }
+	@scripts/tf.sh unlock "$(STACK)" "$(SITE)" "$(LOCK_ID)"
 
 .PHONY: init
 init: ## terraform init for STACK against SITE
@@ -1625,28 +1910,42 @@ order that keeps a mistake cheap. **Nothing below has been done yet.** Until
 someone works through it, this repository is a well-tested scaffold, not a
 deployment.
 
-## First, about "single click"
+## First, about "one command"
 
-It cannot be one click, and the honest reason is worth stating before anyone
-promises it to a team.
+One command to a running pipeline is real, and it is this:
 
-A single command can create a repository, push it, configure a pipeline and
-protect a branch. It cannot decide which state backend your organisation will
-support, obtain a Vault path and a token, know which NSX manager is safe to
-point at first, or accept the risk of the first apply. Those are decisions and
-credentials, not steps.
+```bash
+scripts/bootstrap.sh --profile lab
+```
 
-What *is* achievable, and what to aim for:
+That writes the tree, starts GitLab and a runner in Docker, creates the project,
+pushes, sets the CI/CD variables, records the state address, initialises the
+stacks and waits until the pipeline goes green. If a stage fails it says which
+one and how to resume. Nothing external has to exist first.
 
-- **One command to a reviewable pipeline.** `scripts/bootstrap.sh` with the
-  GitLab flags creates the project, pushes, sets the variables and protects the
-  branch. Reachable today; unproven until stage 2 below.
-- **One merge request to a firewall change.** Edit a file, get a plan, approve,
-  merge, apply. That is the actual product.
+This used to be untrue, and the reason is worth remembering, because it is the
+shape of the mistake to avoid making again. The default credential path was
+Vault — a thing you must run, seal, unseal and hold tokens for — and nothing
+stood one up. So "one command" ended at a question nobody could answer without
+leaving the repository. The fix was not to automate Vault. It was to notice that
+GitLab, already required and already installed, has masked and protected
+variables that give the same read/write split, and to make that the default.
 
-Say "one command to get started, one merge request per change". Do not say
-"single click" — the first person to hit the Vault question will stop trusting
-everything else you said.
+**What one command still does not do**, and no amount of scripting will:
+
+- decide which state backend your organisation will support in production
+- know which NSX manager is safe to point at first
+- give you real NSX credentials
+- accept the risk of the first apply
+
+Those are decisions and secrets, not steps. `--profile lab` gets you everything
+up to them: a pipeline that runs, state that locks, and plan jobs waiting for
+credentials you supply deliberately.
+
+So: **one command to a running pipeline, one merge request per change.** Both
+are true. Do not say "zero touch" — the person who has to produce a service
+account with write access to a production firewall will know better, and will
+stop trusting the rest of what you said.
 
 ---
 
@@ -1670,11 +1969,16 @@ Cost: minutes. Do this on every change to the generator, and in CI.
 Prove the pipeline definition is one GitLab accepts, before it matters.
 
 ```bash
-scripts/gitlab-up.sh                    # local GitLab in Docker, ~4 GB RAM
+scripts/one-touch.sh                    # local GitLab in Docker, ~4 GB RAM
 # or point at a sandbox project on a GitLab you already have:
 scripts/gitlab-setup.sh --url https://gitlab.example.com \
                         --token glpat-xxxx --project sandbox/nsx-test
 ```
+
+`one-touch.sh` does everything in the list below except judge the result, and
+it lints `.gitlab-ci.yml` through GitLab's own API before waiting on a pipeline
+— so points 2 and 3 are already covered when it exits 0. Work through the rest
+by eye; `scripts/one-touch.sh --status` says which stages have run.
 
 **Prove, in order:**
 
@@ -1687,7 +1991,11 @@ scripts/gitlab-setup.sh --url https://gitlab.example.com \
 4. The `matrix` job produces a child pipeline and the `managers` job triggers it.
    Plan jobs will **fail** here — there are no credentials yet. That is expected;
    what you are proving is that the jobs exist and are named per manager.
-5. The default branch is protected and `VAULT_APPLY_TOKEN` is marked protected.
+5. The default branch is protected, and the write credential is marked
+   protected — `NSX_APPLY_USERNAME` and `NSX_APPLY_PASSWORD`, or
+   `VAULT_APPLY_TOKEN` if this tree uses Vault. Confirm in the UI: an
+   unprotected write credential is the one failure here that looks like
+   success until the day it matters.
 
 **Pass:** validate green, child pipeline generated and triggered, one plan job
 per manager per stack, apply jobs present but manual and not startable from a
@@ -1813,7 +2121,7 @@ Also run once, deliberately:
 | 0 | nothing | generator and validators | **done** — `make selftest`, 34 checks |
 | 1 | any GitLab | the pipeline is one GitLab accepts | not started |
 | 2 | a state backend | state is held and locked | not started |
-| 3 | Vault | credentials flow, nothing on disk | not started |
+| 3 | credentials | they resolve and nothing is on disk | not started |
 | 4 | a non-prod NSX manager | plan matches reality | not started |
 | 5 | all of the above | the review loop works end to end | not started |
 | 6 | people | the organisation can run it | not started |
@@ -1941,23 +2249,55 @@ rather than a trap.
 
 ### CI variables
 
+Which set depends on how this tree resolves credentials — `NSX_CREDS_DEFAULT`
+in `envs/tree.env`. `scripts/gitlab-setup.sh` sets them either way.
+
+**The default: GitLab CI/CD variables.** Two NSX service accounts, not one.
+
+| Variable | Value | Flags |
+|---|---|---|
+| `NSX_PLAN_USERNAME` | a **read-only** NSX account | masked |
+| `NSX_PLAN_PASSWORD` | | masked |
+| `NSX_APPLY_USERNAME` | an account that can write | masked, **protected** |
+| `NSX_APPLY_PASSWORD` | | masked, **protected** |
+
+**With `--creds vault`:**
+
 | Variable | Value | Flags |
 |---|---|---|
 | `VAULT_ADDR` | Vault endpoint | masked |
 | `VAULT_PLAN_TOKEN` | **read-only** token | masked |
 | `VAULT_APPLY_TOKEN` | write token | masked, **protected** |
+
+**Either way:**
+
+| Variable | Value | Flags |
+|---|---|---|
 | `CI_API_TOKEN` | project token, `api` scope, so plans can be posted to the MR | masked |
 | `NSX_APPLY_MODE` | `manual` (default) or `auto` | optional |
+| `NSX_APPLY_MODE_NONPROD` | the same switch for non-production tiers | optional |
 
 If `CI_API_TOKEN` is absent the pipeline still runs; it just does not comment,
 and the approver reads the plan in the job log instead.
 
-On GitHub the equivalents are repository secrets `VAULT_ADDR`,
-`VAULT_PLAN_TOKEN` and `VAULT_APPLY_TOKEN`; the plan comment uses the built-in
-`GITHUB_TOKEN` and needs nothing extra. The apply gate is
-**Settings → Environments → `nsx-<site>-<stack>` → Required reviewers**, and
-`VAULT_APPLY_TOKEN` should be scoped to those environments so a plan job can
-never reach it.
+**The protected flag is the security property, not a detail.** A protected
+variable is readable only on a protected branch, so a feature branch can reach
+the identity that reads NSX and never the one that writes to it. One account in
+both pairs removes that, silently, and everything still appears to work.
+
+Per-site and per-tier overrides are read first, so one repository can hold
+sites with different service accounts: `NSX_LON1_APPLY_USERNAME`,
+`NSX_PROD_APPLY_USERNAME`, then the shared `NSX_APPLY_USERNAME`.
+
+On GitHub the equivalents are repository secrets of the same names; the plan
+comment uses the built-in `GITHUB_TOKEN` and needs nothing extra. The apply gate
+is **Settings → Environments → `nsx-<tier>-<site>-<stack>` → Required
+reviewers**, and the write credential should be scoped to those environments so
+a plan job can never reach it.
+
+**Production apply is always manual.** `NSX_APPLY_MODE=auto` applies to
+non-production tiers only — a variable set once in project settings cannot
+remove the human from a change to a production firewall.
 
 ## How the per-manager jobs appear
 
@@ -2372,8 +2712,13 @@ write_file data/schema/managers.schema.json <<'SCAFFOLD_EOF'
       "propertyNames": { "pattern": "^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$" },
       "additionalProperties": {
         "type": "object",
-        "required": ["role", "host", "site", "vcf_instance", "vault_path", "tier"],
+        "required": ["role", "host", "site", "vcf_instance", "tier"],
         "additionalProperties": false,
+        "if": {
+          "required": ["creds_source"],
+          "properties": { "creds_source": { "enum": ["vault"] } }
+        },
+        "then": { "required": ["vault_path"] },
         "properties": {
           "role": { "enum": ["gm", "lm"] },
           "host": { "type": "string", "minLength": 1 },
@@ -2381,10 +2726,14 @@ write_file data/schema/managers.schema.json <<'SCAFFOLD_EOF'
           "region": { "type": "string" },
           "vcf_instance": { "type": "string", "minLength": 1 },
           "sddc_manager": { "type": "string" },
+          "creds_source": {
+            "enum": ["gitlab", "vault", "vcf", "env", "file"],
+            "description": "Where this manager's credentials come from at run time. Omitted means the tree default in envs/tree.env. 'vault' additionally requires vault_path."
+          },
           "vault_path": {
             "type": "string",
             "minLength": 1,
-            "description": "Path only. Never the secret itself."
+            "description": "Path only. Never the secret itself. Required only when creds_source is vault."
           },
           "tier": { "enum": ["prod", "preprod", "nonprod", "lab"] },
           "domain": { "type": "string" },
@@ -3808,7 +4157,28 @@ SCAFFOLD_EOF
 
 # Shared: data-loading locals, identical in every security stack.
 gen_versions() {
-	write_file "stacks/$1/versions.tf" <<'SCAFFOLD_EOF'
+	# use_lockfile does not exist before Terraform 1.10, and an older CLI
+	# ignores an unknown backend argument rather than refusing it — which would
+	# mean running unlocked while the config says otherwise. Raise the floor
+	# instead, so the CLI is what refuses.
+	if [ "$BACKEND" = s3 ] && [ "$LOCK" = native ]; then
+		write_file "stacks/$1/versions.tf" <<'SCAFFOLD_EOF'
+terraform {
+  # 1.10 is the floor because this tree locks S3 state with use_lockfile, which
+  # earlier versions silently ignore. Ignoring a lock is worse than not having
+  # one: the config claims a guarantee the CLI is not providing.
+  required_version = ">= 1.10"
+
+  required_providers {
+    nsxt = {
+      source  = "vmware/nsxt"
+      version = "~> 3.9"
+    }
+  }
+}
+SCAFFOLD_EOF
+	else
+		write_file "stacks/$1/versions.tf" <<'SCAFFOLD_EOF'
 terraform {
   required_version = ">= 1.9"
 
@@ -3820,6 +4190,7 @@ terraform {
   }
 }
 SCAFFOLD_EOF
+	fi
 }
 
 gen_backend() {
@@ -3832,7 +4203,14 @@ gen_backend() {
 #
 # GitLab-managed Terraform state. GitLab provides locking, encryption at rest
 # and version history, so this satisfies what section 9 requires of a backend
-# without standing up an object store.
+# without standing up an object store. It is the default whenever there is a
+# GitLab to use.
+#
+# The state ADDRESS is not set here. scripts/tf.sh builds it from
+# envs/gitlab-state.env — which holds the project URL, never a credential — as
+#   $GITLAB_STATE_BASE/<tier>-<site>-<stack>
+# so that one address per site cannot collide across five stacks, and prod and
+# nonprod cannot share a state.
 #
 # CREDENTIALS DO NOT GO IN THE .hcl FILE. envs/*.backend.hcl is committed, so
 # the token would be committed with it. Terraform reads them from the
@@ -3857,14 +4235,43 @@ SCAFFOLD_EOF
 #
 # S3 or an S3-compatible store (MinIO, Ceph RGW). The bucket must have
 # versioning and encryption enabled, and locking must be configured — either a
-# DynamoDB table or the provider's native lock support. State without locking is
-# state that two concurrent runs will corrupt.
+# DynamoDB table (dynamodb_table) or Terraform 1.10's own lockfile
+# (use_lockfile = true). State without locking is state that two concurrent runs
+# will corrupt, and Terraform will not warn you.
+#
+# deploy/state/aws creates the bucket and the lock table with the settings this
+# expects, rather than leaving you to get them right by hand.
+#
+# The state KEY is not set here. It is injected by scripts/tf.sh as
+# <tier>/<site>/<stack>.tfstate, because one file per site would collide across
+# five stacks and this file is shared by all of them.
 #
 # Credentials come from the environment or an instance role, never from this
 # file: envs/*.backend.hcl is committed.
 
 terraform {
   backend "s3" {}
+}
+SCAFFOLD_EOF
+		;;
+	gcs)
+		write_file "stacks/$1/backend.tf" <<'SCAFFOLD_EOF'
+# Partial backend configuration. Values come from envs/<site>.backend.hcl:
+#
+#   terraform init -backend-config=../../envs/${SITE}.backend.hcl
+#
+# Google Cloud Storage. The bucket must have object versioning and uniform
+# bucket-level access enabled; GCS provides the locking itself, so there is no
+# separate lock table to run.
+#
+# The state PREFIX is injected by scripts/tf.sh as <tier>/<site>/<stack>, for
+# the same reason the s3 key is: this file is shared by all five stacks.
+#
+# Credentials come from GOOGLE_APPLICATION_CREDENTIALS or the workload identity
+# of whatever runs this, never from this file: envs/*.backend.hcl is committed.
+
+terraform {
+  backend "gcs" {}
 }
 SCAFFOLD_EOF
 		;;
@@ -3908,9 +4315,10 @@ SCAFFOLD_EOF
 #
 # Regenerate with the backend you want rather than editing this by hand:
 #
-#   scripts/bootstrap.sh --force --backend http      # GitLab-managed state
+#   scripts/bootstrap.sh --force --backend gitlab    # GitLab-managed state
 #   scripts/bootstrap.sh --force --backend s3        # S3 or MinIO/Ceph
 #   scripts/bootstrap.sh --force --backend azurerm
+#   scripts/bootstrap.sh --force --backend gcs
 #
 # and fill in envs/<site>.backend.hcl to match.
 
@@ -4630,6 +5038,7 @@ write_file scripts/tf.sh <<'SCAFFOLD_EOF'
 #   scripts/tf.sh plan   <stack> <site>
 #   scripts/tf.sh show   <stack> <site>
 #   scripts/tf.sh apply  <stack> <site>     # requires APPROVE=yes
+#   scripts/tf.sh unlock <stack> <site> <lock-id>
 #
 # Credentials are never read from a file here. Either they are already in the
 # environment as NSXT_MANAGER_HOST / NSXT_USERNAME / NSXT_PASSWORD, or you wrap
@@ -4684,16 +5093,66 @@ run() {
 	(cd "$stack_dir" && terraform "$@")
 }
 
-# One state per stack per manager. While the stacks are on the placeholder local
-# backend, the path is derived here so two stacks at the same site cannot end up
-# sharing one state file.
-uses_local_backend() { grep -q 'backend "local"' "$stack_dir/backend.tf" 2>/dev/null; }
+# One state per stack per manager per tier.
+#
+# envs/<site>.backend.hcl is shared by all five stacks, so it cannot carry the
+# part of the address that identifies the stack — if it did, five stacks at one
+# site would share a state file and overwrite each other. That part is derived
+# here instead, for every backend type, and it always starts with the tier:
+#
+#   <tier>/<site>/<stack>
+#
+# The tier is what separates dev, UAT and production state. It is in the address
+# rather than in a convention, so a manager moved between tiers gets a new state
+# rather than quietly writing into the old one, and a typo in the tier fails
+# 'make validate' before it can create a namespace nobody is watching.
+backend_type() { sed -n 's/.*backend "\([a-z0-9]*\)".*/\1/p' "$stack_dir/backend.tf" 2>/dev/null | head -1; }
+uses_local_backend() { [ "$(backend_type)" = local ]; }
+
+tier="${NSX_TIER:-untiered}"
+state_id="${tier}/${site}/${stack}"
 
 backend_args=(-backend-config="$backend_file")
-if uses_local_backend; then
+case "$(backend_type)" in
+local)
 	mkdir -p "$REPO_ROOT/.local-state"
 	backend_args+=(-backend-config="path=$REPO_ROOT/.local-state/${site}-${stack}.tfstate")
-fi
+	;;
+s3)
+	backend_args+=(-backend-config="key=${state_id}.tfstate")
+	;;
+gcs)
+	backend_args+=(-backend-config="prefix=${state_id}")
+	;;
+azurerm)
+	backend_args+=(-backend-config="key=${state_id}.tfstate")
+	;;
+http)
+	# GitLab-managed state. The project URL comes from envs/gitlab-state.env,
+	# written by scripts/gitlab-setup.sh once it knows the project id. It holds
+	# a URL and nothing else — the credentials are TF_HTTP_USERNAME and
+	# TF_HTTP_PASSWORD, which arrive from the environment.
+	if [ -f "$REPO_ROOT/envs/gitlab-state.env" ]; then
+		# shellcheck disable=SC1091
+		. "$REPO_ROOT/envs/gitlab-state.env"
+	fi
+	if [ -z "${GITLAB_STATE_BASE:-}" ]; then
+		echo "error: the stacks use GitLab-managed state, but envs/gitlab-state.env" >&2
+		echo "       does not exist and GITLAB_STATE_BASE is not set, so there is no" >&2
+		echo "       address to init against." >&2
+		echo "" >&2
+		echo "       scripts/gitlab-setup.sh writes that file once it knows the" >&2
+		echo "       project id. Re-run it, or export the base by hand:" >&2
+		echo "         export GITLAB_STATE_BASE=https://gitlab.example.com/api/v4/projects/<id>/terraform/state" >&2
+		exit 1
+	fi
+	# GitLab's state API takes one flat name, not a path.
+	state_name="${tier}-${site}-${stack}"
+	backend_args+=(-backend-config="address=${GITLAB_STATE_BASE}/${state_name}")
+	backend_args+=(-backend-config="lock_address=${GITLAB_STATE_BASE}/${state_name}/lock")
+	backend_args+=(-backend-config="unlock_address=${GITLAB_STATE_BASE}/${state_name}/lock")
+	;;
+esac
 
 case "$cmd" in
 init)
@@ -4712,6 +5171,34 @@ show)
 		exit 1
 	}
 	run show tfplan
+	;;
+unlock)
+	# The two-developers case: a run died holding the lock and every later run
+	# refuses. Terraform's own force-unlock is the right tool; what it does not
+	# do is check whether the other run is actually gone, and breaking a live
+	# lock is how two applies end up writing one state.
+	lock_id="${1:-}"
+	[ -n "$lock_id" ] || {
+		echo "error: usage: scripts/tf.sh unlock <stack> <site> <lock-id>" >&2
+		echo "       The lock ID is in the error message from the run that was refused." >&2
+		exit 1
+	}
+	echo "About to break the state lock on $stack @ $site ($state_id)."
+	echo
+	echo "Do this only when the run that took the lock is definitely finished."
+	echo "If it is still running, breaking the lock lets a second apply write the"
+	echo "same state, and the estate ends up describing neither result."
+	echo
+	if [ "${FORCE_UNLOCK:-}" != yes ]; then
+		printf 'Type the site name (%s) to continue: ' "$site"
+		IFS= read -r reply </dev/tty || reply=""
+		[ "$reply" = "$site" ] || {
+			echo "not confirmed; the lock was left alone." >&2
+			exit 1
+		}
+	fi
+	[ -d "$stack_dir/.terraform" ] || run init -reconfigure "${backend_args[@]}"
+	run force-unlock -force "$lock_id"
 	;;
 apply)
 	[ -f "$plan_file" ] || {
@@ -4751,28 +5238,42 @@ write_file scripts/with-credentials.sh <<'SCAFFOLD_EOF'
 #   * TF_VAR_* values that reach a provider or resource argument land in state
 #     and in saved plan files. 'sensitive = true' only redacts CLI output.
 #
-# Source of the secret, chosen with --from (default: vault):
+# Source of the secret, chosen with --from. When not given it is resolved in
+# this order: CREDS_SOURCE in the environment, the manager's own creds_source in
+# inventory/managers.yaml, the tree default in envs/tree.env, then gitlab.
 #
+#   --from gitlab  masked GitLab CI/CD variables.                    [default]
+#                  Two accounts, not one: NSX_PLAN_* is readable by every
+#                  branch, NSX_APPLY_* is marked PROTECTED in GitLab so only a
+#                  protected branch can reach the account that can write to the
+#                  firewall. Which pair is used is stated by the job through
+#                  NSX_CREDS_ROLE, never guessed.
+#                  Per-site and per-tier overrides are looked up first, so one
+#                  repository can hold sites with different service accounts.
 #   --from vault   read the KV v2 secret at the vault_path in the inventory.
 #                  Needs VAULT_ADDR and VAULT_TOKEN in the environment.
 #   --from vcf     ask SDDC Manager for the current NSX credentials.
 #                  Needs SDDC_MANAGER_HOST, SDDC_USERNAME, SDDC_PASSWORD.
+#   --from env     already exported as NSXT_USERNAME and NSXT_PASSWORD.
+#   --from file    .credentials/<site>.env — mode 0600 and gitignored, both
+#                  enforced here. Refused outright for a prod-tier manager.
 #
 # Prefer short-lived credentials: Vault dynamic secrets or a rotated VCF service
-# account beats a long-lived password in a KV store. Where VCF can issue client
-# certificates, NSXT_CLIENT_AUTH_CERT is stronger than any password path.
+# account beats a long-lived password in any store, GitLab's included. Where VCF
+# can issue client certificates, NSXT_CLIENT_AUTH_CERT is stronger than any
+# password path.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SOURCE=vault
+SOURCE=""
 
 die() {
 	echo "error: $*" >&2
 	exit 1
 }
 
-[ $# -ge 1 ] || die "usage: with-credentials.sh <site> [--from vault|vcf] -- <command>"
+[ $# -ge 1 ] || die "usage: with-credentials.sh <site> [--from gitlab|vault|vcf|env|file] -- <command>"
 
 SITE="$1"
 shift
@@ -4795,9 +5296,23 @@ done
 
 command -v curl >/dev/null 2>&1 || die "curl is required"
 
-# Inventory lookup: host and vault path for this site. Never the secret.
+# Inventory lookup: host, tier, credential source and vault path for this site.
+# Never the secret.
 eval "$(python3 "$REPO_ROOT/scripts/ci-matrix.py" --export "$SITE")"
 [ -n "${NSX_HOST:-}" ] || die "site '$SITE' is not in inventory/managers.yaml"
+
+# The tree's default, chosen when it was generated. Absent in an older tree.
+if [ -f "$REPO_ROOT/envs/tree.env" ]; then
+	# shellcheck disable=SC1091
+	. "$REPO_ROOT/envs/tree.env"
+fi
+
+# Explicit flag, then the environment, then this manager, then the tree, then
+# gitlab. A per-manager creds_source is how one repository holds a site that
+# reads Vault next to a site that does not.
+if [ -z "$SOURCE" ]; then
+	SOURCE="${CREDS_SOURCE:-${NSX_CREDS_SOURCE:-${NSX_CREDS_DEFAULT:-gitlab}}}"
+fi
 
 export NSXT_MANAGER_HOST="$NSX_HOST"
 
@@ -4810,6 +5325,98 @@ for k in sys.argv[1:]:
 print(d)' "$@"; }
 
 case "$SOURCE" in
+gitlab)
+	# Which account: stated by the job, not inferred from what it is doing.
+	# Locally, APPROVE=yes is the same statement made by hand.
+	role="${NSX_CREDS_ROLE:-}"
+	if [ -z "$role" ]; then
+		if [ "${APPROVE:-}" = yes ]; then role=apply; else role=plan; fi
+	fi
+	case "$role" in
+	plan | apply) ;;
+	*) die "NSX_CREDS_ROLE must be 'plan' or 'apply', not '$role'" ;;
+	esac
+	ROLE_UC="$(printf '%s' "$role" | tr '[:lower:]' '[:upper:]')"
+
+	# Most specific wins: this site, then this tier, then the shared pair. A
+	# repository holding prod and nonprod can give them different accounts
+	# without splitting into two repositories.
+	SITE_UC="$(printf '%s' "$SITE" | tr '[:lower:]-' '[:upper:]_')"
+	TIER_UC="$(printf '%s' "${NSX_TIER:-}" | tr '[:lower:]-' '[:upper:]_')"
+
+	pick() { # pick <USERNAME|PASSWORD> — echo the first variable that is set
+		local field="$1" candidate=""
+		for candidate in \
+			"NSX_${SITE_UC}_${ROLE_UC}_${field}" \
+			${TIER_UC:+"NSX_${TIER_UC}_${ROLE_UC}_${field}"} \
+			"NSX_${ROLE_UC}_${field}"; do
+			if [ -n "${!candidate:-}" ]; then
+				printf '%s' "${!candidate}"
+				return 0
+			fi
+		done
+		return 1
+	}
+
+	NSXT_USERNAME="$(pick USERNAME)" || die "no ${ROLE_UC} username for site '$SITE'.
+       Looked for, in order:
+         NSX_${SITE_UC}_${ROLE_UC}_USERNAME${TIER_UC:+"
+         NSX_${TIER_UC}_${ROLE_UC}_USERNAME"}
+         NSX_${ROLE_UC}_USERNAME
+       In CI these are GitLab CI/CD variables; scripts/gitlab-setup.sh sets
+       them. Locally, export them or use --from env."
+	NSXT_PASSWORD="$(pick PASSWORD)" || die "a ${ROLE_UC} username is set for '$SITE' but no matching password.
+       Set NSX_${ROLE_UC}_PASSWORD (or the site/tier variant) alongside it."
+
+	# A protected variable is simply absent on an unprotected ref. Saying so
+	# here turns a confusing NSX authentication failure into the real reason.
+	if [ "$role" = apply ] && [ -n "${CI:-}" ] && [ "${CI_COMMIT_REF_PROTECTED:-false}" != true ]; then
+		echo "warning: reading apply credentials on a ref GitLab does not report as" >&2
+		echo "         protected. The apply variables are deliberately out of reach" >&2
+		echo "         there, so this will fail to authenticate. Check that the branch" >&2
+		echo "         is protected rather than that the password is wrong." >&2
+	fi
+	;;
+env)
+	[ -n "${NSXT_USERNAME:-}" ] || die "--from env: NSXT_USERNAME is not set"
+	[ -n "${NSXT_PASSWORD:-}" ] || die "--from env: NSXT_PASSWORD is not set"
+	;;
+file)
+	# A password in a file on a laptop is a local convenience. It is not a
+	# production credential store, and prod is where that distinction stops
+	# being academic.
+	case "${NSX_TIER:-}" in
+	prod)
+		die "--from file is refused for '$SITE', which is tier 'prod'.
+       A file-backed credential has no rotation, no audit and no revocation.
+       Use --from gitlab (masked, protected CI variables) or --from vault."
+		;;
+	esac
+
+	cred_file="$REPO_ROOT/.credentials/${SITE}.env"
+	[ -f "$cred_file" ] || die "--from file: $cred_file does not exist.
+       Create it with:
+         install -d -m 700 .credentials
+         install -m 600 /dev/null .credentials/${SITE}.env
+       then put NSXT_USERNAME=... and NSXT_PASSWORD=... in it."
+
+	# %a is GNU stat, %Lp is BSD/macOS. Neither is guaranteed; if the mode
+	# cannot be read at all, that is not a reason to read the secret anyway.
+	mode="$(stat -c '%a' "$cred_file" 2>/dev/null || stat -f '%Lp' "$cred_file" 2>/dev/null || echo unknown)"
+	[ "$mode" != unknown ] || die "cannot determine the permissions of $cred_file; refusing to read it."
+	[ "$mode" = 600 ] || die "$cred_file is mode $mode, not 600.
+       It holds a password in plaintext. Fix it:  chmod 600 ${cred_file#"$REPO_ROOT"/}"
+
+	if ! grep -qs '^\.credentials/\?$' "$REPO_ROOT/.gitignore"; then
+		die ".credentials/ is not in .gitignore, so this file is one 'git add -A' from
+       being committed and permanently in history. Add it before using --from file."
+	fi
+
+	# shellcheck disable=SC1090
+	. "$cred_file"
+	[ -n "${NSXT_USERNAME:-}" ] || die "no NSXT_USERNAME in ${cred_file#"$REPO_ROOT"/}"
+	[ -n "${NSXT_PASSWORD:-}" ] || die "no NSXT_PASSWORD in ${cred_file#"$REPO_ROOT"/}"
+	;;
 vault)
 	[ -n "${VAULT_ADDR:-}" ] || die "VAULT_ADDR is not set"
 	[ -n "${VAULT_TOKEN:-}" ] || die "VAULT_TOKEN is not set"
@@ -4853,7 +5460,7 @@ else:
     sys.exit("no NSX credential for " + want)
 ')" || die "no SDDC Manager credential matches $NSX_HOST"
 	;;
-*) die "unknown --from source: $SOURCE (vault|vcf)" ;;
+*) die "unknown credential source: $SOURCE (gitlab|vault|vcf|env|file)" ;;
 esac
 
 [ -n "${NSXT_USERNAME:-}" ] || die "no username retrieved"
@@ -4917,6 +5524,7 @@ def entries(stack_filter: str | None = None, strict: bool = False) -> list[dict]
                     "role": role,
                     "host": m.get("host", ""),
                     "tier": m.get("tier", ""),
+                    "creds_source": m.get("creds_source", ""),
                     "vcf_instance": m.get("vcf_instance", ""),
                 }
             )
@@ -4932,7 +5540,10 @@ its matrix from here, and so does scripts/tf.sh.
 
   scripts/ci-matrix.py                      # JSON matrix, every stack
   scripts/ci-matrix.py --stack local-security
+  scripts/ci-matrix.py --tier prod          # only production managers
   scripts/ci-matrix.py --format lines
+  scripts/ci-matrix.py --format creds       # site, credential source, tier
+  scripts/ci-matrix.py --format vault       # site, vault_path
   scripts/ci-matrix.py --export lon1        # shell exports for one manager
 """
 
@@ -4959,6 +5570,7 @@ def export(site: str) -> int:
         "NSX_SITE": site,
         "NSX_TIER": m.get("tier", ""),
         "NSX_VAULT_PATH": m.get("vault_path", ""),
+        "NSX_CREDS_SOURCE": m.get("creds_source", ""),
         "NSX_DOMAIN": m.get("domain", "default"),
         "NSX_VCF_INSTANCE": m.get("vcf_instance", ""),
     }
@@ -4970,19 +5582,49 @@ def export(site: str) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--stack", help="only include this stack")
-    ap.add_argument("--format", choices=["json", "github", "lines"], default="json")
+    ap.add_argument("--tier", help="only include managers in this tier")
+    ap.add_argument("--format", choices=["json", "github", "lines", "creds", "vault"], default="json")
     ap.add_argument("--export", metavar="SITE", help="print shell exports for one manager")
     args = ap.parse_args()
 
     if args.export:
         return export(args.export)
 
+    # One row per MANAGER, not per stack: who resolves credentials how, for
+    # scripts/readiness.sh.
+    #
+    # An unset field is printed as '-', never as nothing. Tab is whitespace, so
+    # a shell 'read' with IFS=tab collapses two tabs into one and every later
+    # field shifts left by one — silently, and only for the rows where a field
+    # happened to be empty. A placeholder costs one character and removes that.
+    if args.format == "creds":
+        for name, m in sorted(managers(strict=True).items()):
+            if m.get("enabled") is False:
+                continue
+            if args.tier and m.get("tier") != args.tier:
+                continue
+            source = m.get("creds_source") or "-"
+            tier = m.get("tier") or "-"
+            print(f"{name}\t{source}\t{tier}")
+        return 0
+
+    # site and vault_path, for scripts/vault-up.sh. '-' where none is recorded,
+    # for the same field-collapsing reason as --format creds.
+    if args.format == "vault":
+        for name, m in sorted(managers(strict=True).items()):
+            if m.get("enabled") is False:
+                continue
+            print(f"{name}\t{m.get('vault_path') or '-'}")
+        return 0
+
     # Strict here: a human or a GitHub matrix asking for the inventory when it
     # does not exist is an error, not an empty list.
     rows = entries(args.stack, strict=True)
+    if args.tier:
+        rows = [r for r in rows if r.get("tier") == args.tier]
     if args.format == "lines":
         for r in rows:
-            print(f"{r['site']}\t{r['stack']}\t{r['role']}\t{r['host']}")
+            print(f"{r['site']}\t{r['stack']}\t{r['role']}\t{r['tier']}\t{r['host']}")
     elif args.format == "github":
         print(json.dumps({"include": rows}))
     else:
@@ -5369,9 +6011,28 @@ class Report:
 # JSON Schema subset: exactly the keywords used by data/schema/*.json.
 # --------------------------------------------------------------------------
 
+def matches(instance, schema: dict) -> bool:
+    """True when instance satisfies schema, collecting nothing.
+
+    The predicate behind 'if'. It reuses check_schema against a throwaway
+    report rather than reimplementing the rules, so the two can never disagree
+    about what valid means.
+    """
+    probe = Report()
+    check_schema(instance, schema, "<probe>", "", probe)
+    return not probe.errors
+
+
 def check_schema(instance, schema: dict, where: str, path: str, report: Report) -> None:
     def fail(message: str) -> None:
         report.error(where, f"{path or '<root>'}: {message}")
+
+    # Conditional subschemas. Only the branch that applies is reported on, so
+    # the message a person sees is about the shape they actually wrote.
+    if "if" in schema:
+        branch = "then" if matches(instance, schema["if"]) else "else"
+        if branch in schema:
+            check_schema(instance, schema[branch], where, path, report)
 
     expected = schema.get("type")
     if expected and not _type_ok(instance, expected):
@@ -5529,6 +6190,25 @@ def check_no_secrets(where: str, doc: dict, report: Report) -> None:
     walk(doc, "")
 
 
+def tree_settings() -> dict[str, str]:
+    """Generator-chosen defaults from envs/tree.env.
+
+    The schema validates one file in isolation and cannot see these, so the
+    rules that depend on them are checked here instead of being left unchecked.
+    """
+    out: dict[str, str] = {}
+    path = REPO_ROOT / "envs" / "tree.env"
+    if not path.exists():
+        return out
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        out[key.strip()] = value.strip().strip("'\"")
+    return out
+
+
 def check_inventory(report: Report) -> dict:
     if not INVENTORY.exists():
         report.error("inventory/managers.yaml", "missing. Every stack run resolves its manager here.")
@@ -5540,6 +6220,8 @@ def check_inventory(report: Report) -> dict:
         return {}
 
     where = "inventory/managers.yaml"
+    settings = tree_settings()
+    declared_tiers = {t for t in settings.get("NSX_ENVS", "").split(",") if t}
     schema = load_schema("managers.schema.json")
     if schema:
         check_schema(doc, schema, where, "", report)
@@ -5566,6 +6248,31 @@ def check_inventory(report: Report) -> dict:
         backend = REPO_ROOT / "envs" / f"{name}.backend.hcl"
         if m.get("enabled") is not False and not backend.exists():
             report.warn(where, f"{name}: no envs/{name}.backend.hcl — nothing can initialise for this manager.")
+
+        # The schema makes vault_path conditional on an explicit creds_source.
+        # When the key is absent the tree default decides, and only this side
+        # knows what that is.
+        if not m.get("creds_source") and settings.get("NSX_CREDS_DEFAULT") == "vault":
+            if not m.get("vault_path"):
+                report.error(
+                    where,
+                    f"{name}: this tree defaults to Vault credentials (envs/tree.env) and "
+                    "this manager has no vault_path. Add one, or give the manager its own "
+                    "creds_source.",
+                )
+
+        # The tier is the environment boundary: it goes into the state address
+        # and decides whether apply is gated. A tier outside the declared set
+        # would silently create a namespace nobody is watching.
+        tier = m.get("tier")
+        if tier and declared_tiers and tier not in declared_tiers:
+            report.error(
+                where,
+                f"{name}: tier {tier!r} is not one this tree serves "
+                f"({', '.join(sorted(declared_tiers))}, from envs/tree.env). "
+                "State is addressed by tier, so this would write somewhere nobody is watching. "
+                "Fix the tier, or regenerate with --envs including it.",
+            )
 
     return managers
 
@@ -7190,6 +7897,231 @@ mark_executable scripts/drift.sh
 # 7. Backend config and CI
 # ---------------------------------------------------------------------------
 
+write_file scripts/gen-backend-configs.py <<'SCAFFOLD_EOF'
+#!/usr/bin/env python3
+"""Write one envs/<site>.backend.hcl per manager, from the inventory.
+
+Every stack needs a backend config per manager before anything can initialise.
+Writing them by hand is the step people skip, and a missing one surfaces much
+later as a confusing init failure, so this derives them from the inventory that
+already lists the managers.
+
+  scripts/gen-backend-configs.py                 # write the missing ones
+  scripts/gen-backend-configs.py --check         # report only; exit 1 if any
+                                                 # are missing. For CI.
+  scripts/gen-backend-configs.py --force         # rewrite existing ones too
+  scripts/gen-backend-configs.py --bucket nsx-tfstate --region eu-west-2
+
+WHAT IS NOT IN THESE FILES, and why:
+
+  * No credentials. envs/*.backend.hcl is committed, so a token here would be
+    committed with it. Terraform reads them from the environment.
+  * No state key, address or prefix. One file serves all five stacks at a site,
+    so a key here would make five stacks share one state and overwrite each
+    other. scripts/tf.sh derives <tier>/<site>/<stack> instead, which is also
+    what keeps prod and nonprod state apart.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ci_matrix_lib import managers  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+ENVS = REPO_ROOT / "envs"
+
+HEADER = """# Partial backend configuration for {site} ({tier}).
+#
+# GENERATED by scripts/gen-backend-configs.py from inventory/managers.yaml.
+# Re-run it after adding a manager. Edited by hand is fine — it will not be
+# overwritten without --force.
+#
+#   scripts/tf.sh init <stack> {site}
+#
+# NEVER PUT A SECRET IN THIS FILE. It is committed.
+# The state address is NOT here: scripts/tf.sh derives it per stack and tier.
+"""
+
+
+def tree_settings() -> dict:
+    out: dict = {}
+    path = ENVS / "tree.env"
+    if path.exists():
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                out[key.strip()] = value.strip().strip("'\"")
+    return out
+
+
+def body(backend: str, args, site: str) -> str:
+    if backend == "http":
+        return """
+# GitLab-managed Terraform state. GitLab supplies the locking, the encryption at
+# rest and the version history, so there is no object store to run.
+#
+# Credentials come from the environment, never from here:
+#   export TF_HTTP_USERNAME=gitlab-ci-token
+#   export TF_HTTP_PASSWORD="$CI_JOB_TOKEN"      # in GitLab CI
+# Outside CI, a project access token with the api scope in place of the job token.
+
+lock_method    = "POST"
+unlock_method  = "DELETE"
+retry_wait_min = 5
+"""
+    if backend == "s3":
+        lines = [
+            "",
+            "# S3, or an S3-compatible store with endpoints set.",
+            "# Credentials come from the environment or an instance role.",
+            "",
+            f'bucket  = "{args.bucket}"',
+            f'region  = "{args.region}"',
+            "encrypt = true",
+        ]
+        if args.kms_key_id:
+            lines.append(f'kms_key_id = "{args.kms_key_id}"')
+        if args.lock == "native":
+            lines += [
+                "",
+                "# Terraform's own S3 lockfile. Needs Terraform >= 1.10, which the",
+                "# stacks require. No lock table to run.",
+                "use_lockfile = true",
+            ]
+        else:
+            lines += [
+                "",
+                "# The lock table. Without it two concurrent runs corrupt the state",
+                "# and Terraform does not warn you.",
+                f'dynamodb_table = "{args.dynamodb_table}"',
+            ]
+        if args.endpoint:
+            lines += [
+                "",
+                "# S3-compatible store rather than AWS.",
+                "endpoints                   = { s3 = \"%s\" }" % args.endpoint,
+                "use_path_style              = true",
+                "skip_credentials_validation = true",
+                "skip_region_validation      = true",
+                "skip_requesting_account_id  = true",
+            ]
+        return "\n".join(lines) + "\n"
+    if backend == "azurerm":
+        return f"""
+# Azure blob storage. Blob leases provide the locking; the container needs soft
+# delete and versioning enabled.
+
+resource_group_name  = "{args.resource_group}"
+storage_account_name = "{args.storage_account}"
+container_name       = "{args.container}"
+"""
+    if backend == "gcs":
+        return f"""
+# Google Cloud Storage. GCS provides the locking; the bucket needs object
+# versioning and uniform bucket-level access.
+
+bucket = "{args.bucket}"
+"""
+    return """
+# The placeholder local backend holds nothing: scripts/tf.sh supplies the state
+# path itself, so two stacks at one site cannot collide on one file.
+#
+# Filesystem state has NO LOCKING. Lab only — scripts/tf.sh refuses to apply
+# through it unless ALLOW_LOCAL_STATE=1.
+"""
+
+
+def main() -> int:
+    settings = tree_settings()
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--backend", default=settings.get("NSX_BACKEND", "local"))
+    ap.add_argument("--lock", default=settings.get("NSX_LOCK", "dynamodb"), choices=["dynamodb", "native"])
+    ap.add_argument("--bucket", default="nsx-terraform-state")
+    ap.add_argument("--region", default="eu-west-2")
+    ap.add_argument("--kms-key-id", default="")
+    ap.add_argument("--dynamodb-table", default="nsx-terraform-locks")
+    ap.add_argument("--resource-group", default="rg-terraform-state")
+    ap.add_argument("--storage-account", default="sttfstatensx")
+    ap.add_argument("--container", default="state")
+    ap.add_argument("--endpoint", default="", help="S3-compatible endpoint (MinIO, Ceph RGW)")
+    ap.add_argument("--force", action="store_true", help="rewrite files that already exist")
+    ap.add_argument("--check", action="store_true", help="report only; exit 1 if any are missing")
+    args = ap.parse_args()
+
+    entries = {k: v for k, v in managers(strict=True).items() if v.get("enabled") is not False}
+    if not entries:
+        print("inventory/managers.yaml lists no enabled managers; nothing to write.")
+        return 0
+
+    ENVS.mkdir(parents=True, exist_ok=True)
+    missing, wrote, kept = [], [], []
+
+    for site, m in sorted(entries.items()):
+        path = ENVS / f"{site}.backend.hcl"
+        content = HEADER.format(site=site, tier=m.get("tier", "untiered")) + body(args.backend, args, site)
+        if path.exists() and not args.force:
+            kept.append(site)
+            continue
+        if args.check:
+            missing.append(site)
+            continue
+        path.write_text(content)
+        wrote.append(site)
+
+    if args.check:
+        for site in missing:
+            print(f"missing: envs/{site}.backend.hcl")
+        if missing:
+            print(f"\n{len(missing)} manager(s) have no backend config. Nothing can initialise for them.")
+            print("  scripts/gen-backend-configs.py")
+            return 1
+        print(f"every one of {len(kept)} manager(s) has a backend config.")
+        return 0
+
+    for site in wrote:
+        print(f"wrote   envs/{site}.backend.hcl")
+    for site in kept:
+        print(f"kept    envs/{site}.backend.hcl (exists; --force to rewrite)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+SCAFFOLD_EOF
+mark_executable scripts/gen-backend-configs.py
+
+# An unquoted heredoc, because this file's content is the flags rather than
+# fixed text. Every value interpolated below was validated above.
+write_file envs/tree.env <<TREE_EOF
+# Written by scripts/bootstrap.sh. Settings the tooling reads at run time.
+#
+# Committed on purpose: these are choices about the tree, not secrets. Nothing
+# here is a credential, an address or a token.
+#
+# Change them by regenerating rather than editing, so the stacks, the pipeline
+# and the validator keep agreeing with each other:
+#
+#   scripts/bootstrap.sh --force --creds SOURCE --envs TIERS
+
+# Default credential source. A manager may override it with its own
+# creds_source in inventory/managers.yaml.
+NSX_CREDS_DEFAULT=$CREDS
+
+# Tiers this tree serves. A manager whose tier is outside this list fails
+# 'make validate'. The tier is part of the state address and decides whether
+# apply is gated, so an unnoticed typo here is a state file nobody watches.
+NSX_ENVS=$ENVS
+
+# State backend type in stacks/*/backend.tf, and how an s3 backend locks.
+NSX_BACKEND=$BACKEND
+NSX_LOCK=$LOCK
+TREE_EOF
+
 write_file envs/example.backend.hcl.example <<'SCAFFOLD_EOF'
 # Partial backend configuration for one manager. Copy to envs/<site>.backend.hcl
 # and fill in. The file name must match the manager key in
@@ -7247,6 +8179,674 @@ write_file envs/example.backend.hcl.example <<'SCAFFOLD_EOF'
 # Holds nothing: scripts/tf.sh supplies the state path itself, so two stacks at
 # the same site cannot collide on one file. Filesystem state has NO LOCKING —
 # acceptable for a lab, not for a managed estate.
+SCAFFOLD_EOF
+
+write_file deploy/vault/docker-compose.yml <<'SCAFFOLD_EOF'
+# A Vault for trying the Vault credential path, for teams that do not have one.
+# Brought up and seeded by scripts/vault-up.sh.
+#
+# THIS IS A DEV-MODE VAULT. Everything about it is wrong for production, and
+# deliberately so:
+#
+#   * storage is in MEMORY. Restart the container and every secret is gone.
+#   * it starts UNSEALED, with no unseal keys and no seal ceremony.
+#   * the root token is a fixed value you pass in, not one Vault generated.
+#   * there is no TLS.
+#
+# It exists to answer "does the Vault path work end to end" without asking
+# anyone to stand up real Vault first. Point at a real Vault before this
+# repository touches a production manager — scripts/vault-up.sh --emit-ci
+# prints the variables either way, so moving over is a URL and two tokens.
+
+services:
+  vault:
+    image: hashicorp/vault:1.18
+    container_name: nsx-vault
+    restart: unless-stopped
+    cap_add:
+      # Lets Vault lock its memory so secrets cannot be swapped to disk. Not
+      # meaningful in dev mode, but it keeps the container closer to real.
+      - IPC_LOCK
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: "${VAULT_DEV_ROOT_TOKEN_ID:-nsx-lab-root}"
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+    ports:
+      - "${VAULT_PORT:-8200}:8200"
+    command: server -dev
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://127.0.0.1:8200"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+SCAFFOLD_EOF
+
+write_file deploy/vault/README.md <<'SCAFFOLD_EOF'
+# A local Vault, for trying the Vault credential path
+
+Only needed if this tree uses `--creds vault`. The default is GitLab CI/CD
+variables, which need nothing here.
+
+```bash
+scripts/vault-up.sh                 # start it, enable KV v2, seed the managers
+scripts/vault-up.sh --emit-ci       # print VAULT_ADDR and the two tokens
+scripts/vault-up.sh --status
+scripts/vault-up.sh --destroy       # remove it and everything in it
+```
+
+`vault-up.sh` seeds one secret per enabled manager, at the `vault_path` that
+manager records in `inventory/managers.yaml`, and creates two policies:
+
+| Policy | Can | Used by |
+|---|---|---|
+| `nsx-plan` | read `nsx/data/managers/*` | every branch's plan jobs |
+| `nsx-apply` | read and list | apply jobs, on protected branches only |
+
+That split is the point. One token for both would mean a feature branch could
+read the credential that changes a production firewall.
+
+## This is not a production Vault
+
+Dev mode: in memory, unsealed, fixed root token, no TLS. Everything is lost when
+the container stops. It exists so the Vault path can be proven end to end before
+anyone commits to running real Vault.
+
+To move to a real one, nothing in this repository changes — point `VAULT_ADDR`
+at it, create the same two policies, and put the secrets at the same paths.
+SCAFFOLD_EOF
+
+write_file scripts/vault-up.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# Stand up a local Vault, enable KV v2, seed one secret per manager, and mint
+# the two tokens the pipeline needs.
+#
+#   scripts/vault-up.sh                       start and seed
+#   scripts/vault-up.sh --emit-ci             shell exports for gitlab-setup.sh
+#   scripts/vault-up.sh --nsx-user svc --nsx-password 'REDACTED'
+#   scripts/vault-up.sh --status | --down | --destroy
+#
+# DEV MODE. In memory, unsealed, fixed root token, no TLS — see
+# deploy/vault/README.md. Everything here is lost when the container stops.
+#
+# Only useful when this tree uses --creds vault. The default is GitLab CI/CD
+# variables, which need none of this.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMPOSE_DIR="$REPO_ROOT/deploy/vault"
+
+VAULT_PORT="${VAULT_PORT:-8200}"
+VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:$VAULT_PORT}"
+ROOT_TOKEN="${VAULT_DEV_ROOT_TOKEN_ID:-nsx-lab-root}"
+MOUNT="${VAULT_MOUNT:-nsx}"
+NSX_USER=""
+NSX_PASSWORD=""
+EMIT_CI=0
+
+die() {
+	printf 'error: %s\n' "$*" >&2
+	exit 1
+}
+say() { [ "$EMIT_CI" = 1 ] || printf '%s\n' "$*"; }
+step() { [ "$EMIT_CI" = 1 ] || printf '\n== %s\n' "$*"; }
+
+compose() {
+	if docker compose version >/dev/null 2>&1; then
+		(cd "$COMPOSE_DIR" && VAULT_PORT="$VAULT_PORT" VAULT_DEV_ROOT_TOKEN_ID="$ROOT_TOKEN" docker compose "$@")
+	elif command -v docker-compose >/dev/null 2>&1; then
+		(cd "$COMPOSE_DIR" && VAULT_PORT="$VAULT_PORT" VAULT_DEV_ROOT_TOKEN_ID="$ROOT_TOKEN" docker-compose "$@")
+	else
+		die "neither 'docker compose' nor 'docker-compose' is available."
+	fi
+}
+
+preflight() {
+	command -v docker >/dev/null 2>&1 || die "docker is not installed. See https://docs.docker.com/engine/install/"
+	docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon. Is it running, and is your user in the docker group?"
+	command -v curl >/dev/null 2>&1 || die "curl is required"
+	[ -f "$COMPOSE_DIR/docker-compose.yml" ] || die "$COMPOSE_DIR/docker-compose.yml is missing. Re-run scripts/bootstrap.sh."
+}
+
+api() {
+	local method="$1" path="$2"
+	shift 2
+	curl -sS -X "$method" -H "X-Vault-Token: $ROOT_TOKEN" \
+		"${VAULT_ADDR%/}/v1/${path#/}" "$@"
+}
+
+wait_for_vault() {
+	local waited=0
+	say "waiting for Vault to answer on $VAULT_ADDR ..."
+	while [ "$waited" -lt 60 ]; do
+		if curl -sf -o /dev/null --max-time 3 "${VAULT_ADDR%/}/v1/sys/health"; then
+			say "  up after ${waited}s"
+			return 0
+		fi
+		sleep 2
+		waited=$((waited + 2))
+	done
+	die "Vault did not answer within 60s.
+       Look at:  cd deploy/vault && docker compose logs --tail=50 vault"
+}
+
+enable_kv() {
+	step "KV v2 at '$MOUNT/'"
+	if api GET "sys/mounts/$MOUNT" 2>/dev/null | grep -q '"type":"kv"'; then
+		say "  already enabled"
+		return 0
+	fi
+	api POST "sys/mounts/$MOUNT" \
+		--data "{\"type\":\"kv\",\"options\":{\"version\":\"2\"}}" >/dev/null &&
+		say "  enabled" || die "could not enable the KV mount"
+}
+
+seed_managers() {
+	step "seeding one secret per manager"
+	local seeded=0 placeholders=0 site path user password
+
+	while IFS='	' read -r site path; do
+		[ -n "$site" ] || continue
+		[ "$path" != "-" ] || {
+			say "  skip $site — no vault_path recorded"
+			continue
+		}
+
+		user="$NSX_USER"
+		password="$NSX_PASSWORD"
+		if [ -z "$user" ]; then
+			# A placeholder is better than an empty secret: the path exists, the
+			# plumbing is provably working, and the failure when it reaches a
+			# real manager is an authentication error that says so.
+			user="placeholder-not-a-real-account"
+			password="placeholder-$(head -c 9 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+			placeholders=$((placeholders + 1))
+		fi
+
+		# KV v2 writes go to <mount>/data/<path>; the inventory records the full
+		# path including 'data', so strip the mount prefix and use it as given.
+		if api POST "${path}" \
+			--data "$(python3 -c '
+import json, sys
+print(json.dumps({"data": {"username": sys.argv[1], "password": sys.argv[2]}}))' "$user" "$password")" >/dev/null; then
+			say "  $site -> $path"
+			seeded=$((seeded + 1))
+		else
+			say "  FAILED $site -> $path"
+		fi
+	done <<-SITES
+		$(python3 "$REPO_ROOT/scripts/ci-matrix.py" --format vault 2>/dev/null)
+	SITES
+
+	say "  $seeded secret(s) written"
+	if [ "$placeholders" -gt 0 ]; then
+		say ""
+		say "  $placeholders of them hold PLACEHOLDER credentials, not real ones."
+		say "  The path and the policy are proven; the password is not a password."
+		say "  Replace them before pointing this at a manager:"
+		say "    scripts/vault-up.sh --nsx-user svc-nsx --nsx-password '...'"
+	fi
+}
+
+make_policies() {
+	step "policies and tokens"
+
+	# Plan reads. Apply reads and lists. Neither writes: nothing in this
+	# repository should ever change a credential.
+	api PUT "sys/policies/acl/nsx-plan" \
+		--data "$(python3 -c '
+import json, sys
+print(json.dumps({"policy": f"path \"{sys.argv[1]}/data/*\" {{ capabilities = [\"read\"] }}"}))' "$MOUNT")" >/dev/null ||
+		die "could not create the nsx-plan policy"
+
+	api PUT "sys/policies/acl/nsx-apply" \
+		--data "$(python3 -c '
+import json, sys
+m = sys.argv[1]
+print(json.dumps({"policy": f"path \"{m}/data/*\" {{ capabilities = [\"read\",\"list\"] }}"}))' "$MOUNT")" >/dev/null ||
+		die "could not create the nsx-apply policy"
+
+	say "  nsx-plan (read) and nsx-apply (read, list)"
+
+	PLAN_TOKEN="$(api POST "auth/token/create" \
+		--data '{"policies":["nsx-plan"],"ttl":"720h","display_name":"nsx-plan"}' |
+		python3 -c 'import json,sys; print(json.load(sys.stdin)["auth"]["client_token"])' 2>/dev/null)"
+	APPLY_TOKEN="$(api POST "auth/token/create" \
+		--data '{"policies":["nsx-apply"],"ttl":"720h","display_name":"nsx-apply"}' |
+		python3 -c 'import json,sys; print(json.load(sys.stdin)["auth"]["client_token"])' 2>/dev/null)"
+
+	[ -n "$PLAN_TOKEN" ] && [ -n "$APPLY_TOKEN" ] || die "could not mint the tokens"
+	say "  two tokens minted, 30 day TTL"
+}
+
+emit_ci() {
+	printf 'export VAULT_ADDR=%s\n' "$VAULT_ADDR"
+	printf 'export VAULT_PLAN_TOKEN=%s\n' "$PLAN_TOKEN"
+	printf 'export VAULT_APPLY_TOKEN=%s\n' "$APPLY_TOKEN"
+}
+
+summary() {
+	cat <<SUMMARY
+
+===================================================================
+ Vault is up:  $VAULT_ADDR
+ Root token:   $ROOT_TOKEN   (dev mode; this is not a secret)
+
+ For the pipeline:
+   VAULT_ADDR         $VAULT_ADDR
+   VAULT_PLAN_TOKEN   $PLAN_TOKEN
+   VAULT_APPLY_TOKEN  $APPLY_TOKEN
+
+ Hand them to GitLab in one step:
+   eval "\$(scripts/vault-up.sh --emit-ci)" && \\
+     scripts/gitlab-setup.sh --url URL --token TOKEN --project group/name --creds vault
+
+ VAULT_APPLY_TOKEN must be marked PROTECTED in GitLab. That is what stops a
+ feature branch reaching the credential that can change a firewall.
+
+ DEV MODE: in memory, unsealed, gone on restart. Not for production.
+===================================================================
+SUMMARY
+}
+
+main() {
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--status)
+			preflight
+			compose ps
+			curl -sf -o /dev/null --max-time 5 "${VAULT_ADDR%/}/v1/sys/health" &&
+				say "state: answering on $VAULT_ADDR" || say "state: not answering"
+			exit 0
+			;;
+		--down)
+			preflight
+			compose down
+			say "stopped. Dev-mode Vault keeps nothing, so this discarded every secret."
+			exit 0
+			;;
+		--destroy)
+			preflight
+			compose down -v
+			say "removed."
+			exit 0
+			;;
+		--emit-ci) EMIT_CI=1; shift ;;
+		--nsx-user) NSX_USER="${2:?--nsx-user needs a value}"; shift 2 ;;
+		--nsx-user=*) NSX_USER="${1#*=}"; shift ;;
+		--nsx-password) NSX_PASSWORD="${2:?--nsx-password needs a value}"; shift 2 ;;
+		--nsx-password=*) NSX_PASSWORD="${1#*=}"; shift ;;
+		-h | --help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+		*) die "unknown option: $1" ;;
+		esac
+	done
+
+	preflight
+	say "starting Vault (deploy/vault/docker-compose.yml)..."
+	compose up -d || die "could not start Vault"
+	wait_for_vault
+	enable_kv
+	seed_managers
+	make_policies
+
+	if [ "$EMIT_CI" = 1 ]; then
+		emit_ci
+	else
+		summary
+	fi
+}
+
+main "$@"
+SCAFFOLD_EOF
+mark_executable scripts/vault-up.sh
+
+write_file deploy/state/README.md <<'SCAFFOLD_EOF'
+# Creating the state backend
+
+The chicken and egg: Terraform needs a state backend, and the backend is
+infrastructure somebody has to create. These configurations create it.
+
+Each one keeps its own state on the **local** backend, and that is deliberate
+rather than an oversight. It is the one state that cannot live in the thing it
+is creating. It is small, it changes about once, and it is the only state in
+this repository that is allowed to work that way — commit it, or keep it
+somewhere you will still have in a year.
+
+```bash
+cd deploy/state/aws
+terraform init
+terraform apply          # creates the bucket and the lock table
+```
+
+Then point the repository at what it made:
+
+```bash
+scripts/gen-backend-configs.py --force \
+  --backend s3 --bucket nsx-terraform-state --region eu-west-2
+```
+
+| Directory | Creates |
+|---|---|
+| `aws/` | S3 bucket (versioned, encrypted, private) and a DynamoDB lock table |
+| `azurerm/` | resource group, storage account, container, with versioning and soft delete |
+| `gcs/` | bucket with object versioning and uniform bucket-level access |
+
+**None of this is needed for GitLab-managed state**, which is the default:
+GitLab provides the locking, the encryption and the history, and there is
+nothing to create. These exist for estates whose organisation requires the
+state to live in its own cloud account.
+
+## What the settings are for
+
+Versioning is what makes a corrupted or truncated state recoverable — without
+it there is no previous version to go back to. Encryption is because state
+holds every rule, group and credential-shaped value in plaintext. The lock is
+what stops two concurrent runs writing the same state, which is the failure
+that produces an estate matching neither result.
+SCAFFOLD_EOF
+
+write_file deploy/state/aws/main.tf <<'SCAFFOLD_EOF'
+# The S3 bucket and DynamoDB table that hold and lock this repository's state.
+#
+# This configuration keeps its OWN state locally, because it is creating the
+# place remote state lives. That is the one legitimate use of the local backend
+# here. Commit deploy/state/aws/terraform.tfstate, or keep it somewhere durable:
+# losing it means importing these resources again to change them.
+#
+#   terraform init && terraform apply
+#
+# Then:
+#   scripts/gen-backend-configs.py --force --backend s3 \
+#     --bucket "$(terraform output -raw bucket)" --region eu-west-2
+
+terraform {
+  required_version = ">= 1.9"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+  backend "local" {}
+}
+
+provider "aws" {
+  region = var.region
+}
+
+variable "region" {
+  description = "Region for the state bucket and lock table."
+  type        = string
+  default     = "eu-west-2"
+}
+
+variable "bucket" {
+  description = "State bucket name. Must be globally unique across all of S3."
+  type        = string
+  default     = "nsx-terraform-state"
+}
+
+variable "lock_table" {
+  description = <<-EOT
+    DynamoDB table for state locking. Leave the default unless you also set
+    use_lockfile in the backend config, in which case no table is needed and
+    create_lock_table can be false.
+  EOT
+  type        = string
+  default     = "nsx-terraform-locks"
+}
+
+variable "create_lock_table" {
+  description = "False when locking with Terraform 1.10's use_lockfile instead."
+  type        = bool
+  default     = true
+}
+
+resource "aws_s3_bucket" "state" {
+  bucket = var.bucket
+
+  # State is not disposable. Removing this bucket by accident removes the
+  # record of what the estate is.
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# Without versioning there is no previous state to recover to, and a truncated
+# write is unrecoverable rather than inconvenient.
+resource "aws_s3_bucket_versioning" "state" {
+  bucket = aws_s3_bucket.state.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+# State holds every rule, group and credential-shaped value in plaintext.
+resource "aws_s3_bucket_server_side_encryption_configuration" "state" {
+  bucket = aws_s3_bucket.state.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "state" {
+  bucket                  = aws_s3_bucket.state.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# Old versions are kept long enough to recover from a bad apply, not forever:
+# every version is a full copy of the estate's security posture.
+resource "aws_s3_bucket_lifecycle_configuration" "state" {
+  bucket = aws_s3_bucket.state.id
+  rule {
+    id     = "expire-noncurrent"
+    status = "Enabled"
+    filter {}
+    noncurrent_version_expiration {
+      noncurrent_days = 90
+    }
+  }
+  depends_on = [aws_s3_bucket_versioning.state]
+}
+
+# The lock. LockID is the key name Terraform's s3 backend uses; it is not a
+# choice. PAY_PER_REQUEST because this table sees a handful of writes a day.
+resource "aws_dynamodb_table" "locks" {
+  count        = var.create_lock_table ? 1 : 0
+  name         = var.lock_table
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "LockID"
+
+  attribute {
+    name = "LockID"
+    type = "S"
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+output "bucket" {
+  value       = aws_s3_bucket.state.id
+  description = "Pass to gen-backend-configs.py --bucket"
+}
+
+output "lock_table" {
+  value       = var.create_lock_table ? aws_dynamodb_table.locks[0].name : null
+  description = "Pass to gen-backend-configs.py --dynamodb-table"
+}
+
+output "region" {
+  value = var.region
+}
+SCAFFOLD_EOF
+
+write_file deploy/state/azurerm/main.tf <<'SCAFFOLD_EOF'
+# The storage account and container that hold this repository's state.
+# Blob leases provide the locking, so there is no separate lock table.
+#
+# Keeps its own state locally — see deploy/state/README.md.
+
+terraform {
+  required_version = ">= 1.9"
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 4.0"
+    }
+  }
+  backend "local" {}
+}
+
+provider "azurerm" {
+  features {}
+}
+
+variable "location" {
+  type    = string
+  default = "uksouth"
+}
+
+variable "resource_group" {
+  type    = string
+  default = "rg-terraform-state"
+}
+
+variable "storage_account" {
+  description = "Globally unique, 3-24 characters, lowercase letters and digits."
+  type        = string
+  default     = "sttfstatensx"
+}
+
+variable "container" {
+  type    = string
+  default = "state"
+}
+
+resource "azurerm_resource_group" "state" {
+  name     = var.resource_group
+  location = var.location
+}
+
+resource "azurerm_storage_account" "state" {
+  name                            = var.storage_account
+  resource_group_name             = azurerm_resource_group.state.name
+  location                        = azurerm_resource_group.state.location
+  account_tier                    = "Standard"
+  account_replication_type        = "GRS"
+  min_tls_version                 = "TLS1_2"
+  allow_nested_items_to_be_public = false
+
+  blob_properties {
+    # Versioning is what makes a corrupted state recoverable; soft delete is
+    # what makes a deleted one recoverable.
+    versioning_enabled = true
+    delete_retention_policy {
+      days = 30
+    }
+    container_delete_retention_policy {
+      days = 30
+    }
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "azurerm_storage_container" "state" {
+  name                  = var.container
+  storage_account_id    = azurerm_storage_account.state.id
+  container_access_type = "private"
+}
+
+output "resource_group" {
+  value = azurerm_resource_group.state.name
+}
+
+output "storage_account" {
+  value = azurerm_storage_account.state.name
+}
+
+output "container" {
+  value = azurerm_storage_container.state.name
+}
+SCAFFOLD_EOF
+
+write_file deploy/state/gcs/main.tf <<'SCAFFOLD_EOF'
+# The GCS bucket that holds this repository's state. GCS provides the locking
+# itself, so there is nothing else to create.
+#
+# Keeps its own state locally — see deploy/state/README.md.
+
+terraform {
+  required_version = ">= 1.9"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 6.0"
+    }
+  }
+  backend "local" {}
+}
+
+variable "project" {
+  description = "GCP project id."
+  type        = string
+}
+
+variable "location" {
+  type    = string
+  default = "EU"
+}
+
+variable "bucket" {
+  description = "Globally unique bucket name."
+  type        = string
+  default     = "nsx-terraform-state"
+}
+
+provider "google" {
+  project = var.project
+}
+
+resource "google_storage_bucket" "state" {
+  name     = var.bucket
+  location = var.location
+
+  # Uniform access means IAM alone decides who can read state, with no
+  # per-object ACL quietly granting more.
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+
+  versioning {
+    enabled = true
+  }
+
+  lifecycle_rule {
+    condition {
+      num_newer_versions = 10
+    }
+    action {
+      type = "Delete"
+    }
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+output "bucket" {
+  value = google_storage_bucket.state.name
+}
 SCAFFOLD_EOF
 
 write_file deploy/gitlab/docker-compose.yml <<'SCAFFOLD_EOF'
@@ -7345,15 +8945,24 @@ login. For a production estate use a real GitLab and point
 
 Set these in the project, under Settings → CI/CD → Variables:
 
+With the default credential source, GitLab's own variables:
+
 | Variable | Value | Flags |
 |---|---|---|
-| `VAULT_ADDR` | your Vault endpoint | masked |
-| `VAULT_PLAN_TOKEN` | a **read-only** token | masked |
-| `VAULT_APPLY_TOKEN` | a write token | masked, **protected** |
+| `NSX_PLAN_USERNAME` / `NSX_PLAN_PASSWORD` | a **read-only** NSX account | masked |
+| `NSX_APPLY_USERNAME` / `NSX_APPLY_PASSWORD` | an account that can write | masked, **protected** |
 | `CI_API_TOKEN` | project token, `api` scope — lets the pipeline post plans to the MR | masked |
 
-`VAULT_APPLY_TOKEN` must be protected, so it is only available on protected
-branches. That is what stops a feature branch from applying anything.
+With `--creds vault`, `VAULT_ADDR`, `VAULT_PLAN_TOKEN` and a protected
+`VAULT_APPLY_TOKEN` instead. `scripts/vault-up.sh --emit-ci` prints them.
+
+The apply credential must be **protected**, so it is only available on protected
+branches. That is what stops a feature branch from applying anything, and it is
+the one setting here that looks fine when it is wrong.
+
+GitLab refuses to mask a value shorter than 8 characters or containing
+whitespace, and stores it unmasked instead. `scripts/gitlab-setup.sh` checks
+before sending and stops rather than letting a password reach a job log.
 SCAFFOLD_EOF
 
 write_file scripts/gitlab-setup.sh <<'SCAFFOLD_EOF'
@@ -7371,19 +8980,28 @@ write_file scripts/gitlab-setup.sh <<'SCAFFOLD_EOF'
 # What it does, each step skipped if already done:
 #   1. create the project (and the group, if it does not exist)
 #   2. push this repository to it
-#   3. set the CI/CD variables the pipeline needs
-#   4. protect the default branch so nobody can push straight to it
-#   5. create one environment per manager/stack for the apply jobs
+#   3. record the Terraform state address, which needs the project id
+#   4. set the CI/CD variables the pipeline needs
+#   5. protect the default branch so nobody can push straight to it
+#   6. create one environment per manager/stack for the apply jobs
 #
 # The token needs the 'api' scope and Maintainer or Owner on the group. It is
 # read from --token or GITLAB_TOKEN, used in memory, and never written to disk
 # or into .git/config.
 #
 # Credentials for the pipeline are passed as environment variables, so they do
-# not appear in your shell history:
+# not appear in your shell history. Which ones depends on --creds, which
+# defaults to whatever the tree was generated with:
+#
+#   NSX_PLAN_USERNAME=... NSX_PLAN_PASSWORD=... \
+#   NSX_APPLY_USERNAME=... NSX_APPLY_PASSWORD=... \
+#     scripts/gitlab-setup.sh --url ... --token ... --project ...
 #
 #   VAULT_ADDR=... VAULT_PLAN_TOKEN=... VAULT_APPLY_TOKEN=... \
-#     scripts/gitlab-setup.sh --url ... --token ... --project ...
+#     scripts/gitlab-setup.sh --url ... --token ... --project ... --creds vault
+#
+# The plan pair is readable by every branch. The apply pair is marked PROTECTED,
+# so only a protected branch can reach the account that can change a firewall.
 
 set -uo pipefail
 
@@ -7394,6 +9012,15 @@ TOKEN="${GITLAB_TOKEN:-}"
 PROJECT="${GITLAB_PROJECT:-}"
 BRANCH="${GIT_BRANCH:-main}"
 DRY=0
+
+# Which credential variables the pipeline will look for. The tree recorded its
+# own choice when it was generated; --creds overrides it for this run.
+CREDS=""
+if [ -f "$REPO_ROOT/envs/tree.env" ]; then
+	# shellcheck disable=SC1091
+	. "$REPO_ROOT/envs/tree.env"
+	CREDS="${NSX_CREDS_DEFAULT:-}"
+fi
 
 die() {
 	printf 'error: %s\n' "$*" >&2
@@ -7412,6 +9039,8 @@ while [ $# -gt 0 ]; do
 	--project=*) PROJECT="${1#*=}"; shift ;;
 	--branch) BRANCH="${2:?--branch needs a name}"; shift 2 ;;
 	--branch=*) BRANCH="${1#*=}"; shift ;;
+	--creds) CREDS="${2:?--creds needs gitlab, vault, vcf, env or file}"; shift 2 ;;
+	--creds=*) CREDS="${1#*=}"; shift ;;
 	--dry-run) DRY=1; shift ;;
 	-h | --help) sed -n '2,30p' "$0"; exit 0 ;;
 	*) die "unknown option: $1" ;;
@@ -7527,11 +9156,67 @@ else
 	fi
 fi
 
-# --- 3. CI/CD variables ---------------------------------------------------
+# --- 3. the state address -------------------------------------------------
+# GitLab-managed Terraform state is addressed by PROJECT ID, which nothing knows
+# until the project exists. This is the first moment it is known, so record it
+# here rather than leaving a URL for somebody to assemble by hand.
+#
+# The file holds a URL and nothing else. The credentials are TF_HTTP_USERNAME
+# and TF_HTTP_PASSWORD, which come from the environment.
+if grep -qs 'backend "http"' "$REPO_ROOT"/stacks/*/backend.tf 2>/dev/null; then
+	step "state address"
+	state_base="${URL%/}/api/v4/projects/${pid}/terraform/state"
+	if [ "$DRY" = 1 ]; then
+		say "  would write envs/gitlab-state.env -> $state_base"
+	else
+		mkdir -p "$REPO_ROOT/envs"
+		cat >"$REPO_ROOT/envs/gitlab-state.env" <<STATE_EOF
+# Written by scripts/gitlab-setup.sh. Committed on purpose.
+#
+# Where GitLab keeps this project's Terraform state. A URL, not a credential:
+# the state API authenticates with TF_HTTP_USERNAME and TF_HTTP_PASSWORD, which
+# come from the environment (gitlab-ci-token + \$CI_JOB_TOKEN inside CI).
+#
+# scripts/tf.sh appends <tier>-<site>-<stack> to this, so each stack at each
+# manager gets its own state and prod cannot share state with nonprod.
+GITLAB_STATE_BASE=$state_base
+STATE_EOF
+		say "  envs/gitlab-state.env -> $state_base"
+		say "  commit it: the pipeline and every engineer need the same address."
+	fi
+fi
+
+# --- 4. CI/CD variables ---------------------------------------------------
 step "CI/CD variables"
+# GitLab silently stores a value UNMASKED when it cannot mask it, and the first
+# time anyone notices is a password in a job log. The rules: at least 8
+# characters, no whitespace, and only base64 alphabet plus @:.~+-/. Check here
+# and stop, rather than let the API decide quietly.
+maskable() {
+	local value="$1"
+	[ "${#value}" -ge 8 ] || return 1
+	case "$value" in
+	*[![:alnum:]@:.~+/-]*) return 1 ;;
+	esac
+	return 0
+}
+
 set_var() {
 	local key="$1" value="$2" protected="$3" masked="$4"
 	[ -n "$value" ] || { say "  skip $key (not supplied)"; return 0; }
+	if [ "$masked" = true ] && ! maskable "$value"; then
+		die "$key cannot be masked by GitLab, and storing it unmasked would put it in
+       job logs the first time something echoes the environment.
+
+       GitLab masks a value only when it is at least 8 characters and contains
+       nothing outside A-Z a-z 0-9 @ : . ~ + - /
+
+       Two ways forward, and the first is better:
+         * change the service account's password to one that satisfies that
+         * store it as a File-type variable instead, and read it from the path
+
+       Nothing was set for $key."
+	fi
 	if [ "$DRY" = 1 ]; then say "  would set $key (protected=$protected)"; return 0; fi
 	local existing
 	existing="$(api GET "/projects/$pid/variables/$key" | jget key)"
@@ -7549,20 +9234,74 @@ set_var() {
 	fi
 }
 
-set_var VAULT_ADDR "${VAULT_ADDR:-}" false false
-set_var VAULT_PLAN_TOKEN "${VAULT_PLAN_TOKEN:-}" false true
-# Protected, so a feature branch can never reach the write credential.
-set_var VAULT_APPLY_TOKEN "${VAULT_APPLY_TOKEN:-}" true true
 set_var CI_API_TOKEN "${CI_API_TOKEN:-$TOKEN}" false true
 
-if [ -z "${VAULT_ADDR:-}${VAULT_PLAN_TOKEN:-}${VAULT_APPLY_TOKEN:-}" ]; then
-	say ""
-	say "  none of the Vault variables were supplied, so the plan jobs cannot reach"
-	say "  a manager yet. Set them here, or re-run with them in the environment:"
-	say "    $URL/$PROJECT/-/settings/ci_cd"
-fi
+# Which credential variables the pipeline will look for. The tree recorded its
+# choice when it was generated; --creds overrides it for this run.
+case "$CREDS" in
+gitlab)
+	# Two accounts, and the difference between them is the whole point:
+	#   plan  — read-only on NSX, available to every branch
+	#   apply — can write to the firewall, PROTECTED so only a protected
+	#           branch can read it. A feature branch cannot reach it at all.
+	set_var NSX_PLAN_USERNAME "${NSX_PLAN_USERNAME:-}" false true
+	set_var NSX_PLAN_PASSWORD "${NSX_PLAN_PASSWORD:-}" false true
+	set_var NSX_APPLY_USERNAME "${NSX_APPLY_USERNAME:-}" true true
+	set_var NSX_APPLY_PASSWORD "${NSX_APPLY_PASSWORD:-}" true true
 
-# --- 4. protect the default branch ---------------------------------------
+	# Per-site and per-tier overrides, when the caller exported any. Same
+	# protection rule: anything with APPLY in the name is protected.
+	for var in $(env | sed -n 's/^\(NSX_[A-Z0-9_]*_\(PLAN\|APPLY\)_\(USERNAME\|PASSWORD\)\)=.*/\1/p' | sort -u); do
+		case "$var" in
+		NSX_PLAN_* | NSX_APPLY_*) continue ;; # already set above
+		*_APPLY_*) set_var "$var" "${!var}" true true ;;
+		*) set_var "$var" "${!var}" false true ;;
+		esac
+	done
+
+	if [ -z "${NSX_PLAN_USERNAME:-}${NSX_APPLY_USERNAME:-}" ]; then
+		say ""
+		say "  No NSX credentials were supplied, so plan jobs cannot reach a manager"
+		say "  yet. This is the one thing still to do. Set four variables here:"
+		say "    $URL/$PROJECT/-/settings/ci_cd"
+		say ""
+		say "    NSX_PLAN_USERNAME    read-only account      masked"
+		say "    NSX_PLAN_PASSWORD                           masked"
+		say "    NSX_APPLY_USERNAME   account that can write masked, PROTECTED"
+		say "    NSX_APPLY_PASSWORD                          masked, PROTECTED"
+		say ""
+		say "  Or re-run with them in the environment and this will do it:"
+		say "    NSX_PLAN_USERNAME=... NSX_PLAN_PASSWORD=... \\"
+		say "    NSX_APPLY_USERNAME=... NSX_APPLY_PASSWORD=... \\"
+		say "      scripts/gitlab-setup.sh --url $URL --token TOKEN --project $PROJECT"
+		say ""
+		say "  The APPLY pair MUST be marked protected. That is what stops a feature"
+		say "  branch from reaching the account that can change the firewall."
+	fi
+	;;
+vault)
+	set_var VAULT_ADDR "${VAULT_ADDR:-}" false false
+	set_var VAULT_PLAN_TOKEN "${VAULT_PLAN_TOKEN:-}" false true
+	# Protected, so a feature branch can never reach the write credential.
+	set_var VAULT_APPLY_TOKEN "${VAULT_APPLY_TOKEN:-}" true true
+
+	if [ -z "${VAULT_ADDR:-}${VAULT_PLAN_TOKEN:-}${VAULT_APPLY_TOKEN:-}" ]; then
+		say ""
+		say "  none of the Vault variables were supplied, so the plan jobs cannot reach"
+		say "  a manager yet. Set them here, or re-run with them in the environment:"
+		say "    $URL/$PROJECT/-/settings/ci_cd"
+		say ""
+		say "  scripts/vault-up.sh --emit-ci prints them for a lab Vault."
+	fi
+	;;
+*)
+	say "  credential source is '$CREDS': nothing to set here."
+	say "  The pipeline expects NSXT_USERNAME and NSXT_PASSWORD to arrive some"
+	say "  other way. See docs/GITOPS.md."
+	;;
+esac
+
+# --- 5. protect the default branch ---------------------------------------
 step "protecting '$BRANCH'"
 if [ "$DRY" = 1 ]; then
 	say "  would protect $BRANCH (no direct push, maintainers may merge)"
@@ -7581,7 +9320,7 @@ else
 	fi
 fi
 
-# --- 5. environments for the apply jobs ----------------------------------
+# --- 6. environments for the apply jobs ----------------------------------
 step "environments"
 if [ -f "$REPO_ROOT/inventory/managers.yaml" ] && [ "$DRY" != 1 ]; then
 	rows="$(cd "$REPO_ROOT" && python3 -c "
@@ -7728,7 +9467,7 @@ api() {
 make_root_token() {
 	# A token minted through the Rails console, because there is no API to
 	# create the first token without one.
-	say "minting an API token for root..."
+	[ "${QUIET_TOKEN:-0}" = 1 ] || say "minting an API token for root..."
 	ROOT_TOKEN="$(
 		docker exec nsx-gitlab gitlab-rails runner "
           u = User.find_by_username('root')
@@ -7857,6 +9596,16 @@ main() {
        Reset with: docker exec -it nsx-gitlab gitlab-rake \"gitlab:password:reset[root]\""
 		exit 0
 		;;
+	--print-token)
+		# Mint an API token and print nothing else, so another script can use
+		# the API without a second implementation of this. scripts/one-touch.sh
+		# is the caller. The token is short-lived and never written to disk.
+		preflight
+		TOKEN_SEED="nsxbootstrap$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+		QUIET_TOKEN=1 make_root_token
+		printf '%s\n' "$ROOT_TOKEN"
+		exit 0
+		;;
 	--down)
 		preflight
 		compose down
@@ -7905,6 +9654,393 @@ main() {
 main "$@"
 SCAFFOLD_EOF
 mark_executable scripts/gitlab-up.sh
+
+write_file scripts/one-touch.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# From a generated tree to a green pipeline, in one command.
+#
+#   scripts/one-touch.sh              run every stage that has not run
+#   scripts/one-touch.sh --resume     the same thing; the name people reach for
+#   scripts/one-touch.sh --status     what has been done so far
+#   scripts/one-touch.sh --restart    forget the progress and start over
+#
+# What it is for: a fresh tree needs a git host, a place for state, credentials
+# and an initialised set of stacks before anything can run. Each of those is a
+# command somebody has to know about, in an order that matters. This is that
+# order, written down and executed.
+#
+# WHAT IT DOES NOT DO, and will not pretend to:
+#
+#   * decide which NSX manager is safe to point at first
+#   * accept the risk of the first apply
+#   * give you real NSX credentials
+#
+# Those are decisions and secrets, not steps. What you get is everything up to
+# them: a GitLab with this repository in it, a pipeline that runs, state that
+# locks, and a plan job waiting for credentials you supply.
+#
+# Every stage is idempotent and records itself in .one-touch-state, so a failure
+# is resumed rather than restarted. Run it as many times as you like.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT" || exit 1
+
+STATE_FILE="$REPO_ROOT/.one-touch-state"
+GITLAB_HOST="${GITLAB_HOST:-localhost}"
+GITLAB_PORT="${GITLAB_PORT:-8929}"
+GITLAB_URL="${GITLAB_URL:-http://${GITLAB_HOST}:${GITLAB_PORT}}"
+PROJECT_NAME="${PROJECT_NAME:-nsx-terraform}"
+PROJECT_PATH="${PROJECT_PATH:-root/$PROJECT_NAME}"
+BRANCH="${GIT_BRANCH:-main}"
+
+CREDS=gitlab
+if [ -f envs/tree.env ]; then
+	# shellcheck disable=SC1091
+	. ./envs/tree.env
+	CREDS="${NSX_CREDS_DEFAULT:-gitlab}"
+fi
+
+say() { printf '%s\n' "$*"; }
+stage_banner() { printf '\n=== %s %s\n' "$1" "$(printf '%.0s-' $(seq 1 $((58 - ${#1}))))"; }
+
+# A stage that fails says which stage, why, and the one command that resumes.
+# Half a deployment with no idea where it stopped is worse than no deployment.
+fail() {
+	local stage="$1"
+	shift
+	printf '\n' >&2
+	printf 'FAILED at stage: %s\n' "$stage" >&2
+	printf '\n' >&2
+	printf '%s\n' "$*" >&2
+	printf '\n' >&2
+	printf 'Nothing after this stage has run. When the cause is fixed:\n' >&2
+	printf '  scripts/one-touch.sh --resume\n' >&2
+	printf '\n' >&2
+	printf 'Earlier stages are recorded in .one-touch-state and will be skipped.\n' >&2
+	exit 1
+}
+
+done_already() { [ -f "$STATE_FILE" ] && grep -qx "$1" "$STATE_FILE"; }
+mark_done() { printf '%s\n' "$1" >>"$STATE_FILE"; }
+
+STAGES="preflight vault gitlab backends init pipeline"
+
+usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-}" in
+--status)
+	say "stages, in order:"
+	for st in $STAGES; do
+		if done_already "$st"; then say "  done     $st"; else say "  pending  $st"; fi
+	done
+	exit 0
+	;;
+--restart)
+	rm -f "$STATE_FILE"
+	say "progress forgotten. Every stage will run again; each one is idempotent."
+	;;
+--resume | "") ;;
+-h | --help)
+	usage
+	exit 0
+	;;
+*)
+	say "unknown option: $1"
+	usage
+	exit 1
+	;;
+esac
+
+# --- preflight -------------------------------------------------------------
+# Checked before anything is started, so a missing dependency is a message
+# rather than a half-built lab.
+if ! done_already preflight; then
+	stage_banner preflight
+
+	command -v docker >/dev/null 2>&1 ||
+		fail preflight "docker is not installed.
+See https://docs.docker.com/engine/install/"
+
+	docker info >/dev/null 2>&1 ||
+		fail preflight "cannot talk to the Docker daemon.
+Is it running, and is your user in the docker group?"
+
+	command -v python3 >/dev/null 2>&1 ||
+		fail preflight "python3 is required by the validators and the CI matrix."
+
+	command -v git >/dev/null 2>&1 || fail preflight "git is required."
+
+	# GitLab genuinely needs this much. Finding out by watching it get OOM
+	# killed twenty minutes in is a bad way to learn it.
+	if [ -r /proc/meminfo ]; then
+		kb="$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null)"
+		if [ -n "$kb" ] && [ "$kb" -lt 3500000 ]; then
+			say "  WARNING: $((kb / 1024)) MB available. GitLab wants about 4 GB and"
+			say "           will be slow or be killed with less."
+		else
+			say "  memory looks sufficient"
+		fi
+	fi
+
+	for port in "$GITLAB_PORT" 2224; do
+		if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":${port} "; then
+			fail preflight "port $port is already in use, and GitLab needs it.
+Stop whatever is using it, or set GITLAB_PORT to something else:
+  GITLAB_PORT=9080 scripts/one-touch.sh"
+		fi
+	done
+	say "  ports are free"
+
+	mark_done preflight
+fi
+
+# --- vault -----------------------------------------------------------------
+# Only when this tree uses Vault. The default is GitLab CI/CD variables, which
+# need nothing here, and standing up a Vault nobody asked for would be the
+# opposite of one-touch.
+if ! done_already vault; then
+	stage_banner vault
+	if [ "$CREDS" = vault ]; then
+		[ -x scripts/vault-up.sh ] ||
+			fail vault "scripts/vault-up.sh is missing. Re-run scripts/bootstrap.sh."
+
+		say "  this tree uses Vault credentials; starting and seeding one"
+		eval "$(scripts/vault-up.sh --emit-ci)" ||
+			fail vault "Vault did not come up or could not be seeded.
+Look at:  cd deploy/vault && docker compose logs --tail=50 vault
+Then:     scripts/vault-up.sh"
+
+		export VAULT_ADDR VAULT_PLAN_TOKEN VAULT_APPLY_TOKEN
+		say "  Vault seeded; the two tokens will be passed to GitLab in the next stage"
+	else
+		say "  credentials come from GitLab CI/CD variables; no Vault needed"
+	fi
+	mark_done vault
+fi
+
+# --- gitlab ----------------------------------------------------------------
+# gitlab-up.sh starts the containers and hands over to gitlab-setup.sh, which
+# creates the project, pushes, writes the state address and sets the CI
+# variables. One implementation of each, called from here in order.
+if ! done_already gitlab; then
+	stage_banner gitlab
+	[ -x scripts/gitlab-up.sh ] ||
+		fail gitlab "scripts/gitlab-up.sh is missing. Re-run scripts/bootstrap.sh."
+
+	say "  starting GitLab and a runner. First boot takes several minutes."
+	scripts/gitlab-up.sh ||
+		fail gitlab "GitLab did not come up, or the project could not be set up.
+Look at:  cd deploy/gitlab && docker compose logs --tail=100 gitlab
+Then:     scripts/gitlab-up.sh          (it is re-runnable)"
+
+	mark_done gitlab
+fi
+
+# --- backends --------------------------------------------------------------
+# The state address only exists once the project does, so the backend configs
+# are regenerated here rather than at generation time.
+if ! done_already backends; then
+	stage_banner backends
+	[ -f envs/gitlab-state.env ] || [ "${NSX_BACKEND:-local}" != http ] ||
+		fail backends "envs/gitlab-state.env was not written, so there is no state address.
+That file comes from scripts/gitlab-setup.sh once the project exists.
+Re-run:  scripts/gitlab-up.sh"
+
+	python3 scripts/gen-backend-configs.py ||
+		fail backends "could not write the per-manager backend configs.
+Re-run:  scripts/gen-backend-configs.py"
+
+	mark_done backends
+fi
+
+# --- init ------------------------------------------------------------------
+# Proves the backend is reachable and writes the provider lock file, which is
+# committed so every site resolves the same provider build.
+if ! done_already init; then
+	stage_banner init
+	if ! command -v terraform >/dev/null 2>&1; then
+		say "  terraform is not installed locally, so the stacks were not initialised."
+		say "  Not fatal: the pipeline runs terraform in a container. Install it"
+		say "  when you want to plan from your own machine."
+		mark_done init
+	else
+		failed=""
+		for stack in stacks/*/; do
+			name="$(basename "$stack")"
+			# global-security runs against the GM; every other stack needs a
+			# Local Manager. Use the first manager of the right kind.
+			site="$(python3 scripts/ci-matrix.py --stack "$name" --format lines 2>/dev/null | head -1 | cut -f1)"
+			[ -n "$site" ] || continue
+			printf '  %-16s @ %-6s ' "$name" "$site"
+			if scripts/tf.sh init "$name" "$site" >/dev/null 2>&1; then
+				printf 'ok\n'
+			else
+				printf 'FAILED\n'
+				failed="$failed $name"
+			fi
+		done
+		if [ -n "$failed" ]; then
+			fail init "terraform init failed for:$failed
+
+Usually the state backend is not reachable yet. See the real error with:
+  scripts/tf.sh init${failed%% *} $site"
+		fi
+		git add -f stacks/*/.terraform.lock.hcl 2>/dev/null &&
+			say "  provider lock files staged — commit them"
+		mark_done init
+	fi
+fi
+
+# --- pipeline --------------------------------------------------------------
+# The stage that decides whether any of this worked. Everything above can
+# succeed while the pipeline is still rejected by GitLab's own parser.
+if ! done_already pipeline; then
+	stage_banner pipeline
+
+	token="$(scripts/gitlab-up.sh --print-token 2>/dev/null | tail -1)"
+	[ -n "$token" ] ||
+		fail pipeline "could not mint a GitLab API token to watch the pipeline with.
+GitLab is probably still starting. Check:  scripts/gitlab-up.sh --status"
+
+	enc="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$PROJECT_PATH")"
+	api() { curl -sS -H "PRIVATE-TOKEN: $token" "${GITLAB_URL%/}/api/v4$1"; }
+
+	pid="$(api "/projects/$enc" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' 2>/dev/null)"
+	[ -n "$pid" ] ||
+		fail pipeline "the project $PROJECT_PATH does not exist on $GITLAB_URL.
+Re-run:  scripts/gitlab-up.sh"
+
+	# CI lint first. Valid YAML is not a valid pipeline, and this is the
+	# cheapest place to find out which one you have.
+	say "  linting .gitlab-ci.yml"
+	lint="$(curl -sS -H "PRIVATE-TOKEN: $token" \
+		--data-urlencode "content@.gitlab-ci.yml" \
+		"${GITLAB_URL%/}/api/v4/projects/$pid/ci/lint")"
+	if printf '%s' "$lint" | grep -q '"valid":true'; then
+		say "  the pipeline definition is one GitLab accepts"
+	else
+		fail pipeline "GitLab rejected .gitlab-ci.yml:
+
+$(printf '%s' "$lint" | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+    for e in d.get("errors", []) or ["(no message)"]:
+        print("  " + e)
+except Exception:
+    print("  (could not parse the lint response)")' 2>/dev/null)"
+	fi
+
+	say "  waiting for a pipeline to run (up to 10 minutes)"
+	waited=0
+	status=""
+	while [ "$waited" -lt 600 ]; do
+		status="$(api "/projects/$pid/pipelines?ref=$BRANCH&per_page=1" |
+			python3 -c 'import json,sys
+try:
+    p = json.load(sys.stdin)
+    print(p[0]["status"] if p else "")
+except Exception:
+    print("")' 2>/dev/null)"
+		case "$status" in
+		success | failed | canceled) break ;;
+		esac
+		sleep 10
+		waited=$((waited + 10))
+	done
+
+	case "$status" in
+	success)
+		say "  pipeline: SUCCESS"
+		mark_done pipeline
+		;;
+	failed)
+		# A red pipeline here is expected when no NSX credentials are set: the
+		# plan jobs cannot reach a manager. Saying which half failed is the
+		# difference between "it works" and "something is broken".
+		validate="$(api "/projects/$pid/pipelines/$(api "/projects/$pid/pipelines?ref=$BRANCH&per_page=1" |
+			python3 -c 'import json,sys; p=json.load(sys.stdin); print(p[0]["id"] if p else "")')/jobs" |
+			python3 -c 'import json,sys
+try:
+    for j in json.load(sys.stdin):
+        if j["stage"] == "validate":
+            print(j["status"])
+except Exception:
+    pass' 2>/dev/null | sort -u | tr "\n" " ")"
+		if printf '%s' "$validate" | grep -q success; then
+			say "  pipeline: the validate stage PASSED; a later stage failed."
+			say ""
+			say "  That is the expected result with no NSX credentials set: the plan"
+			say "  jobs have no manager to reach. Everything this script is"
+			say "  responsible for is working."
+			mark_done pipeline
+		else
+			fail pipeline "the validate stage did not pass, which means something is wrong
+with the repository rather than with the credentials.
+
+Look at:  $GITLAB_URL/$PROJECT_PATH/-/pipelines"
+		fi
+		;;
+	*)
+		fail pipeline "no pipeline finished within 10 minutes (last status: ${status:-none}).
+
+The runner may not have picked the job up. Check:
+  $GITLAB_URL/$PROJECT_PATH/-/pipelines
+  cd deploy/gitlab && docker compose logs --tail=50 runner"
+		;;
+	esac
+fi
+
+# --- what is left ----------------------------------------------------------
+cat <<SUMMARY
+
+===================================================================
+ Done. Every stage completed.
+
+   GitLab      $GITLAB_URL/$PROJECT_PATH
+   Password    scripts/gitlab-up.sh --password
+   State       GitLab-managed, one per <tier>-<site>-<stack>
+
+ WHAT IS LEFT, and it is not a step this script can do for you:
+
+SUMMARY
+
+case "$CREDS" in
+gitlab)
+	cat <<'SUMMARY'
+   Two NSX service accounts, set as CI/CD variables:
+     NSX_PLAN_USERNAME  / NSX_PLAN_PASSWORD    read-only, masked
+     NSX_APPLY_USERNAME / NSX_APPLY_PASSWORD   masked AND PROTECTED
+
+   The apply pair MUST be protected. That is what stops a feature branch
+   reaching the account that can change a firewall.
+SUMMARY
+	;;
+vault)
+	cat <<'SUMMARY'
+   Real NSX credentials in Vault, replacing the placeholders:
+     scripts/vault-up.sh --nsx-user svc-nsx --nsx-password '...'
+
+   The Vault running here is dev mode: in memory, unsealed, gone on
+   restart. Point VAULT_ADDR at a real one before this matters.
+SUMMARY
+	;;
+esac
+
+cat <<'SUMMARY'
+
+   Then, and only then:
+     make ready                     what still blocks a production apply
+     make plan STACK=... SITE=...   against a manager you chose deliberately
+
+   No plan in this repository has ever run against an NSX manager. Provider
+   schema validity is not API validity.
+===================================================================
+SUMMARY
+SCAFFOLD_EOF
+mark_executable scripts/one-touch.sh
 
 write_file scripts/selftest.sh <<'SCAFFOLD_EOF'
 #!/usr/bin/env bash
@@ -7974,9 +10110,21 @@ else
 fi
 
 for f in Makefile README.md docs/ARCHITECTURE.md scripts/validate-data.py \
-	stacks/global-security/main.tf modules/dfw-policy/main.tf; do
+	stacks/global-security/main.tf modules/dfw-policy/main.tf \
+	scripts/one-touch.sh scripts/gen-backend-configs.py scripts/vault-up.sh \
+	envs/tree.env deploy/state/aws/main.tf deploy/vault/docker-compose.yml; do
 	[ -f "$A/$f" ] && ok "present: $f" || bad "missing: $f"
 done
+
+# The backend configs are generated from the inventory, not written by hand,
+# so every enabled manager must have one after a plain run.
+nmgr="$(cd "$A" && python3 scripts/ci-matrix.py --format creds 2>/dev/null | wc -l | tr -d ' ')"
+nbe="$(find "$A/envs" -name '*.backend.hcl' 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$nmgr" -gt 0 ] && [ "$nmgr" = "$nbe" ]; then
+	ok "one backend config per manager ($nbe)"
+else
+	bad "$nmgr manager(s) but $nbe backend config(s) — nothing can initialise for the rest"
+fi
 
 # --------------------------------------------------------------------------
 phase "2. shell and python syntax"
@@ -8072,7 +10220,8 @@ fi
 phase "5. generated YAML and pipelines"
 
 ymls=0
-for f in "$A"/.gitlab-ci.yml "$A"/.github/workflows/*.yml "$A"/deploy/gitlab/docker-compose.yml; do
+for f in "$A"/.gitlab-ci.yml "$A"/.github/workflows/*.yml \
+	"$A"/deploy/gitlab/docker-compose.yml "$A"/deploy/vault/docker-compose.yml; do
 	[ -f "$f" ] || continue
 	ymls=$((ymls + 1))
 	python3 -c "import yaml,sys; yaml.safe_load(open(sys.argv[1]))" "$f" 2>/dev/null ||
@@ -8107,12 +10256,138 @@ if "$BOOTSTRAP" --dir "$G" --ci gitlab --vcs none --quiet </dev/null >/dev/null 
 		bad "apply jobs: $napply, manual gates: $nmanual — they must match"
 	fi
 
-	if printf '%s' "$main" | grep -q 'VAULT_APPLY_TOKEN' &&
-		printf '%s' "$mr" | grep -qv 'VAULT_APPLY_TOKEN'; then
-		ok "the write credential appears only in apply jobs"
+	# The security property, stated as a test rather than as a comment: the
+	# write identity must appear in apply jobs and nowhere a merge request can
+	# reach. This is the assertion that would catch someone "simplifying" the
+	# two credential pairs back into one.
+	if printf '%s' "$main" | grep -q 'NSX_CREDS_ROLE: "apply"' &&
+		! printf '%s' "$mr" | grep -q 'NSX_CREDS_ROLE: "apply"'; then
+		ok "the write identity is requested only by apply jobs"
+	else
+		bad "apply credentials are reachable from a merge request pipeline"
+	fi
+
+	# A production apply must not be automatable by setting a variable.
+	auto="$(cd "$G" && CI_COMMIT_BRANCH=main CI_DEFAULT_BRANCH=main \
+		NSX_APPLY_MODE=auto python3 scripts/gitlab-child-pipeline.py 2>/dev/null)"
+	nprod="$(printf '%s' "$auto" | grep -c 'name: nsx/prod/' || true)"
+	if [ "$nprod" -gt 0 ]; then
+		# Every prod apply job must still be manual with the override set.
+		nprodmanual="$(printf '%s' "$auto" | grep -B8 'name: nsx/prod/' | grep -c 'when: manual' || true)"
+		if [ "$nprodmanual" -ge "$nprod" ]; then
+			ok "prod apply stays manual even with NSX_APPLY_MODE=auto ($nprod job(s))"
+		else
+			bad "NSX_APPLY_MODE=auto removed the human from $((nprod - nprodmanual)) prod apply job(s)"
+		fi
+	fi
+
+	# The tier is in the environment name, which is what separates prod from
+	# nonprod state and gating.
+	if printf '%s' "$main" | grep -q 'name: nsx/prod/' &&
+		printf '%s' "$main" | grep -q 'name: nsx/preprod/'; then
+		ok "apply environments are namespaced by tier"
+	else
+		bad "apply environments are not namespaced by tier"
 	fi
 else
 	bad "could not generate a GitLab tree"
+fi
+
+# --------------------------------------------------------------------------
+phase "5b. credential sources and backend options"
+
+# The default resolves credentials through GitLab, and the generated pipeline
+# must not still be asking for a Vault token it will never be given.
+if [ -f "$G/.gitlab-ci.yml" ]; then
+	nvault="$(cd "$G" && CI_COMMIT_BRANCH=main CI_DEFAULT_BRANCH=main \
+		python3 scripts/gitlab-child-pipeline.py 2>/dev/null | grep -c 'VAULT_TOKEN' || true)"
+	[ "$nvault" = 0 ] &&
+		ok "the default pipeline asks for no Vault token" ||
+		bad "the default pipeline still references VAULT_TOKEN $nvault time(s)"
+fi
+
+# ...and choosing Vault must put it back, or the option is decorative.
+V="$WORK/vault"
+if "$BOOTSTRAP" --dir "$V" --vcs none --ci gitlab --creds vault --quiet </dev/null >/dev/null 2>&1; then
+	vout="$(cd "$V" && CI_COMMIT_BRANCH=main CI_DEFAULT_BRANCH=main \
+		python3 scripts/gitlab-child-pipeline.py 2>/dev/null)"
+	printf '%s' "$vout" | grep -q 'VAULT_TOKEN: \$VAULT_PLAN_TOKEN' &&
+		ok "--creds vault emits the plan token" ||
+		bad "--creds vault did not emit VAULT_PLAN_TOKEN"
+	printf '%s' "$vout" | grep -q 'VAULT_TOKEN: \$VAULT_APPLY_TOKEN' &&
+		ok "--creds vault emits the apply token" ||
+		bad "--creds vault did not emit VAULT_APPLY_TOKEN"
+else
+	bad "could not generate a --creds vault tree"
+fi
+
+# A manager with GitLab credentials has no vault_path, and that must validate.
+# This is the check that used to fail and force Vault on everyone.
+if (cd "$A" && python3 scripts/validate-data.py >/dev/null 2>&1); then
+	ok "a tree with no Vault validates"
+else
+	bad "a tree with no Vault does not validate"
+fi
+
+# A tier outside the declared set must fail offline, before it can address
+# state nobody is watching.
+T="$WORK/tiers"
+if "$BOOTSTRAP" --dir "$T" --vcs none --envs prod --quiet </dev/null >/dev/null 2>&1; then
+	if (cd "$T" && python3 scripts/validate-data.py >/dev/null 2>&1); then
+		bad "--envs prod accepted a preprod manager — the tier boundary is not enforced"
+	else
+		ok "a manager outside --envs fails validation"
+	fi
+else
+	bad "could not generate an --envs prod tree"
+fi
+
+# Native S3 locking does not exist before Terraform 1.10, and an older CLI
+# ignores the argument rather than refusing it. The floor must move with it.
+S="$WORK/s3native"
+if "$BOOTSTRAP" --dir "$S" --vcs none --backend s3 --lock native --quiet </dev/null >/dev/null 2>&1; then
+	grep -q 'required_version = ">= 1.10"' "$S/stacks/platform/versions.tf" &&
+		ok "--lock native raises required_version to 1.10" ||
+		bad "--lock native left required_version below 1.10, so the lock would be ignored"
+	grep -q 'use_lockfile = true' "$S/envs/lon1.backend.hcl" &&
+		ok "--lock native writes use_lockfile" ||
+		bad "--lock native did not write use_lockfile"
+else
+	bad "could not generate an s3 --lock native tree"
+fi
+
+# GitLab refuses to mask a value it cannot mask, and stores it in the clear
+# instead. The guard has to reject those before they are sent.
+if [ -f "$G/scripts/gitlab-setup.sh" ]; then
+	maskcheck="$(sed -n '/^maskable() {/,/^}/p' "$G/scripts/gitlab-setup.sh")"
+	if [ -n "$maskcheck" ]; then
+		mres="$(bash -c "$maskcheck
+			for v in 'short' 'goodpassword123' 'has space' 'semi;colon'; do
+				if maskable \"\$v\"; then echo \"y \$v\"; else echo \"n \$v\"; fi
+			done")"
+		expected="n short
+y goodpassword123
+n has space
+n semi;colon"
+		[ "$mres" = "$expected" ] &&
+			ok "unmaskable values are rejected before GitLab sees them" ||
+			bad "the maskability guard does not classify values correctly"
+	else
+		bad "gitlab-setup.sh has no maskability guard"
+	fi
+fi
+
+# --profile lab must write nothing in a dry run. It is the mode that starts
+# containers, so "it would have" and "it did" must stay far apart.
+D="$WORK/labdry"
+if "$BOOTSTRAP" --dir "$D" --profile lab --dry-run --quiet </dev/null >/dev/null 2>&1; then
+	if [ -e "$D" ]; then
+		bad "--profile lab --dry-run created $D"
+	else
+		ok "--profile lab --dry-run writes nothing"
+	fi
+else
+	bad "--profile lab --dry-run exited non-zero"
 fi
 
 # --------------------------------------------------------------------------
@@ -8121,6 +10396,9 @@ phase "6. the generator is deterministic"
 if "$A/scripts/bootstrap.sh" --dir "$B" --vcs none --quiet </dev/null >/dev/null 2>&1 &&
 	"$B/scripts/bootstrap.sh" --dir "$C" --vcs none --quiet </dev/null >/dev/null 2>&1; then
 	rm -rf "$B/.git" "$C/.git"
+	# __pycache__ is gitignored build output that embeds a timestamp. It is not
+	# generator output, and comparing it would test the Python version instead.
+	find "$B" "$C" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
 	if diff -r "$B" "$C" >/dev/null 2>&1; then
 		ok "two generations are byte identical"
 	else
@@ -8229,6 +10507,12 @@ cd "$REPO_ROOT"
 QUIET=0
 [ "${1:-}" = "--quiet" ] && QUIET=1
 
+# What this tree was generated to use. Absent in a tree from an older version.
+if [ -f envs/tree.env ]; then
+	# shellcheck disable=SC1091
+	. ./envs/tree.env
+fi
+
 blocking=0
 warnings=0
 
@@ -8254,13 +10538,39 @@ if grep -rqs 'backend "local"' stacks/*/backend.tf; then
 else
 	backend="$(sed -n 's/.*backend "\([a-z0-9]*\)".*/\1/p' stacks/platform/backend.tf 2>/dev/null | head -1)"
 	ok "state backend is '${backend:-unknown}', not the placeholder"
-	if [ "$backend" = http ]; then
-		if ls envs/*.backend.hcl >/dev/null 2>&1 && ! grep -lqs 'lock_address' envs/*.backend.hcl; then
-			block "http backend with no lock_address in envs/*.backend.hcl — no locking"
+	# Every backend has to be locked. An unlocked one is not a smaller problem
+	# than an unset one: two concurrent runs corrupt the state and Terraform
+	# does not warn you.
+	case "$backend" in
+	http)
+		if ls envs/*.backend.hcl >/dev/null 2>&1 && ! grep -lqs 'lock_address\|lock_method' envs/*.backend.hcl; then
+			block "http backend with no lock_method in envs/*.backend.hcl — no locking.
+        scripts/gen-backend-configs.py --force"
 		else
-			ok "http backend declares lock_address"
+			ok "http backend declares locking"
 		fi
-	fi
+		if [ ! -f envs/gitlab-state.env ] && [ -z "${GITLAB_STATE_BASE:-}" ]; then
+			block "GitLab-managed state, but envs/gitlab-state.env does not exist, so
+        there is no state address. scripts/gitlab-setup.sh writes it once the
+        project exists."
+		else
+			ok "the GitLab state address is recorded"
+		fi
+		;;
+	s3)
+		if ls envs/*.backend.hcl >/dev/null 2>&1 &&
+			! grep -lqs 'dynamodb_table\|use_lockfile' envs/*.backend.hcl; then
+			block "s3 backend with neither dynamodb_table nor use_lockfile — NO LOCKING.
+        Two runs at one site will corrupt the state. deploy/state/aws creates
+        the table; or regenerate with --lock native for Terraform's own lockfile."
+		else
+			ok "s3 backend declares locking"
+		fi
+		;;
+	azurerm | gcs)
+		ok "$backend provides locking itself"
+		;;
+	esac
 fi
 
 if [ -z "$(ls envs/*.backend.hcl 2>/dev/null)" ]; then
@@ -8308,11 +10618,48 @@ else
 	else
 		ok "inventory hostnames look real"
 	fi
-	if ! grep -qs 'vault_path' inventory/managers.yaml; then
-		block "no vault_path in the inventory — credentials cannot be resolved"
+	# Credentials are per manager now, so the question is per manager too:
+	# can THIS site's credentials be resolved by the source it actually uses?
+	creds_default=gitlab
+	[ -n "${NSX_CREDS_DEFAULT:-}" ] && creds_default="$NSX_CREDS_DEFAULT"
+	unresolved=""
+	while IFS='	' read -r site source tier; do
+		[ -n "$site" ] || continue
+		# '-' is how --format creds spells "not set for this manager".
+		[ "$source" = - ] && source="$creds_default"
+		[ "$tier" = - ] && tier=""
+		case "$source" in
+		vault)
+			grep -qs "vault_path" inventory/managers.yaml ||
+				unresolved="$unresolved $site(no vault_path)"
+			;;
+		file)
+			# Refused at run time for prod; saying so here is cheaper than
+			# finding out during an apply window.
+			[ "$tier" = prod ] &&
+				unresolved="$unresolved $site(file creds on a prod manager)"
+			;;
+		esac
+	done <<-SITES
+		$(python3 scripts/ci-matrix.py --format creds 2>/dev/null)
+	SITES
+
+	if [ -n "$unresolved" ]; then
+		block "credentials cannot be resolved for:$unresolved"
 	else
-		ok "every manager records a vault_path"
+		ok "every manager has a credential source that can resolve ($creds_default by default)"
 	fi
+
+	if [ "$creds_default" = file ]; then
+		warn "this tree defaults to file credentials. That is a workstation
+        convenience: no rotation, no audit, no revocation. Move to
+        --creds gitlab or --creds vault before this estate matters."
+	fi
+fi
+
+if [ -d .credentials ] && ! grep -qs '^\.credentials/\?$' .gitignore; then
+	block ".credentials/ exists but is not in .gitignore. One 'git add -A' and
+        plaintext passwords are in history permanently."
 fi
 
 say ""
@@ -8382,8 +10729,20 @@ say ""
 say "=== cannot be checked from here ============================"
 manual "branch protection on the default branch, so nobody can push to it"
 manual "an approval requirement on merge/pull requests"
-manual "VAULT_ADDR and a READ-ONLY VAULT_PLAN_TOKEN in the CI settings"
-manual "VAULT_APPLY_TOKEN, marked PROTECTED so only protected branches can apply"
+case "${NSX_CREDS_DEFAULT:-gitlab}" in
+vault)
+	manual "VAULT_ADDR and a READ-ONLY VAULT_PLAN_TOKEN in the CI settings"
+	manual "VAULT_APPLY_TOKEN, marked PROTECTED so only protected branches can apply"
+	;;
+gitlab)
+	manual "NSX_PLAN_USERNAME / NSX_PLAN_PASSWORD (read-only account), masked"
+	manual "NSX_APPLY_USERNAME / NSX_APPLY_PASSWORD, masked AND PROTECTED — the
+        protection is what stops a feature branch reaching the write account"
+	;;
+*)
+	manual "credentials reaching the runner as NSXT_USERNAME / NSXT_PASSWORD"
+	;;
+esac
 manual "a protected environment (GitLab) or required reviewers (GitHub) on apply"
 manual "a terraform plan actually run against a manager — schema validity is not API validity"
 
@@ -8635,17 +10994,31 @@ write_file .gitlab-ci.yml <<'SCAFFOLD_EOF'
 # The per-manager jobs are generated from inventory/managers.yaml by a child
 # pipeline, so adding an eleventh Local Manager stays a data change.
 #
-# Required CI/CD variables (Settings -> CI/CD -> Variables), all masked:
-#   VAULT_ADDR          Vault endpoint
-#   VAULT_PLAN_TOKEN    READ-ONLY. Available to every branch.
-#   VAULT_APPLY_TOKEN   write. PROTECTED — protected branches and tags only.
-# See docs/GITOPS.md.
+# Required CI/CD variables (Settings -> CI/CD -> Variables), all masked.
+# Which set depends on how this tree resolves credentials (envs/tree.env):
+#
+#   creds_source: gitlab   (the default)
+#     NSX_PLAN_USERNAME    read-only NSX account. Every branch.
+#     NSX_PLAN_PASSWORD
+#     NSX_APPLY_USERNAME   account that can write. PROTECTED — protected
+#     NSX_APPLY_PASSWORD   branches and tags only.
+#
+#   creds_source: vault
+#     VAULT_ADDR           Vault endpoint
+#     VAULT_PLAN_TOKEN     READ-ONLY. Available to every branch.
+#     VAULT_APPLY_TOKEN    write. PROTECTED.
+#
+# Either way the split is the same, and it is the point: a feature branch can
+# reach the identity that reads, never the one that writes.
+#
+# scripts/gitlab-setup.sh sets them. See docs/GITOPS.md.
 
 stages:
   - validate
   - generate
   - plan
   - apply
+  - operate
 
 default:
   image: hashicorp/terraform:1.9.8
@@ -8708,6 +11081,123 @@ managers:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# --- operate: the jobs that are not part of reviewing a change --------------
+#
+# Everything above answers "is this change safe to apply". These answer
+# questions that come up between changes, and each one existed only as a
+# command somebody had to remember to run.
+
+# Are the credentials in this project's variables actually correct?
+#
+# The cheapest possible answer: authenticate against each manager and stop.
+# It never plans, so it cannot change anything and cannot be slow. Manual,
+# because it talks to every manager in the estate and nobody needs that on
+# every push.
+verify-credentials:
+  stage: operate
+  when: manual
+  allow_failure: true
+  variables:
+    NSX_CREDS_ROLE: plan
+    VAULT_TOKEN: $VAULT_PLAN_TOKEN
+  script:
+    - |
+      set -eu
+      failed=""
+      for site in $(python3 scripts/ci-matrix.py --format creds | cut -f1); do
+        printf '%-10s ' "$site"
+        if scripts/with-credentials.sh "$site" -- sh -c '
+             curl -sf -o /dev/null --max-time 15 -u "$NSXT_USERNAME:$NSXT_PASSWORD" \
+               "https://$NSXT_MANAGER_HOST/api/v1/node"'; then
+          echo "ok"
+        else
+          echo "FAILED"
+          failed="$failed $site"
+        fi
+      done
+      if [ -n "$failed" ]; then
+        echo
+        echo "Could not authenticate to:$failed"
+        echo "The plan jobs for those managers will fail the same way."
+        exit 1
+      fi
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# Drift: what changed on the managers that did not come from this repository.
+#
+# Scheduled rather than on push, because drift is something that happens over
+# time and not something a merge request causes. Set the schedule in
+# Settings -> CI/CD -> Schedules; daily is a reasonable starting point.
+#
+# It reports and never reverts. An auto-revert during an incident undoes the
+# fix somebody applied to stop an outage.
+drift:
+  stage: operate
+  variables:
+    NSX_CREDS_ROLE: plan
+    VAULT_TOKEN: $VAULT_PLAN_TOKEN
+  script:
+    - |
+      set -u
+      # Redirected from a file rather than piped: the right-hand side of a pipe
+      # is a subshell, so a status set inside it is lost when the loop ends.
+      python3 scripts/ci-matrix.py --format lines > /tmp/matrix.txt
+      drifted=0
+      while IFS="$(printf '\t')" read -r site stack role tier host; do
+        echo "--- $stack @ $site"
+        scripts/with-credentials.sh "$site" -- scripts/drift.sh "$stack" "$site"
+        # drift.sh exits 2 for drift, 1 for an error. Neither should stop the
+        # sweep: the point is to check every manager, not the first one.
+        [ $? -eq 2 ] && drifted=$((drifted + 1))
+      done < /tmp/matrix.txt
+      echo
+      echo "$drifted stack/manager pair(s) have drifted."
+      # Reports are artifacts, not merge request comments: a plan reveals the
+      # security posture of the estate.
+  artifacts:
+    paths: [reports/]
+    expire_in: 30 days
+    when: always
+  allow_failure: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+
+# Is the state backend reachable and lockable, for every stack and manager?
+#
+# A backend that has quietly stopped working surfaces during an apply, which is
+# the worst time to find out. This asks on a schedule instead.
+state-check:
+  stage: operate
+  script:
+    - python3 scripts/gen-backend-configs.py --check
+    - |
+      set -u
+      # Redirected from a file, not piped: an 'exit' inside a piped while loop
+      # only leaves the subshell, and this job would report success while the
+      # state backend was unreachable — the exact thing it exists to catch.
+      python3 scripts/ci-matrix.py --format lines > /tmp/matrix.txt
+      unreachable=0
+      while IFS="$(printf '\t')" read -r site stack role tier host; do
+        printf '%-16s @ %-8s ' "$stack" "$site"
+        if scripts/tf.sh init "$stack" "$site" >/dev/null 2>&1; then
+          echo "ok"
+        else
+          echo "UNREACHABLE"
+          unreachable=$((unreachable + 1))
+        fi
+      done < /tmp/matrix.txt
+      if [ "$unreachable" -gt 0 ]; then
+        echo
+        echo "$unreachable stack/manager pair(s) cannot reach their state backend."
+        echo "An apply would fail the same way, at a much worse moment."
+        exit 1
+      fi
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
 SCAFFOLD_EOF
 
 write_file scripts/gitlab-child-pipeline.py <<'SCAFFOLD_EOF'
@@ -8749,6 +11239,58 @@ APPLY_MODE = os.environ.get("NSX_APPLY_MODE", "manual").strip().lower()
 if APPLY_MODE not in ("manual", "auto"):
     sys.exit(f"error: NSX_APPLY_MODE must be 'manual' or 'auto', got {APPLY_MODE!r}")
 
+# The same switch for tiers that are not production. A lab estate can merge and
+# apply without a second pause; prod never can, see gate_for().
+APPLY_MODE_NONPROD = os.environ.get("NSX_APPLY_MODE_NONPROD", APPLY_MODE).strip().lower()
+if APPLY_MODE_NONPROD not in ("manual", "auto"):
+    sys.exit(f"error: NSX_APPLY_MODE_NONPROD must be 'manual' or 'auto', got {APPLY_MODE_NONPROD!r}")
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def tree_settings() -> dict:
+    """Generator-chosen defaults from envs/tree.env."""
+    out: dict = {}
+    path = REPO_ROOT / "envs" / "tree.env"
+    if not path.exists():
+        return out
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            out[key.strip()] = value.strip().strip("'\"")
+    return out
+
+
+CREDS = os.environ.get("NSX_CREDS_DEFAULT") or tree_settings().get("NSX_CREDS_DEFAULT", "gitlab")
+
+
+def credential_vars(role: str) -> list[str]:
+    """The variables a job needs to resolve NSX credentials.
+
+    scripts/with-credentials.sh does the resolving; this only has to put the
+    right things in the job's environment and state which account is wanted.
+    Nothing here is a secret — they are all references to CI/CD variables.
+    """
+    lines = [f'    NSX_CREDS_ROLE: "{role}"']
+    if CREDS == "vault":
+        token = "$VAULT_PLAN_TOKEN" if role == "plan" else "$VAULT_APPLY_TOKEN"
+        lines.append(f"    VAULT_TOKEN: {token}")
+    return lines
+
+
+def gate_for(row: dict) -> str:
+    """manual or auto for this row's apply job.
+
+    Production is always manual, whatever NSX_APPLY_MODE says. A variable set
+    once in project settings should not be able to remove the human from a
+    change to a production firewall — and the tier is the only thing that
+    reliably says which estate this is.
+    """
+    if row.get("tier") == "prod":
+        return "manual"
+    return APPLY_MODE_NONPROD
+
 
 def job_name(prefix: str, row: dict) -> str:
     return f"{prefix} {row['stack']} @ {row['site']}"
@@ -8781,7 +11323,7 @@ def main() -> int:
         out.append("  variables:")
         out.append(f'    SITE: "{row["site"]}"')
         out.append(f'    STACK: "{row["stack"]}"')
-        out.append("    VAULT_TOKEN: $VAULT_PLAN_TOKEN")
+        out.extend(credential_vars("plan"))
         out.append("  script:")
         out.append('    - scripts/with-credentials.sh "$SITE" -- scripts/tf.sh plan "$STACK" "$SITE"')
         out.append('    - scripts/tf.sh show "$STACK" "$SITE" | tee "plan-$STACK-$SITE.txt"')
@@ -8808,17 +11350,19 @@ def main() -> int:
         out.append("      artifacts: true")
         # The gate. A manual job will not start without a human, and a
         # protected environment restricts who that human can be.
-        if APPLY_MODE == "manual":
+        if gate_for(row) == "manual":
             out.append("  when: manual")
         else:
             out.append("  when: on_success")
         out.append("  allow_failure: false")
+        # The tier leads the environment name so that protecting everything
+        # under nsx/prod/ is one rule in GitLab rather than one per manager.
         out.append("  environment:")
-        out.append(f'    name: nsx/{row["site"]}/{row["stack"]}')
+        out.append(f'    name: nsx/{row.get("tier") or "untiered"}/{row["site"]}/{row["stack"]}')
         out.append("  variables:")
         out.append(f'    SITE: "{row["site"]}"')
         out.append(f'    STACK: "{row["stack"]}"')
-        out.append("    VAULT_TOKEN: $VAULT_APPLY_TOKEN")
+        out.extend(credential_vars("apply"))
         out.append("    APPROVE: \"yes\"")
         out.append("  script:")
         # tf.sh refuses without a saved plan, so this cannot silently re-plan.
@@ -9047,6 +11591,14 @@ jobs:
         env:
           # The plan identity is read-only. Only the apply workflow gets write
           # access — that is what makes it safe to plan on every pull request.
+          #
+          # Both credential sources are passed through. A secret that was never
+          # set arrives as an empty string, and scripts/with-credentials.sh
+          # resolves whichever source this tree was generated for, so one
+          # workflow serves both without a second file to keep in step.
+          NSX_CREDS_ROLE: plan
+          NSX_PLAN_USERNAME: ${{ secrets.NSX_PLAN_USERNAME }}
+          NSX_PLAN_PASSWORD: ${{ secrets.NSX_PLAN_PASSWORD }}
           VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
           VAULT_TOKEN: ${{ secrets.VAULT_PLAN_TOKEN }}
         run: |
@@ -9164,7 +11716,9 @@ jobs:
       max-parallel: 1
       matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
     # The approval gate. Protect this environment to require a reviewer.
-    environment: nsx-${{ matrix.site }}-${{ matrix.stack }}
+    # The tier leads the name so that every production environment sorts
+    # together and can be given the same required reviewers in one pass.
+    environment: nsx-${{ matrix.tier }}-${{ matrix.site }}-${{ matrix.stack }}
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -9178,6 +11732,10 @@ jobs:
 
       - name: Apply the plan that was approved
         env:
+          # The write identity, and the only workflow that is given it.
+          NSX_CREDS_ROLE: apply
+          NSX_APPLY_USERNAME: ${{ secrets.NSX_APPLY_USERNAME }}
+          NSX_APPLY_PASSWORD: ${{ secrets.NSX_APPLY_PASSWORD }}
           VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
           VAULT_TOKEN: ${{ secrets.VAULT_APPLY_TOKEN }}
           APPROVE: "yes"
@@ -9319,20 +11877,11 @@ managers:
     domain: default
 SCAFFOLD_EOF
 
-	# Note the heredoc rather than a pipe: each stage of a pipeline runs in a
-	# subshell, so a piped write_file could not update the counters or the
-	# skipped-file exit status.
-	for site in gm1 lon1 nyc1 fra1; do
-		write_file "envs/${site}.backend.hcl" <<-EOF
-			# Partial backend configuration for ${site}.
-			#
-			# The backend type is an open decision (docs/ARCHITECTURE.md section 14.1).
-			# While the stacks are on the placeholder local backend, scripts/tf.sh
-			# supplies the state path itself and this file holds nothing. Once the
-			# backend is chosen, put its per-manager settings here — see
-			# envs/example.backend.hcl.example.
-		EOF
-	done
+	# The per-manager backend configs used to be written here as a placeholder
+	# that ignored --backend entirely. They are generated from the inventory
+	# instead, after this script finishes, by scripts/gen-backend-configs.py —
+	# one implementation, so the files and the stacks cannot disagree about
+	# which backend this tree uses.
 
 	write_file data/groups/payments.yaml <<'SCAFFOLD_EOF'
 # Groups for the payments application.
@@ -9875,6 +12424,32 @@ if [ "$DRY_RUN" != 1 ]; then
 	done
 fi
 
+# One backend config per manager, derived from the inventory rather than left
+# on a checklist. This used to be step 3 of "next steps" and the step people
+# skipped, which surfaced much later as an init failure that named a file
+# nobody had been told to create.
+#
+# Existing files are kept: this adds what is missing and never rewrites an
+# answer somebody already gave.
+if [ "$DRY_RUN" != 1 ] && [ -x "$ROOT/scripts/gen-backend-configs.py" ]; then
+	if command -v python3 >/dev/null 2>&1; then
+		log ""
+		# PYTHONDONTWRITEBYTECODE: importing ci_matrix_lib would otherwise
+		# leave __pycache__/*.pyc in the tree, and those embed a timestamp, so
+		# two generations of the same input would not be byte identical.
+		if (cd "$ROOT" && PYTHONDONTWRITEBYTECODE=1 python3 scripts/gen-backend-configs.py 2>&1 | sed 's/^/  /'); then
+			:
+		else
+			warn "could not generate the per-manager backend configs. Not fatal — the
+         tree is complete. Run it yourself:
+           cd $ROOT && scripts/gen-backend-configs.py"
+		fi
+	else
+		warn "python3 is not on PATH, so envs/<site>.backend.hcl was not generated.
+         Nothing can initialise until it is:  scripts/gen-backend-configs.py"
+	fi
+fi
+
 # Any version-control choice implies a working tree; only 'none' does not.
 vcs_wants_git() {
 	case "$VCS" in
@@ -9975,8 +12550,21 @@ if [ "$DRY_RUN" != 1 ]; then
 		;;
 	gitlab-docker)
 		log ""
-		log "starting GitLab in Docker..."
-		if [ -x "$ROOT/scripts/gitlab-up.sh" ]; then
+		if [ "$PROFILE" = lab ] && [ -x "$ROOT/scripts/one-touch.sh" ]; then
+			# The lab profile promises one command to a green pipeline, so it
+			# runs the whole sequence rather than just starting a container and
+			# leaving the rest on a checklist.
+			log "running scripts/one-touch.sh — GitLab, state, stacks, pipeline."
+			log ""
+			# Not fatal: the tree is written and correct either way, and every
+			# stage records itself so a failure is resumed, not restarted.
+			(cd "$ROOT" && ./scripts/one-touch.sh) || {
+				warn "one-touch did not finish. The repository is complete and unaffected;
+         the stage that failed said why. Resume with:
+           cd $ROOT && scripts/one-touch.sh --resume"
+			}
+		elif [ -x "$ROOT/scripts/gitlab-up.sh" ]; then
+			log "starting GitLab in Docker..."
 			# Not fatal: the files are written and correct either way, and the
 			# script is re-runnable.
 			"$ROOT/scripts/gitlab-up.sh" || {
@@ -10021,23 +12609,39 @@ if [ "$DRY_RUN" = 1 ]; then
 fi
 
 if [ "$QUIET" != 1 ]; then
-	cat <<'NEXT'
-
-next steps
-  1. make preflight              check the tools this repository needs
-  2. make validate               schema + convention checks, offline
-  3. Edit inventory/managers.yaml so it describes the real estate, and add one
-     envs/<site>.backend.hcl per manager.
-  4. Decide the state backend and replace the placeholder in stacks/*/backend.tf.
-     The local backend is not acceptable for a real manager.
-  5. terraform init in one stack, then commit the generated .terraform.lock.hcl.
-
-what still needs a human decision (docs/ARCHITECTURE.md section 14)
-  * state backend, encryption and locking
-  * Vault mount, path convention, and auth method for the pipeline
-  * whether Application category is GM-owned or delegated per site
-  * which site is the brownfield import pilot
-NEXT
+	log ""
+	log "next steps"
+	log "  1. make preflight              check the tools this repository needs"
+	log "  2. make validate               schema + convention checks, offline"
+	log "  3. Edit inventory/managers.yaml so it describes the real estate, then"
+	log "     re-run scripts/gen-backend-configs.py to add the new managers."
+	if [ "$BACKEND" = local ]; then
+		log "  4. Choose a state backend. This tree is on the placeholder local"
+		log "     backend, which has NO LOCKING and which scripts/tf.sh refuses to"
+		log "     apply through:"
+		log "       scripts/bootstrap.sh --force --backend gitlab   # nothing to run"
+		log "       scripts/bootstrap.sh --force --backend s3       # deploy/state/aws"
+	else
+		log "  4. make ready                 what still blocks a production apply"
+	fi
+	log "  5. terraform init in one stack, then commit the generated .terraform.lock.hcl."
+	log ""
+	log "what still needs a human decision (docs/ARCHITECTURE.md section 14)"
+	case "$CREDS" in
+	gitlab)
+		log "  * the two NSX service accounts — one read-only for plan, one that can"
+		log "    write for apply — and setting them as CI/CD variables"
+		;;
+	vault)
+		log "  * Vault mount, path convention, and auth method for the pipeline"
+		;;
+	*)
+		log "  * how credentials reach the runner as NSXT_USERNAME / NSXT_PASSWORD"
+		;;
+	esac
+	[ "$BACKEND" = local ] && log "  * state backend, encryption and locking"
+	log "  * whether Application category is GM-owned or delegated per site"
+	log "  * which site is the brownfield import pilot"
 fi
 
 if [ "$skipped" -gt 0 ]; then

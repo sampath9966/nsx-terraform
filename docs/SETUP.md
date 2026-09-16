@@ -165,19 +165,42 @@ exactly what the generator changed.
 The generator refuses to guess these. They are listed in
 `docs/ARCHITECTURE.md` section 14; three block a real apply.
 
-### 2.1 State backend — blocking
+### 2.1 State backend — blocking unless you have a GitLab
 
-`stacks/*/backend.tf` ships a placeholder `backend "local" {}` so the stacks
-initialise for offline validation. **It is not acceptable for a real manager.**
+**A run with a GitLab defaults to GitLab-managed Terraform state**, which gives
+locking, encryption at rest and version history with nothing to stand up. If
+that is what you are using, this decision is already made and you can skip to
+2.2.
+
+Otherwise `stacks/*/backend.tf` ships a placeholder `backend "local" {}` so the
+stacks initialise for offline validation. **It is not acceptable for a real
+manager** — it has no locking, and `scripts/tf.sh` refuses to apply through it.
 
 Pick one with a flag rather than editing the stacks by hand:
 
 ```bash
 ./scripts/bootstrap.sh --force --backend gitlab    # GitLab-managed state
 ./scripts/bootstrap.sh --force --backend s3        # or minio, ceph
+./scripts/bootstrap.sh --force --backend s3 --lock native   # Terraform 1.10 lockfile
 ./scripts/bootstrap.sh --force --backend azure
+./scripts/bootstrap.sh --force --backend gcs
 ./scripts/bootstrap.sh --force --backend local     # filesystem on this server
 ```
+
+For S3, Azure and GCS the bucket or account has to exist, with versioning,
+encryption and locking configured correctly. `deploy/state/` contains Terraform
+that creates each one properly, so that is not a checklist either:
+
+```bash
+cd deploy/state/aws && terraform init && terraform apply
+```
+
+The per-manager `envs/<site>.backend.hcl` files are generated from the inventory
+by `scripts/gen-backend-configs.py`, which the generator runs for you. Adding an
+eleventh manager means re-running it, not writing a file by hand.
+
+**The state address always starts with the manager's tier**, so production and
+non-production state can never be the same file. See 2.6.
 
 The flag takes the Terraform backend type (`http`, `s3`, `azurerm`, `local`) or
 a friendly name for it — `gitlab` is `http`, `minio` and `ceph` are `s3`,
@@ -333,9 +356,13 @@ is one anybody can bypass:
 
 - branch protection on the default branch;
 - an approval requirement on merge requests;
-- `VAULT_PLAN_TOKEN` **read-only**, available everywhere;
-- `VAULT_APPLY_TOKEN` write and **protected**, so only protected branches can
-  apply.
+- the **read-only** credential, available everywhere — `NSX_PLAN_USERNAME` and
+  `NSX_PLAN_PASSWORD`, or `VAULT_PLAN_TOKEN` with `--creds vault`;
+- the **write** credential, marked **protected**, so only protected branches can
+  apply — `NSX_APPLY_USERNAME` and `NSX_APPLY_PASSWORD`, or
+  `VAULT_APPLY_TOKEN`.
+
+`scripts/gitlab-setup.sh` sets all four and marks the right ones protected.
 
 `docs/GITOPS.md` in the generated tree has the rest, including what the approver
 is checking.
@@ -343,25 +370,61 @@ is checking.
 #### No GitLab? One command
 
 ```bash
-scripts/gitlab-up.sh
+./scripts/bootstrap.sh --profile lab     # from nothing
+scripts/one-touch.sh                     # in a tree that already exists
 ```
 
 GitLab CE and a runner in Docker, the project created and pushed, the runner
-registered, and the initial root password printed the way GitLab does it —
-readable again later with `scripts/gitlab-up.sh --password`. Needs Docker and
-about 4 GB of RAM, and first boot takes several minutes. It is a lab instance:
-no TLS, no backups, no HA.
+registered, the CI variables set, the state address recorded, the stacks
+initialised, and the pipeline watched until it goes green. The initial root
+password is printed the way GitLab does it, readable again later with
+`scripts/gitlab-up.sh --password`.
+
+Needs Docker and about 4 GB of RAM; first boot takes several minutes. It is a
+lab instance: no TLS, no backups, no HA.
+
+Every stage records itself in `.one-touch-state`, so a failure is resumed rather
+than restarted:
+
+```bash
+scripts/one-touch.sh --status     # which stages have run
+scripts/one-touch.sh --resume     # continue from the first incomplete one
+```
 
 ### 2.3 Credentials — blocking
 
 Credentials never live in this repository, and never pass through a Terraform
 data source: the `vault_*` data sources write the fetched secret into state in
-plaintext.
+plaintext. `scripts/with-credentials.sh` fetches outside Terraform and execs
+with `NSXT_*` in the environment.
 
-`scripts/with-credentials.sh` fetches outside Terraform and execs with `NSXT_*`
-in the environment. It assumes Vault KV v2 at the path recorded per manager in
-`inventory/managers.yaml`; the mount convention and auth method are yours to
-set. `vault_path` records **where the credential lives, never the credential**.
+**What it reads is `--creds`, and the default is GitLab's own CI/CD variables.**
+
+| `--creds` | Reads | Needs |
+|---|---|---|
+| `gitlab` *(default)* | masked GitLab CI/CD variables | two NSX service accounts |
+| `vault` | KV v2 at each manager's `vault_path` | a Vault you run |
+| `vcf` | SDDC Manager's credential API | `SDDC_MANAGER_*` |
+| `env` | `NSXT_USERNAME` / `NSXT_PASSWORD` | whatever sets them |
+| `file` | `.credentials/<site>.env`, mode 0600 | local use; refused for prod |
+
+**Two accounts, not one.** A read-only NSX account for plan, which every branch
+can read, and an account that can write in **protected** variables only a
+protected branch can read. That split is the security property — it is what
+stops a feature branch reaching the identity that can change a firewall. One
+account in both places removes it, and nothing appears to break.
+
+Per-site and per-tier overrides are read first, so one repository can serve
+sites with different service accounts: `NSX_LON1_APPLY_USERNAME`,
+`NSX_PROD_APPLY_USERNAME`, then the shared `NSX_APPLY_USERNAME`.
+
+A manager can override the tree default with its own `creds_source`.
+
+**Vault is the stronger production answer**, and moving to it is a flag plus
+`vault_path` per manager. `scripts/vault-up.sh` will run and seed a lab Vault in
+Docker — dev mode, in memory, unsealed, gone on restart — so the path can be
+proven before anyone commits to running real Vault. Nothing is installed unless
+you choose it.
 
 ### 2.4 Who tags the workloads — decide before writing group criteria
 
@@ -406,6 +469,15 @@ errors if `data/vm-tags/` writes a scope not owned by `terraform`.
 | Import scope and pilot site | none chosen | before the first adoption tranche |
 
 ---
+
+### 2.6 Dev, UAT and production
+
+The `tier` recorded against each manager is the environment boundary, not a
+label: it is part of the state address, it names the approval environment, and
+**a production apply is always manual** regardless of `NSX_APPLY_MODE`.
+
+Declare which tiers a tree serves with `--envs prod,preprod`; a manager whose
+tier falls outside that set fails `make validate` offline.
 
 ## 3. Describe your estate
 
@@ -504,8 +576,8 @@ in Vault rather than in this repository:
 
 - branch protection on the default branch;
 - an approval requirement on merge/pull requests;
-- `VAULT_ADDR` and a read-only `VAULT_PLAN_TOKEN`;
-- `VAULT_APPLY_TOKEN`, marked protected;
+- the read-only credential in the CI settings;
+- the write credential, marked **protected**;
 - a protected environment (GitLab) or required reviewers (GitHub) on apply;
 - whether a `terraform plan` has ever run against a real manager.
 
