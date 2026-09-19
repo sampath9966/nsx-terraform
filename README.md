@@ -10,8 +10,15 @@ writes the working tree — modules, stacks, schemas, tooling, CI and worked
 example data — into whatever directory you point it at.
 
 ```bash
-./scripts/bootstrap.sh          # interactive: pick basic or advanced, answer, done
+./scripts/bootstrap.sh                  # interactive: pick basic or advanced
+./scripts/bootstrap.sh --profile lab    # one command to a running pipeline
 ```
+
+`--profile lab` writes the tree, starts GitLab and a runner in Docker, creates
+the project, pushes, sets the credential variables, records the state address,
+initialises the stacks and waits until the pipeline is green. Nothing external
+has to exist first. If a stage fails it names the stage and the command that
+resumes; every stage is idempotent.
 
 ```
  1) Basic deployment      — best practices assumed, four questions
@@ -24,8 +31,9 @@ example data — into whatever directory you point it at.
 **Basic** asks where to put it, **where the files live and how changes get
 reviewed**, which state backend, and whether to include the worked example —
 everything else takes the recommended answer. **Advanced** asks about every
-flag. Either way it prints the equivalent command line before it
-writes anything, so one pass teaches you the scripted form:
+flag, including where credentials come from. Either way it prints the equivalent
+command line before it writes anything, so one pass teaches you the scripted
+form:
 
 ```bash
 ./scripts/bootstrap.sh --dir ~/work/nsx --backend gitlab --git-init
@@ -115,6 +123,22 @@ the way — server, project, runner, CI variables and the approval gate. GitHub
 gets complete workflows, but its secrets and environment protection are yours to
 set. Local-only writes no pipeline at all and leaves the manual path.
 
+That choice also settles the two things that otherwise need infrastructure
+nobody has yet:
+
+- **Credentials** are GitLab CI/CD variables by default. Two NSX accounts, not
+  one: a read-only account for plan that every branch can read, and an account
+  that can write in **protected** variables only a protected branch can read.
+  That split is the security property. HashiCorp Vault is the stronger
+  production answer and is one flag away — `--creds vault`, and
+  `scripts/vault-up.sh` will run and seed a lab one — but it is not required to
+  get started, and nothing is installed unless you ask for it.
+- **State** is GitLab-managed Terraform state by default. GitLab provides the
+  locking, the encryption at rest and the version history, so there is no object
+  store to stand up. S3 with a DynamoDB table (or Terraform 1.10's own
+  lockfile), Azure blob and GCS are all supported, and `deploy/state/` contains
+  Terraform that creates each one properly — versioned, encrypted, private.
+
 | Choice | Written | Done for you |
 |---|---|---|
 | **GitLab** *(default)* | `.gitlab-ci.yml` + child pipeline + MR template | remote, and optionally the whole server |
@@ -137,6 +161,29 @@ instance, not a production one.
 The per-manager jobs come from `inventory/managers.yaml`, so adding an eleventh
 Local Manager stays a data change. GitLab and GitHub read the same
 `scripts/ci_matrix_lib.py` and cannot drift apart.
+
+Three jobs run outside the review flow: `verify-credentials` checks that each
+manager's credentials actually authenticate, `drift` runs on a schedule and
+reports what changed outside Terraform, and `state-check` confirms every state
+address is still reachable and lockable.
+
+## Dev, UAT and production
+
+The `tier` already recorded against each manager — `prod`, `preprod`, `nonprod`
+or `lab` — **is** the environment boundary, and it is load-bearing rather than
+descriptive:
+
+- it is part of the state address, so production and non-production state can
+  never be the same file
+- it names the approval environment, so protecting everything under `nsx/prod/`
+  is one rule instead of one per manager
+- **a production apply is always manual.** `NSX_APPLY_MODE=auto` applies to
+  non-production tiers only; a variable set once in project settings cannot
+  remove the human from a change to a production firewall
+
+`--envs prod,preprod` declares which tiers a tree serves, and a manager whose
+tier falls outside that set fails `make validate` offline — before the typo can
+address state nobody is watching.
 
 ## Why the state is split five ways
 
@@ -230,6 +277,7 @@ creates, because they describe that tree.
 | Path | What it is |
 |---|---|
 | `scripts/bootstrap.sh` | The generator. Every file it writes is embedded in it. |
+| `scripts/bootstrap.sh --profile lab` | The same, plus standing the lab up and proving the pipeline runs. |
 | `docs/ARCHITECTURE.md` | The design, the conventions, and the operating rules. |
 | `docs/SETUP.md` | How to stand up your own, and the variants on offer. |
 | `README.md` | This file. |
@@ -252,10 +300,16 @@ What that does **not** cover:
 
 - **No `terraform plan` has run against an NSX manager.** Provider schema
   validity is not API validity.
-- **The state backend is a placeholder** `backend "local"`. It is not acceptable
-  for a real manager, and `scripts/tf.sh` refuses to apply through it.
+- **No GitLab has been started from this environment.** `--profile lab` is
+  exercised offline — its stages, guards and dry-run behaviour are covered by
+  `make selftest` — but the Docker path itself has not been run end to end.
 - **All example data describes no real site.** Replace it, or generate with
   `--no-examples`.
+
+The state backend is no longer a placeholder unless you ask for one: any run
+with a GitLab defaults to GitLab-managed state, and `backend "local"` is
+reachable only through `--backend local`, which `scripts/tf.sh` still refuses to
+apply through.
 
 `docs/ARCHITECTURE.md` section 14 lists every decision deliberately left to the
 owner. Section 2 — ten things that will break this repository — is worth reading
