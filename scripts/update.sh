@@ -109,8 +109,25 @@ TARGET="$(cd "$TARGET" 2>/dev/null && pwd)" || die "$TARGET does not exist."
 
 # --- 2. pull this repository, then run the pulled copy --------------------
 
+# One update at a time per tree, and one pull at a time per clone. A cron job, a
+# second terminal or a colleague on the same server must wait, not interleave.
+lock() { # lock <file> <what>
+	[ "${NSX_UPDATE_LOCKED:-}" = 1 ] && return 0 # inherited from the process we replaced
+	command -v flock >/dev/null 2>&1 || return 0
+	mkdir -p "$(dirname "$1")" 2>/dev/null
+	exec 9>"$1" || return 0
+	flock -w "${NSX_LOCK_WAIT:-120}" 9 || die "another update is already running against $2 (lock: $1). Try again in a minute."
+}
+# Keyed by the tree's path, kept outside the tree so it never shows up in git.
+lockkey="$(printf '%s' "$TARGET" | cksum | awk '{print $1}')"
+lock "$STATE_DIR/locks/$lockkey.lock" "$TARGET"
+
 if [ "$PULL" = 1 ]; then
 	if git -C "$GEN_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+		cur="$(git -C "$GEN_ROOT" symbolic-ref --short -q HEAD || true)"
+		[ "$cur" = "$BRANCH" ] ||
+			die "$GEN_ROOT is on '${cur:-a detached HEAD}', not '$BRANCH'. Pulling would merge $BRANCH into it.
+       Switch with: git -C $GEN_ROOT checkout $BRANCH   (or pass --branch ${cur:-NAME})"
 		say "pulling $REMOTE $BRANCH into $GEN_ROOT..."
 		git -C "$GEN_ROOT" fetch -q "$REMOTE" "$BRANCH" || die "could not fetch $REMOTE $BRANCH."
 		incoming="$(git -C "$GEN_ROOT" log --oneline HEAD..FETCH_HEAD 2>/dev/null)"
@@ -119,11 +136,15 @@ if [ "$PULL" = 1 ]; then
 			printf '%s\n' "$incoming" | sed 's/^/  /'
 			git -C "$GEN_ROOT" merge -q --ff-only FETCH_HEAD ||
 				die "cannot fast-forward $GEN_ROOT. It has local commits or edits; resolve that first."
-			# The script itself may have changed. Run the new one.
-			exec "$GEN_ROOT/scripts/update.sh" --no-pull --dir "$TARGET" \
-				$([ "$CHECK" = 1 ] && echo --check) $([ "$YES" = 1 ] && echo --yes) \
-				$([ "$OVERWRITE_UNKNOWN" = 1 ] && echo --overwrite-unknown) \
-				$([ "$COMMIT" = 1 ] && echo --commit) $([ "$SUMMARY" = 1 ] && echo --summary)
+			# The script itself may have changed. Run the new one (fd 9, the lock,
+			# is inherited and stays held, so nothing can slip in between).
+			fwd=(--no-pull --dir "$TARGET")
+			[ "$CHECK" = 1 ] && fwd+=(--check)
+			[ "$YES" = 1 ] && fwd+=(--yes)
+			[ "$OVERWRITE_UNKNOWN" = 1 ] && fwd+=(--overwrite-unknown)
+			[ "$COMMIT" = 1 ] && fwd+=(--commit)
+			[ "$SUMMARY" = 1 ] && fwd+=(--summary)
+			NSX_UPDATE_LOCKED=1 exec "$GEN_ROOT/scripts/update.sh" "${fwd[@]}"
 		fi
 		say "this repository is already up to date."
 	else
@@ -283,11 +304,13 @@ BACKUP="$TARGET/.nsx-update-backup/$STAMP"
 COMMIT_BRANCH=""
 if [ "$COMMIT" = 1 ]; then
 	git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1 || die "--commit needs $TARGET to be a git repository."
-	[ -z "$(git -C "$TARGET" status --porcelain 2>/dev/null)" ] ||
+	[ -z "$(git -C "$TARGET" status --porcelain --untracked-files=no 2>/dev/null)" ] ||
 		die "$TARGET has uncommitted changes. Commit or stash them first, so this update is its own commit."
+	# Built on a temporary branch and named at the end, because the branch for
+	# this release may already be here: another server can have pushed it.
 	COMMIT_BRANCH="update/$GEN_REV"
-	git -C "$TARGET" checkout -q -b "$COMMIT_BRANCH" 2>/dev/null ||
-		die "could not create branch $COMMIT_BRANCH (does it exist already?)."
+	TMP_BRANCH="update/tmp-$$"
+	git -C "$TARGET" checkout -q -b "$TMP_BRANCH" 2>/dev/null || die "could not create a branch in $TARGET."
 fi
 
 for r in "${TO_APPLY[@]}"; do
@@ -296,7 +319,10 @@ for r in "${TO_APPLY[@]}"; do
 		cp -p "$TARGET/$r" "$BACKUP/$r"
 	fi
 	mkdir -p "$TARGET/$(dirname "$r")"
-	cp -p "$FRESH/$r" "$TARGET/$r"
+	# Copy beside, then rename: a reader never sees half a file, and an
+	# interrupted run leaves the original in place.
+	cp -p "$FRESH/$r" "$TARGET/$r.nsx-new" && mv -f "$TARGET/$r.nsx-new" "$TARGET/$r" ||
+		die "could not write $r. Originals are in $BACKUP; nothing else was changed after this point."
 done
 
 # Record what the generator wrote, for every file now identical to it, so the
@@ -339,11 +365,30 @@ if [ "${#followups[@]}" -gt 0 ]; then
 fi
 
 if [ "$COMMIT" = 1 ]; then
-	git -C "$TARGET" add -A -- . ':!.nsx-update-backup' 2>/dev/null
-	git -C "$TARGET" -c user.name="${GIT_AUTHOR_NAME:-nsx-update}" \
-		-c user.email="${GIT_AUTHOR_EMAIL:-nsx-update@localhost}" \
-		commit -q -m "Update generated files to generator $GEN_REV" &&
-		say "" && say "committed on branch $COMMIT_BRANCH. Push it and open a merge request; nothing was pushed."
+	# Only the files this run wrote, never whatever else is lying around.
+	for r in ${TO_APPLY[@]+"${TO_APPLY[@]}"} "$BASELINE"; do
+		git -C "$TARGET" add -- "$r" 2>/dev/null
+	done
+	# The same update on the same parent gives the same commit id on every server
+	# (fixed dates and author), so two servers pushing it do not collide.
+	gdate="$(git -C "$GEN_ROOT" log -1 --format=%cI 2>/dev/null || echo 2000-01-01T00:00:00Z)"
+	GIT_AUTHOR_DATE="$gdate" GIT_COMMITTER_DATE="$gdate" \
+		git -C "$TARGET" -c user.name="nsx-update" -c user.email="nsx-update@localhost" -c commit.gpgsign=false \
+		commit -q -m "Update generated files to generator $GEN_REV" || die "the commit failed; your files are updated but uncommitted on $TMP_BRANCH."
+	mine="$(git -C "$TARGET" rev-parse HEAD)"
+	if git -C "$TARGET" rev-parse -q --verify "refs/heads/$COMMIT_BRANCH" >/dev/null; then
+		if [ "$(git -C "$TARGET" rev-parse "refs/heads/$COMMIT_BRANCH")" = "$mine" ]; then
+			# Same parent, same files, same dates: the very same commit.
+			git -C "$TARGET" checkout -q "$COMMIT_BRANCH" && git -C "$TARGET" branch -q -D "$TMP_BRANCH"
+		else
+			COMMIT_BRANCH="update/$GEN_REV-$(date +%H%M%S)"
+			git -C "$TARGET" branch -q -m "$TMP_BRANCH" "$COMMIT_BRANCH"
+			say "" && say "note: update/$GEN_REV already exists here with different content; used $COMMIT_BRANCH."
+		fi
+	else
+		git -C "$TARGET" branch -q -m "$TMP_BRANCH" "$COMMIT_BRANCH"
+	fi
+	say "" && say "committed on branch $COMMIT_BRANCH. Push it and open a merge request; nothing was pushed."
 elif git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
 	say ""
 	say "review with 'git -C $TARGET diff', then commit on a branch and open a merge request."
