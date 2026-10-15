@@ -1002,6 +1002,15 @@ confirm_overwrite() {
 }
 
 # write_file <relative-path> — content is read from stdin.
+# record_gen <relative-path> <staged-file> — remember what the generator wrote,
+# so scripts/update.sh can later tell its own changes from yours. Estate data is
+# yours from the first minute and is not recorded.
+record_gen() {
+	is_estate_data "$1" && return 0
+	[ "$DRY_RUN" = 1 ] && return 0
+	printf '%s  %s\n' "$(sha256sum "$2" | awk '{print $1}')" "$1" >>"$STAGE/generated.sha256"
+}
+
 write_file() {
 	local rel="$1"
 	local dest="$ROOT/$rel"
@@ -1041,10 +1050,12 @@ write_file() {
 		fi
 		if cmp -s "$tmp" "$dest"; then
 			log "  ok       $rel"
+			record_gen "$rel" "$tmp"
 			unchanged=$((unchanged + 1))
 		elif [ "$may_overwrite" = 1 ]; then
 			confirm_overwrite "$rel"
 			cat "$tmp" >"$dest"
+			record_gen "$rel" "$tmp"
 			log "  updated  $rel"
 			updated=$((updated + 1))
 		elif [ -n "$guard" ]; then
@@ -1064,6 +1075,7 @@ write_file() {
 		fi
 		mkdir -p "$(dirname "$dest")"
 		cat "$tmp" >"$dest"
+		record_gen "$rel" "$tmp"
 		log "  created  $rel"
 		created=$((created + 1))
 	fi
@@ -1152,6 +1164,13 @@ reports/
 # against the real file, merge by hand, then delete.
 *.yaml.new
 *.tf.new
+
+# Host-specific GitLab container settings written by scripts/gitlab-https.sh.
+deploy/gitlab/.env
+deploy/gitlab/ssl/
+
+# Originals saved by the generator's update script before it overwrites a file.
+.nsx-update-backup/
 
 # Local tool output.
 .bin/
@@ -7253,7 +7272,7 @@ write_file deploy/gitlab/docker-compose.yml <<'SCAFFOLD_EOF'
 # A self-contained GitLab for running this repository's review pipeline, for
 # teams that do not already have one. Brought up by scripts/gitlab-up.sh.
 #
-# NOT a production GitLab. No TLS, no backups, no HA, and the runner is
+# NOT a production GitLab. TLS only through scripts/gitlab-https.sh, no backups, no HA, and the runner is
 # privileged so it can run Docker-in-Docker. Fine for a lab or a pilot; put a
 # real one in front of a production estate.
 #
@@ -7268,7 +7287,10 @@ services:
     hostname: "${GITLAB_HOST:-localhost}"
     environment:
       GITLAB_OMNIBUS_CONFIG: |
-        external_url 'http://${GITLAB_HOST:-localhost}:${GITLAB_PORT:-8929}'
+        external_url '${GITLAB_SCHEME:-http}://${GITLAB_HOST:-localhost}:${GITLAB_PORT:-8929}'
+        # Only used when the scheme is https; set up by scripts/gitlab-https.sh.
+        nginx['ssl_certificate'] = "/etc/gitlab/ssl/server.crt"
+        nginx['ssl_certificate_key'] = "/etc/gitlab/ssl/server.key"
         gitlab_rails['gitlab_shell_ssh_port'] = ${GITLAB_SSH_PORT:-2224}
         # A lab instance does not need mail, metrics or the container registry.
         registry['enable'] = false
@@ -7284,6 +7306,7 @@ services:
       - gitlab-config:/etc/gitlab
       - gitlab-logs:/var/log/gitlab
       - gitlab-data:/var/opt/gitlab
+      - ${GITLAB_SSL_DIR:-./ssl}:/etc/gitlab/ssl:ro
     shm_size: 256m
     healthcheck:
       test: ["CMD", "/opt/gitlab/bin/gitlab-healthcheck", "--fail", "--max-time", "10"]
@@ -7334,9 +7357,22 @@ answers. The script waits and tells you what it is waiting for.
 - A project containing this repository, with `.gitlab-ci.yml` already in it.
 - A registered runner using the Docker executor.
 
+## HTTPS on 8443, renewed automatically
+
+```bash
+scripts/gitlab-https.sh           # certificate, HTTPS on 8443, runner, daily renewal
+scripts/gitlab-https.sh --status  # URL, certificate expiry, renewal job
+scripts/gitlab-https.sh --renew   # what the daily job runs
+```
+
+It makes a small internal CA with openssl, issues a 90-day server certificate,
+reissues it when 30 days remain and reloads nginx. Import `ca.crt` (default
+`/opt/nsx-gitlab/ssl/ca.crt`) into browsers and other clients. A private IP
+cannot get a public certificate; if GitLab has a public DNS name, use certbot.
+
 ## What it is not
 
-Not a production GitLab. No TLS, no backups, no HA, and the initial root
+Not a production GitLab. No backups, no HA, and the initial root
 password lives in a file inside the container for 24 hours. Change it at first
 login. For a production estate use a real GitLab and point
 `scripts/enable-gitops.sh` at it instead.
@@ -7905,6 +7941,236 @@ main() {
 main "$@"
 SCAFFOLD_EOF
 mark_executable scripts/gitlab-up.sh
+
+write_file scripts/gitlab-https.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# Serve the local GitLab over HTTPS and keep its certificate renewed.
+#
+#   scripts/gitlab-https.sh            set up, or re-apply: certificate, HTTPS on
+#                                      8443, runner trust, daily renewal job
+#   scripts/gitlab-https.sh --renew    reissue the certificate if it expires
+#                                      within 30 days (what the daily job runs)
+#   scripts/gitlab-https.sh --status   URL, certificate expiry, renewal job
+#
+# For the GitLab started by scripts/gitlab-up.sh. A private address cannot get a
+# public certificate, so this keeps a small internal CA with openssl and issues
+# 90-day server certificates from it. Clients import ca.crt once.
+#
+# Settings (environment, or deploy/gitlab/.env from a previous run):
+#   GITLAB_HOST      name or IP clients use      (default: this host's first IP)
+#   GITLAB_PORT      HTTPS port                  (default: 8443)
+#   GITLAB_SSL_DIR   CA and certificate keys     (default: /opt/nsx-gitlab/ssl)
+#
+# Keys stay out of the repository: GITLAB_SSL_DIR is outside it.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMPOSE_DIR="$REPO_ROOT/deploy/gitlab"
+ENV_FILE="$COMPOSE_DIR/.env"
+RENEW_DAYS=30
+VALID_DAYS=90
+
+die() {
+	printf 'error: %s\n' "$*" >&2
+	exit 1
+}
+say() { printf '%s\n' "$*"; }
+
+# Environment wins, then the file a previous run wrote, then a default.
+saved() { [ -f "$ENV_FILE" ] && sed -n "s/^$1=//p" "$ENV_FILE" | tail -1 || true; }
+GITLAB_HOST="${GITLAB_HOST:-$(saved GITLAB_HOST)}"
+GITLAB_HOST="${GITLAB_HOST:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
+GITLAB_PORT="${GITLAB_PORT:-$(saved GITLAB_PORT)}"
+GITLAB_PORT="${GITLAB_PORT:-8443}"
+GITLAB_SSL_DIR="${GITLAB_SSL_DIR:-$(saved GITLAB_SSL_DIR)}"
+GITLAB_SSL_DIR="${GITLAB_SSL_DIR:-/opt/nsx-gitlab/ssl}"
+[ -n "$GITLAB_HOST" ] || die "cannot work out this host's address. Set GITLAB_HOST."
+URL="https://${GITLAB_HOST}:${GITLAB_PORT}"
+CRON_FILE=/etc/cron.d/nsx-gitlab-cert
+
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required."; }
+
+compose() {
+	if docker compose version >/dev/null 2>&1; then
+		(cd "$COMPOSE_DIR" && docker compose "$@")
+	elif command -v docker-compose >/dev/null 2>&1; then
+		(cd "$COMPOSE_DIR" && docker-compose "$@")
+	else
+		die "neither 'docker compose' nor 'docker-compose' is available."
+	fi
+}
+
+# Returns 0 if a valid certificate for this host exists with time to spare.
+cert_ok() {
+	[ -f "$GITLAB_SSL_DIR/server.crt" ] && [ -f "$GITLAB_SSL_DIR/server.key" ] || return 1
+	openssl x509 -in "$GITLAB_SSL_DIR/server.crt" -noout -checkend $((RENEW_DAYS * 86400)) >/dev/null || return 1
+	openssl x509 -in "$GITLAB_SSL_DIR/server.crt" -noout -text | grep -q -- "$GITLAB_HOST" || return 1
+}
+
+issue_cert() {
+	local san
+	umask 077
+	mkdir -p "$GITLAB_SSL_DIR"
+	cd "$GITLAB_SSL_DIR"
+	if [[ "$GITLAB_HOST" =~ ^[0-9.]+$ ]]; then san="IP:$GITLAB_HOST"; else san="DNS:$GITLAB_HOST"; fi
+
+	if [ ! -f ca.key ]; then
+		say "creating the internal CA (10 years)..."
+		openssl genrsa -out ca.key 4096 2>/dev/null
+		openssl req -x509 -new -key ca.key -sha256 -days 3650 \
+			-subj "/CN=NSX Estate Internal CA" -out ca.crt
+	fi
+
+	say "issuing a ${VALID_DAYS}-day certificate for $GITLAB_HOST..."
+	openssl genrsa -out server.key 2048 2>/dev/null
+	openssl req -new -key server.key -subj "/CN=$GITLAB_HOST" -out server.csr
+	printf 'subjectAltName=%s\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n' "$san" >ext.cnf
+	openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+		-sha256 -days "$VALID_DAYS" -extfile ext.cnf -out server.crt 2>/dev/null
+	rm -f server.csr ext.cnf
+	chmod 600 server.key ca.key
+	chmod 644 server.crt ca.crt
+}
+
+reload_nginx() {
+	docker exec nsx-gitlab gitlab-ctl hup nginx >/dev/null 2>&1 &&
+		say "nginx reloaded with the new certificate." || true
+}
+
+write_env() {
+	cat >"$ENV_FILE" <<ENVFILE
+# Written by scripts/gitlab-https.sh. Docker compose reads this automatically.
+GITLAB_HOST=$GITLAB_HOST
+GITLAB_PORT=$GITLAB_PORT
+GITLAB_SCHEME=https
+GITLAB_SSL_DIR=$GITLAB_SSL_DIR
+ENVFILE
+}
+
+wait_for_https() {
+	local deadline=$((SECONDS + 600))
+	say "waiting for $URL (GitLab reconfigures itself; a few minutes)..."
+	while [ "$SECONDS" -lt "$deadline" ]; do
+		if curl -sf -o /dev/null --max-time 10 --cacert "$GITLAB_SSL_DIR/ca.crt" "$URL/users/sign_in"; then
+			say "GitLab answers over HTTPS."
+			return 0
+		fi
+		sleep 10
+	done
+	die "no HTTPS answer within 10 minutes. Look at: docker logs --tail=100 nsx-gitlab"
+}
+
+trust_runner() {
+	docker inspect nsx-gitlab-runner >/dev/null 2>&1 || {
+		say "no runner container found; skipping runner trust."
+		return 0
+	}
+	local certs=/etc/gitlab-runner/certs
+	docker exec nsx-gitlab-runner mkdir -p "$certs"
+	docker cp "$GITLAB_SSL_DIR/ca.crt" "nsx-gitlab-runner:$certs/${GITLAB_HOST}.crt"
+	docker exec nsx-gitlab-runner sh -c "
+		f=/etc/gitlab-runner/config.toml
+		[ -f \$f ] || exit 0
+		sed -i 's|^\\([[:space:]]*url = \\)\".*\"|\\1\"${URL}/\"|' \$f
+		grep -q tls-ca-file \$f || sed -i '/^[[:space:]]*url = /a\\  tls-ca-file = \"${certs}/${GITLAB_HOST}.crt\"' \$f
+	"
+	docker restart nsx-gitlab-runner >/dev/null
+	say "runner now trusts the CA and points at $URL."
+}
+
+install_cron() {
+	local line="17 3 * * * root GITLAB_HOST=$GITLAB_HOST GITLAB_PORT=$GITLAB_PORT GITLAB_SSL_DIR=$GITLAB_SSL_DIR $REPO_ROOT/scripts/gitlab-https.sh --renew >> /var/log/nsx-gitlab-cert.log 2>&1"
+	if [ "$(id -u)" -eq 0 ] && [ -d /etc/cron.d ]; then
+		printf '%s\n' "$line" >"$CRON_FILE"
+		chmod 644 "$CRON_FILE"
+		say "daily renewal installed: $CRON_FILE"
+	else
+		say "not root: add this line to a crontab to renew automatically:"
+		say "  $line"
+	fi
+}
+
+port_clash() {
+	# Our own container already publishing the port is fine.
+	docker port nsx-gitlab 2>/dev/null | grep -q ":${GITLAB_PORT}\$" && return 1
+	command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${GITLAB_PORT}\$"
+}
+
+status() {
+	say "URL         $URL"
+	say "SSL dir     $GITLAB_SSL_DIR"
+	if [ -f "$GITLAB_SSL_DIR/server.crt" ]; then
+		openssl x509 -in "$GITLAB_SSL_DIR/server.crt" -noout -enddate | sed 's/^/certificate  /'
+	else
+		say "certificate  none yet"
+	fi
+	[ -f "$CRON_FILE" ] && say "renewal job  $CRON_FILE" || say "renewal job  not installed"
+	curl -sf -o /dev/null --max-time 10 --cacert "$GITLAB_SSL_DIR/ca.crt" "$URL/users/sign_in" 2>/dev/null &&
+		say "state        answering over HTTPS" || say "state        not answering over HTTPS"
+}
+
+main() {
+	need openssl
+	case "${1:-}" in
+	--status)
+		status
+		exit 0
+		;;
+	--renew)
+		if cert_ok; then
+			exit 0
+		fi
+		issue_cert
+		reload_nginx
+		exit 0
+		;;
+	"") ;;
+	*) die "unknown option: $1. Try --renew or --status." ;;
+	esac
+
+	need docker
+	need curl
+	docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon."
+	[ -f "$COMPOSE_DIR/docker-compose.yml" ] || die "$COMPOSE_DIR/docker-compose.yml is missing."
+	grep -q GITLAB_SCHEME "$COMPOSE_DIR/docker-compose.yml" ||
+		die "docker-compose.yml predates HTTPS support. Update it: scripts/bootstrap.sh --force"
+	if port_clash; then
+		die "port $GITLAB_PORT is already in use on this host by something else."
+	fi
+
+	cert_ok || issue_cert
+	write_env
+	say "restarting GitLab with $URL (data is kept)..."
+	compose up -d
+	wait_for_https
+	trust_runner
+	install_cron
+
+	cat <<DONE
+
+===================================================================
+ GitLab is serving HTTPS
+===================================================================
+
+  URL      $URL
+  CA       $GITLAB_SSL_DIR/ca.crt   (import into browsers and other clients)
+
+Point existing clones at it:
+
+  git remote set-url origin $URL/<group>/<project>.git
+  git config http.sslCAInfo $GITLAB_SSL_DIR/ca.crt
+
+and use $URL as --url for scripts/gitlab-setup.sh.
+Certificate renews itself when under ${RENEW_DAYS} days remain.
+
+DONE
+}
+
+main "$@"
+SCAFFOLD_EOF
+mark_executable scripts/gitlab-https.sh
 
 write_file scripts/selftest.sh <<'SCAFFOLD_EOF'
 #!/usr/bin/env bash
@@ -9893,6 +10159,17 @@ if { [ "$WITH_GIT" = 1 ] || vcs_wants_git; } && [ "$DRY_RUN" != 1 ]; then
 			git -C "$ROOT" init -q # -b needs git 2.28+; older git gets its default
 		log "git: initialised a repository in $ROOT"
 	fi
+fi
+
+# Merge what this run wrote into the tree's record of generator output.
+if [ "$DRY_RUN" != 1 ] && [ -s "$STAGE/generated.sha256" ]; then
+	{
+		cat "$STAGE/generated.sha256"
+		[ -f "$ROOT/.nsx-generated.sha256" ] && cat "$ROOT/.nsx-generated.sha256"
+		true # no earlier record is not a failure
+	} | LC_ALL=C sort -k2,2 -s -u >"$STAGE/merged.sha256" &&
+		cat "$STAGE/merged.sha256" >"$ROOT/.nsx-generated.sha256" 2>/dev/null ||
+		warn "could not write $ROOT/.nsx-generated.sha256; scripts/update.sh will treat differing files as conflicts"
 fi
 
 # Remember the answers, so a later bare re-run does not quietly change the shape

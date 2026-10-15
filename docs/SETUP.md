@@ -588,3 +588,71 @@ Terraform. It writes a report and never reverts anything and never writes
 
 `docs/ARCHITECTURE.md` section 2 lists the ten failure modes worth internalising
 before the first change.
+
+---
+
+## Keeping it up to date — the same command every time
+
+This repository is the generator. Your tree is generated from it once; after
+that, **improvements arrive by updating this clone and running one command**.
+The command does not change between releases.
+
+```bash
+cd ~/nsx-terrafrom                       # the clone of this public repository
+scripts/update.sh --dir ~/nsx-estate     # first time only; the path is remembered
+scripts/update.sh                        # every time after
+```
+
+It pulls this repository (fast-forward only), generates what your tree *would*
+be today in a scratch directory, and **shows you the difference before writing
+anything**:
+
+```
+  1 new   3 update   1 yours, kept   1 conflict   107 unchanged
+
+NEW       scripts/gitlab-https.sh
+UPDATE    .gitignore                 (diff shown)
+CONFLICT  modules/group/main.tf      (diff shown; kept unless you say otherwise)
+YOURS     README.md                  (you edited it, the generator did not; left alone)
+
+Apply 4 change(s) to /root/nsx-estate? [y/N]
+```
+
+How each file is judged — by comparing what the generator writes now, what is in
+your tree, and what the generator wrote last time (`.nsx-generated.sha256`,
+written by `bootstrap.sh`):
+
+| | Meaning | What happens |
+|---|---|---|
+| **NEW** | not in your tree yet | created |
+| **UPDATE** | generator changed it, you did not | replaced |
+| **YOURS** | you changed it, generator did not | never touched |
+| **CONFLICT** | both changed, or there is no record from last time | kept; `--overwrite-unknown` applies it |
+
+Always true: `data/`, `inventory/` and `envs/` are never read or written; nothing
+is ever deleted; every overwritten file is first copied to
+`.nsx-update-backup/<timestamp>/`.
+
+```bash
+scripts/update.sh --check          # preview only; exit 3 if anything is pending
+scripts/update.sh --summary        # file list without the diffs
+scripts/update.sh --yes            # apply without asking (safe changes only)
+scripts/update.sh --commit         # in a git tree: commit on update/<rev>; never pushes
+scripts/update.sh --overwrite-unknown   # also apply CONFLICT files, backed up
+scripts/update.sh --remote URL --branch main    # pull from somewhere else
+```
+
+Use `--commit`, push the `update/<rev>` branch and open a merge request: the
+update then goes through the same review and plan pipeline as any other change.
+Some updates need an action afterwards (a changed `deploy/gitlab/` file means
+restarting the container; a changed `backend.tf` means `terraform init`); the
+command lists them at the end and does not do them silently.
+
+A tree generated before this existed has no record of last time, so its first
+update shows every differing file as **CONFLICT**. Read the diffs once, apply
+with `--overwrite-unknown` if they are all the generator's, and it is
+tracked from then on.
+
+If the clone's `origin` is not this repository (for example it points at your
+own GitLab), pass `--remote https://github.com/sampath9966/nsx-terraform` or
+`git remote add upstream` and use `--remote upstream`.
