@@ -7293,9 +7293,11 @@ services:
         nginx['ssl_certificate_key'] = "/etc/gitlab/ssl/server.key"
         gitlab_rails['gitlab_shell_ssh_port'] = ${GITLAB_SSH_PORT:-2224}
         # A lab instance does not need mail, metrics or the container registry.
+        # (No grafana[...] line: bundled Grafana was removed in GitLab 16.3 and
+        # any grafana setting now stops 'gitlab-ctl reconfigure' with
+        # "Reading unsupported config value grafana".)
         registry['enable'] = false
         prometheus_monitoring['enable'] = false
-        grafana['enable'] = false
         gitlab_rails['gitlab_email_enabled'] = false
         puma['worker_processes'] = 2
         sidekiq['max_concurrency'] = 9
@@ -7319,6 +7321,10 @@ services:
     image: gitlab/gitlab-runner:v17.5.3
     container_name: nsx-gitlab-runner
     restart: unless-stopped
+    # Host network: the runner then reaches GitLab at the same address you do,
+    # including 127.0.0.1 / localhost. On the default bridge network 127.0.0.1
+    # is the runner's own container and registration fails.
+    network_mode: host
     depends_on:
       - gitlab
     volumes:
@@ -7988,9 +7994,23 @@ GITLAB_SSL_DIR="${GITLAB_SSL_DIR:-$(saved GITLAB_SSL_DIR)}"
 GITLAB_SSL_DIR="${GITLAB_SSL_DIR:-/opt/nsx-gitlab/ssl}"
 [ -n "$GITLAB_HOST" ] || die "cannot work out this host's address. Set GITLAB_HOST."
 URL="https://${GITLAB_HOST}:${GITLAB_PORT}"
-CRON_FILE=/etc/cron.d/nsx-gitlab-cert
+CRON_FILE="${NSX_CRON_FILE:-/etc/cron.d/nsx-gitlab-cert}"
 
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required."; }
+
+# One certificate operation at a time: the daily renewal and a manual run must
+# not both rewrite server.key while nginx reads it.
+lock_ssl() {
+	mkdir -p "$GITLAB_SSL_DIR" 2>/dev/null
+	# Docker creates a missing bind-mount directory as root, so a directory that
+	# GitLab's first start made is not writable by an ordinary user.
+	[ -w "$GITLAB_SSL_DIR" ] ||
+		die "$GITLAB_SSL_DIR is not writable by $(id -un) (owner: $(stat -c %U "$GITLAB_SSL_DIR" 2>/dev/null || echo unknown)).
+       Run as root, or: sudo chown -R $(id -un) $GITLAB_SSL_DIR"
+	command -v flock >/dev/null 2>&1 || return 0
+	exec 8>"$GITLAB_SSL_DIR/.lock" || return 0
+	flock -w "${NSX_LOCK_WAIT:-120}" 8 || die "another certificate operation is running (lock: $GITLAB_SSL_DIR/.lock)."
+}
 
 compose() {
 	if docker compose version >/dev/null 2>&1; then
@@ -8024,14 +8044,18 @@ issue_cert() {
 	fi
 
 	say "issuing a ${VALID_DAYS}-day certificate for $GITLAB_HOST..."
-	openssl genrsa -out server.key 2048 2>/dev/null
-	openssl req -new -key server.key -subj "/CN=$GITLAB_HOST" -out server.csr
+	# Build the pair under temporary names and move both into place, so nginx
+	# (which may reload at any moment) never reads a new key beside an old cert.
+	openssl genrsa -out server.key.new 2048 2>/dev/null
+	openssl req -new -key server.key.new -subj "/CN=$GITLAB_HOST" -out server.csr
 	printf 'subjectAltName=%s\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n' "$san" >ext.cnf
 	openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
-		-sha256 -days "$VALID_DAYS" -extfile ext.cnf -out server.crt 2>/dev/null
+		-sha256 -days "$VALID_DAYS" -extfile ext.cnf -out server.crt.new 2>/dev/null
 	rm -f server.csr ext.cnf
-	chmod 600 server.key ca.key
-	chmod 644 server.crt ca.crt
+	chmod 600 server.key.new ca.key
+	chmod 644 server.crt.new ca.crt
+	mv -f server.key.new server.key
+	mv -f server.crt.new server.crt
 }
 
 reload_nginx() {
@@ -8059,7 +8083,10 @@ wait_for_https() {
 		fi
 		sleep 10
 	done
-	die "no HTTPS answer within 10 minutes. Look at: docker logs --tail=100 nsx-gitlab"
+	say "--- last lines from the container:"
+	docker logs --tail=30 nsx-gitlab 2>&1 | sed 's/^/    /' || true
+	die "no HTTPS answer within 10 minutes.
+       To go back to plain HTTP:  rm $ENV_FILE && (cd $COMPOSE_DIR && docker compose up -d)"
 }
 
 trust_runner() {
@@ -8082,7 +8109,7 @@ trust_runner() {
 
 install_cron() {
 	local line="17 3 * * * root GITLAB_HOST=$GITLAB_HOST GITLAB_PORT=$GITLAB_PORT GITLAB_SSL_DIR=$GITLAB_SSL_DIR $REPO_ROOT/scripts/gitlab-https.sh --renew >> /var/log/nsx-gitlab-cert.log 2>&1"
-	if [ "$(id -u)" -eq 0 ] && [ -d /etc/cron.d ]; then
+	if [ "$(id -u)" -eq 0 ] && [ -d "$(dirname "$CRON_FILE")" ]; then
 		printf '%s\n' "$line" >"$CRON_FILE"
 		chmod 644 "$CRON_FILE"
 		say "daily renewal installed: $CRON_FILE"
@@ -8119,6 +8146,7 @@ main() {
 		exit 0
 		;;
 	--renew)
+		lock_ssl
 		if cert_ok; then
 			exit 0
 		fi
@@ -8135,13 +8163,19 @@ main() {
 	docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon."
 	[ -f "$COMPOSE_DIR/docker-compose.yml" ] || die "$COMPOSE_DIR/docker-compose.yml is missing."
 	grep -q GITLAB_SCHEME "$COMPOSE_DIR/docker-compose.yml" ||
-		die "docker-compose.yml predates HTTPS support. Update it: scripts/bootstrap.sh --force"
+		die "docker-compose.yml predates HTTPS support. Bring the tree up to date first: update.sh in your clone of the generator."
+	# GitLab 16.3 removed bundled Grafana; any grafana[...] setting makes
+	# 'gitlab-ctl reconfigure' abort, and the container then cannot start.
+	grep -Eq "^[[:space:]]*grafana\[" "$COMPOSE_DIR/docker-compose.yml" &&
+		die "docker-compose.yml has a grafana[...] setting, which GitLab 17 rejects. Bring the tree up to date first (update.sh), or delete that line."
+	lock_ssl
 	if port_clash; then
 		die "port $GITLAB_PORT is already in use on this host by something else."
 	fi
 
 	cert_ok || issue_cert
 	write_env
+	compose config -q || die "docker-compose.yml is not valid; nothing was restarted."
 	say "restarting GitLab with $URL (data is kept)..."
 	compose up -d
 	wait_for_https

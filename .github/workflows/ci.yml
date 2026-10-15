@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    name: offline tests (syntax, shellcheck, selftest, update, certificates)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Run offline tests
+        run: tests/run.sh
+
+  e2e:
+    name: real GitLab (HTTP -> HTTPS on 8443 -> renewal)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk for the GitLab image
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android || true
+          df -h /
+      - name: Boot GitLab, switch to HTTPS, renew
+        run: tests/e2e-gitlab.sh
+      - name: GitLab logs on failure
+        if: failure()
+        run: docker logs --tail=200 nsx-gitlab || true
