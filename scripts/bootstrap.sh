@@ -7293,9 +7293,11 @@ services:
         nginx['ssl_certificate_key'] = "/etc/gitlab/ssl/server.key"
         gitlab_rails['gitlab_shell_ssh_port'] = ${GITLAB_SSH_PORT:-2224}
         # A lab instance does not need mail, metrics or the container registry.
+        # (No grafana[...] line: bundled Grafana was removed in GitLab 16.3 and
+        # any grafana setting now stops 'gitlab-ctl reconfigure' with
+        # "Reading unsupported config value grafana".)
         registry['enable'] = false
         prometheus_monitoring['enable'] = false
-        grafana['enable'] = false
         gitlab_rails['gitlab_email_enabled'] = false
         puma['worker_processes'] = 2
         sidekiq['max_concurrency'] = 9
