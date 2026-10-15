@@ -36,6 +36,12 @@ Any flag on the command line suppresses the menu, so CI is unaffected.
 
 `docs/SETUP.md` walks the whole thing, including the choices you have to make.
 
+Later, to pick up improvements to this repository **without changing your steps**:
+
+```bash
+scripts/update.sh        # pulls, shows exactly what would change in your tree, asks, applies
+```
+
 > The repository name contains a typo for "terraform". It is reproduced verbatim
 > in remotes and CI config; renaming is the owner's call.
 

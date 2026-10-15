@@ -1002,6 +1002,15 @@ confirm_overwrite() {
 }
 
 # write_file <relative-path> — content is read from stdin.
+# record_gen <relative-path> <staged-file> — remember what the generator wrote,
+# so scripts/update.sh can later tell its own changes from yours. Estate data is
+# yours from the first minute and is not recorded.
+record_gen() {
+	is_estate_data "$1" && return 0
+	[ "$DRY_RUN" = 1 ] && return 0
+	printf '%s  %s\n' "$(sha256sum "$2" | awk '{print $1}')" "$1" >>"$STAGE/generated.sha256"
+}
+
 write_file() {
 	local rel="$1"
 	local dest="$ROOT/$rel"
@@ -1041,10 +1050,12 @@ write_file() {
 		fi
 		if cmp -s "$tmp" "$dest"; then
 			log "  ok       $rel"
+			record_gen "$rel" "$tmp"
 			unchanged=$((unchanged + 1))
 		elif [ "$may_overwrite" = 1 ]; then
 			confirm_overwrite "$rel"
 			cat "$tmp" >"$dest"
+			record_gen "$rel" "$tmp"
 			log "  updated  $rel"
 			updated=$((updated + 1))
 		elif [ -n "$guard" ]; then
@@ -1064,6 +1075,7 @@ write_file() {
 		fi
 		mkdir -p "$(dirname "$dest")"
 		cat "$tmp" >"$dest"
+		record_gen "$rel" "$tmp"
 		log "  created  $rel"
 		created=$((created + 1))
 	fi
@@ -1156,6 +1168,9 @@ reports/
 # Host-specific GitLab container settings written by scripts/gitlab-https.sh.
 deploy/gitlab/.env
 deploy/gitlab/ssl/
+
+# Originals saved by the generator's update script before it overwrites a file.
+.nsx-update-backup/
 
 # Local tool output.
 .bin/
@@ -10144,6 +10159,17 @@ if { [ "$WITH_GIT" = 1 ] || vcs_wants_git; } && [ "$DRY_RUN" != 1 ]; then
 			git -C "$ROOT" init -q # -b needs git 2.28+; older git gets its default
 		log "git: initialised a repository in $ROOT"
 	fi
+fi
+
+# Merge what this run wrote into the tree's record of generator output.
+if [ "$DRY_RUN" != 1 ] && [ -s "$STAGE/generated.sha256" ]; then
+	{
+		cat "$STAGE/generated.sha256"
+		[ -f "$ROOT/.nsx-generated.sha256" ] && cat "$ROOT/.nsx-generated.sha256"
+		true # no earlier record is not a failure
+	} | LC_ALL=C sort -k2,2 -s -u >"$STAGE/merged.sha256" &&
+		cat "$STAGE/merged.sha256" >"$ROOT/.nsx-generated.sha256" 2>/dev/null ||
+		warn "could not write $ROOT/.nsx-generated.sha256; scripts/update.sh will treat differing files as conflicts"
 fi
 
 # Remember the answers, so a later bare re-run does not quietly change the shape
