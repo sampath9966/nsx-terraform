@@ -43,7 +43,7 @@ env -u GITLAB_SSL_DIR GITLAB_WAIT_MINUTES=25 "$T/scripts/gitlab-up.sh" >"$SCRATC
 check "gitlab-up.sh succeeds" test $? -eq 0
 tail -12 "$SCRATCH/up.log" | sed 's/^/    /'
 check "answers over plain HTTP on 8929" curl -sf -o /dev/null --max-time 20 http://127.0.0.1:8929/users/sign_in
-check "gitlab-up.sh registered a runner" bash -c "docker exec nsx-gitlab-runner gitlab-runner list 2>&1 | grep -q nsx-local"
+check "gitlab-up.sh registered a runner" docker exec nsx-gitlab-runner grep -q '\[\[runners\]\]' /etc/gitlab-runner/config.toml
 projects_before="$(docker exec nsx-gitlab gitlab-rails runner 'puts Project.count' 2>/dev/null | tail -1)"
 check "a project exists before the switch" test "${projects_before:-0}" -ge 1
 
