@@ -7321,6 +7321,10 @@ services:
     image: gitlab/gitlab-runner:v17.5.3
     container_name: nsx-gitlab-runner
     restart: unless-stopped
+    # Host network: the runner then reaches GitLab at the same address you do,
+    # including 127.0.0.1 / localhost. On the default bridge network 127.0.0.1
+    # is the runner's own container and registration fails.
+    network_mode: host
     depends_on:
       - gitlab
     volumes:
