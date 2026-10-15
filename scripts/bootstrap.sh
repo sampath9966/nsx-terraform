@@ -7997,8 +7997,13 @@ need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required."; }
 # One certificate operation at a time: the daily renewal and a manual run must
 # not both rewrite server.key while nginx reads it.
 lock_ssl() {
-	command -v flock >/dev/null 2>&1 || return 0
 	mkdir -p "$GITLAB_SSL_DIR" 2>/dev/null
+	# Docker creates a missing bind-mount directory as root, so a directory that
+	# GitLab's first start made is not writable by an ordinary user.
+	[ -w "$GITLAB_SSL_DIR" ] ||
+		die "$GITLAB_SSL_DIR is not writable by $(id -un) (owner: $(stat -c %U "$GITLAB_SSL_DIR" 2>/dev/null || echo unknown)).
+       Run as root, or: sudo chown -R $(id -un) $GITLAB_SSL_DIR"
+	command -v flock >/dev/null 2>&1 || return 0
 	exec 8>"$GITLAB_SSL_DIR/.lock" || return 0
 	flock -w "${NSX_LOCK_WAIT:-120}" 8 || die "another certificate operation is running (lock: $GITLAB_SSL_DIR/.lock)."
 }

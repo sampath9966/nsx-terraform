@@ -23,7 +23,8 @@ done
 
 scratch
 T="$SCRATCH/estate"
-export GITLAB_HOST=127.0.0.1 GITLAB_SSL_DIR="$SCRATCH/ssl" NSX_CRON_FILE="$SCRATCH/cron-nsx-gitlab-cert"
+export GITLAB_HOST=127.0.0.1 NSX_CRON_FILE="$SCRATCH/cron-nsx-gitlab-cert"
+SSL="$SCRATCH/ssl"          # exported only for step 2: GitLab must not create it as root first
 cleanup() {
 	echo "--- cleaning up"
 	(cd "$T/deploy/gitlab" 2>/dev/null && docker compose down -v >/dev/null 2>&1)
@@ -38,7 +39,7 @@ git_quiet -C "$T" add -A
 git_quiet -C "$T" commit -m init
 
 echo "step 1: start GitLab over HTTP with scripts/gitlab-up.sh (first boot is slow)"
-GITLAB_WAIT_MINUTES=25 "$T/scripts/gitlab-up.sh" >"$SCRATCH/up.log" 2>&1
+env -u GITLAB_SSL_DIR GITLAB_WAIT_MINUTES=25 "$T/scripts/gitlab-up.sh" >"$SCRATCH/up.log" 2>&1
 check "gitlab-up.sh succeeds" test $? -eq 0
 tail -12 "$SCRATCH/up.log" | sed 's/^/    /'
 check "answers over plain HTTP on 8929" curl -sf -o /dev/null --max-time 20 http://127.0.0.1:8929/users/sign_in
@@ -46,11 +47,12 @@ projects_before="$(docker exec nsx-gitlab gitlab-rails runner 'puts Project.coun
 check "a project exists before the switch" test "${projects_before:-0}" -ge 1
 
 echo "step 2: switch to HTTPS on 8443"
-"$T/scripts/gitlab-https.sh" >"$SCRATCH/https.log" 2>&1
+GITLAB_SSL_DIR="$SSL" "$T/scripts/gitlab-https.sh" >"$SCRATCH/https.log" 2>&1
 rc=$?
 check "gitlab-https.sh succeeds" test "$rc" -eq 0
 [ "$rc" -eq 0 ] || tail -40 "$SCRATCH/https.log" | sed 's/^/    /'
-CA="$GITLAB_SSL_DIR/ca.crt"
+export GITLAB_SSL_DIR="$SSL"
+CA="$SSL/ca.crt"
 check "answers over HTTPS on 8443, trusting only our CA" curl -sf -o /dev/null --max-time 20 --cacert "$CA" https://127.0.0.1:8443/users/sign_in
 check "is NOT trusted without the CA" bash -c "! curl -sf -o /dev/null --max-time 20 https://127.0.0.1:8443/users/sign_in"
 check "certificate carries the IP in its SAN" bash -c "echo | openssl s_client -connect 127.0.0.1:8443 -CAfile '$CA' 2>/dev/null | openssl x509 -noout -text | grep -q 'IP Address:127.0.0.1'"
