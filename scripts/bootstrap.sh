@@ -8948,7 +8948,12 @@ stages:
   - apply
 
 default:
-  image: hashicorp/terraform:1.9.8
+  # The image's entrypoint is 'terraform'. GitLab starts every job with 'sh -c',
+  # so without an empty entrypoint Terraform is handed 'sh' and fails with
+  # 'Terraform has no command named "sh"'.
+  image:
+    name: hashicorp/terraform:1.9.8
+    entrypoint: [""]
   before_script:
     - apk add --no-cache python3 curl git bash >/dev/null
   interruptible: true
@@ -9069,7 +9074,9 @@ def main() -> int:
     out.append("stages: [plan, apply]")
     out.append("")
     out.append("default:")
-    out.append("  image: hashicorp/terraform:1.9.8")
+    out.append("  image:")
+    out.append("    name: hashicorp/terraform:1.9.8")
+    out.append('    entrypoint: [""]')
     out.append("  before_script:")
     out.append("    - apk add --no-cache python3 curl git bash jq >/dev/null")
     out.append("")

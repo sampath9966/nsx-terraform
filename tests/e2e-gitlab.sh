@@ -74,6 +74,37 @@ tok="nsxe2e$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 docker exec nsx-gitlab gitlab-rails runner "u=User.find_by_username('root'); t=u.personal_access_tokens.create!(scopes:['api','write_repository'],name:'e2e',expires_at:7.days.from_now); t.set_token('$tok'); t.save!" >/dev/null 2>&1
 check "git ls-remote works over HTTPS" env GIT_SSL_CAINFO="$CA" git ls-remote "https://root:$tok@127.0.0.1:8443/root/nsx-terraform.git"
 
+echo "step 4b: the pipeline really runs on the runner"
+API="https://127.0.0.1:8443/api/v4/projects/root%2Fnsx-terraform"
+api() { curl -s --max-time 30 --cacert "$CA" -H "PRIVATE-TOKEN: $tok" "$@"; }
+# validate-stage jobs (offline: no Vault, no NSX) must pass. The plan stage needs credentials and is not expected to.
+want="data terraform matrix"
+deadline=$((SECONDS + 900))
+pid="" states=""
+while [ "$SECONDS" -lt "$deadline" ]; do
+	pid="$(api "$API/pipelines?ref=main&per_page=1" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d[0]["id"] if d else "")' 2>/dev/null)"
+	if [ -n "$pid" ]; then
+		states="$(api "$API/pipelines/$pid/jobs?per_page=100" | python3 -c '
+import sys, json
+want = set("'"$want"'".split())
+jobs = {j["name"]: j["status"] for j in json.load(sys.stdin) if j["name"] in want}
+print(" ".join(f"{n}={jobs.get(n, \"missing\")}" for n in sorted(want)))' 2>/dev/null)"
+		# stop waiting once every wanted job has reached a final state
+		case "$states" in *pending* | *running* | *created* | *missing* | "") ;; *) break ;; esac
+	fi
+	sleep 10
+done
+echo "    pipeline $pid: $states"
+for j in $want; do
+	check "pipeline job '$j' succeeded on the runner" grep -q "$j=success" <<<"$states"
+done
+if ! grep -q "data=success" <<<"$states" || grep -q "failed" <<<"$states"; then
+	for j in $(api "$API/pipelines/$pid/jobs?per_page=100" | python3 -c 'import sys,json; print(" ".join(str(j["id"]) for j in json.load(sys.stdin) if j["status"]=="failed"))' 2>/dev/null); do
+		echo "    --- trace of failed job $j (last 25 lines)"
+		api "$API/jobs/$j/trace" | tail -25 | sed 's/^/    /'
+	done
+fi
+
 echo "step 5: renewal reloads nginx without a restart"
 served() { echo | openssl s_client -connect 127.0.0.1:8443 -CAfile "$CA" 2>/dev/null | openssl x509 -noout -fingerprint -sha256; }
 # nginx reloads asynchronously (a few seconds): wait for the served certificate to differ from $1.
