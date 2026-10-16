@@ -120,4 +120,84 @@ check "converge.sh reports it and exits 1, without a stack trace" bash -c '[ "$2
 out="$(env PATH="$base_path" "$R" 2>&1)"
 check "gitlab-runner.sh says Docker is missing" grep -qi "docker is not installed" <<<"$out"
 
+# ---------------------------------------------------------------------------
+echo "ci-image.sh with a stand-in Docker"
+FD="$SCRATCH/fakedocker"
+mkdir -p "$FD/bin"
+cat >"$FD/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+# Stand-in Docker. State lives in $FAKE_DIR. Knobs: FAKE_PULL=ok|429  FAKE_BUILD_NEEDS_REGISTRY=1
+d="$FAKE_DIR"
+echo "$*" >>"$d/calls"
+has() { grep -qxF "$1" "$d/local" 2>/dev/null; }
+case "$1" in
+info) exit 0 ;;
+image)
+	img="${*: -1}"
+	has "$img" || exit 1
+	case "$*" in *Labels*) cat "$d/label.$(echo "$img" | tr '/:' '__')" 2>/dev/null ;; esac
+	exit 0 ;;
+pull)
+	img="${*: -1}"
+	if [ "${FAKE_PULL:-ok}" = 429 ]; then
+		echo "toomanyrequests: You have reached your pull rate limit." >&2
+		exit 1
+	fi
+	echo "$img" >>"$d/local"
+	exit 0 ;;
+build)
+	# every FROM must be local, or (without --pull=false) reachable
+	for b in hashicorp/terraform:1.9.8 python:3.12-bookworm; do
+		if ! has "$b"; then
+			echo "failed to resolve source metadata for $b: 429 Too Many Requests" >&2
+			exit 1
+		fi
+	done
+	label="$(printf '%s\n' "$@" | sed -n 's/^nsx.dockerfile=//p')"
+	echo "nsx-ci:1" >>"$d/local"
+	printf '%s' "$label" >"$d/label.nsx-ci_1"
+	exit 0 ;;
+run) exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x "$FD/bin/docker"
+fd_run() { # fd_run [ENV=VAL...] -> runs ci-image.sh against the stand-in
+	: >"$FD/calls"
+	env FAKE_DIR="$FD" NSX_PULL_RETRY_SLEEP=0 PATH="$FD/bin:$PATH" "$@" "$T/scripts/ci-image.sh" 2>&1
+}
+
+: >"$FD/local"
+rm -f "$FD"/label.*
+out="$(fd_run)"
+rc=$?
+check "bases missing, registry fine: pulls them, builds, exits 0" test "$rc" -eq 0
+check "...both base images were pulled first" bash -c 'grep -q "pull -q hashicorp/terraform:1.9.8" "$1/calls" && grep -q "pull -q python:3.12-bookworm" "$1/calls"' _ "$FD"
+check "...and the build did not ask the registry (--pull=false)" grep -q -- "--pull=false" "$FD/calls"
+
+out="$(fd_run)"
+check "an image that is current is left alone (no second build)" bash -c '! grep -q "^build" "$1/calls" && grep -q "is current" <<<"$2"' _ "$FD" "$out"
+
+printf '\n# changed\n' >>"$T/deploy/ci-image/Dockerfile"
+out="$(fd_run)"
+check "a changed Dockerfile triggers a rebuild" bash -c 'grep -q "^build" "$1/calls" && grep -q "out of date" <<<"$2"' _ "$FD" "$out"
+
+# Registry rate-limited, but the base images are already on the host: still builds.
+: >"$FD/local"
+printf 'hashicorp/terraform:1.9.8\npython:3.12-bookworm\n' >"$FD/local"
+rm -f "$FD"/label.*
+out="$(fd_run FAKE_PULL=429)"
+rc=$?
+check "registry rate-limited but bases cached: builds from them, exits 0" test "$rc" -eq 0
+check "...without pulling anything" bash -c '! grep -q "^pull" "$1/calls"' _ "$FD"
+
+# Registry rate-limited and nothing cached: fails, and says why in plain words.
+: >"$FD/local"
+rm -f "$FD"/label.*
+out="$(fd_run FAKE_PULL=429)"
+rc=$?
+check "rate-limited with nothing cached: exits non-zero" test "$rc" -ne 0
+check "...names the rate limit and what to do" bash -c 'grep -qi "rate-limiting" <<<"$1" && grep -q "docker login" <<<"$1"' _ "$out"
+check "...after retrying the pull" bash -c '[ "$(grep -c "^pull" "$1/calls")" -ge 3 ]' _ "$FD"
+
 finish ci-scripts

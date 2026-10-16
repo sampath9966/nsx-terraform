@@ -8418,8 +8418,10 @@ verify() {
 
 why_build_failed() {
 	local log="$1"
-	if grep -Eqi 'toomanyrequests|rate limit' "$log"; then
-		say "  Docker Hub is rate-limiting this host. Wait, or 'docker login' with a Docker Hub account, then re-run."
+	if grep -Eqi 'toomanyrequests|too many requests|rate limit|\b429\b' "$log"; then
+		say "  Docker Hub is rate-limiting this host (anonymous pulls are limited per address; the limit resets after a few"
+		say "  hours). Run 'docker login' with a Docker Hub account, or wait and re-run scripts/converge.sh. Once the base"
+		say "  images are on this host the build needs no registry at all."
 	elif grep -Eqi 'x509|certificate' "$log"; then
 		say "  A TLS certificate problem reaching Docker Hub (an inspecting proxy?). The Docker daemon must trust"
 		say "  your proxy's CA: install it in the host trust store (update-ca-certificates) and restart Docker."
@@ -8460,10 +8462,32 @@ fi
 
 log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
-say "building CI image $IMAGE from Docker Hub images (a minute or two the first time)..."
-if ! docker build --label "nsx.dockerfile=$want" -t "$IMAGE" "$CONTEXT" >"$log" 2>&1; then
+
+# The base images named by FROM lines.
+bases() { sed -n 's/^FROM[[:space:]]\{1,\}\([^[:space:]]\{1,\}\).*/\1/Ip' "$CONTEXT/Dockerfile"; }
+
+# Get the base images into the local image store first, retrying: Docker Hub rate-limits
+# anonymous pulls and networks blip. A build from images already here needs no registry.
+ensure_bases() {
+	local b attempt plog
+	plog="$(mktemp)"
+	for b in $(bases); do
+		docker image inspect "$b" >/dev/null 2>&1 && continue
+		for attempt in 1 2 3; do
+			say "pulling $b (attempt $attempt of 3)..."
+			docker pull -q "$b" >"$plog" 2>&1 && break
+			cat "$plog" >>"$log"
+			[ "$attempt" -lt 3 ] && sleep $((attempt * ${NSX_PULL_RETRY_SLEEP:-15}))
+		done
+	done
+	rm -f "$plog"
+}
+
+ensure_bases
+say "building CI image $IMAGE (a minute or two the first time)..."
+if ! docker build --pull=false --label "nsx.dockerfile=$want" -t "$IMAGE" "$CONTEXT" >>"$log" 2>&1; then
 	# Registry metadata lookups can fail where a plain build of cached images still works.
-	if ! DOCKER_BUILDKIT=0 docker build --label "nsx.dockerfile=$want" -t "$IMAGE" "$CONTEXT" >>"$log" 2>&1; then
+	if ! DOCKER_BUILDKIT=0 docker build --pull=false --label "nsx.dockerfile=$want" -t "$IMAGE" "$CONTEXT" >>"$log" 2>&1; then
 		tail -15 "$log" | sed 's/^/    /' >&2
 		why_build_failed "$log" >&2
 		die "could not build $IMAGE."
