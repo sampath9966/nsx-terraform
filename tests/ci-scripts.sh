@@ -64,6 +64,22 @@ rm -f "$SCRATCH/count"
 TF_STUB_INIT=flaky run_validate
 check "a transient network error is retried and then succeeds" test $? -eq 0
 
+# GitLab only honours allow_failure:exit_codes when the job's own shell executes 'exit 42'
+# (found by experiment on a real runner: a command that returns 42 is recorded as exit
+# code 1). So the job must be written as 'cmd || exit $?', and the exit codes must match.
+check "the terraform job re-exits the script's code (|| exit \$?)" grep -q 'ci-terraform-validate.sh || exit \$?' "$T/.gitlab-ci.yml"
+check "...and allows exactly the code the script uses for 'providers unreachable'" bash -c 'grep -q "exit_codes: 42" "$1/.gitlab-ci.yml" && grep -q "exit 42" "$1/scripts/ci-terraform-validate.sh"' _ "$T"
+python3 - "$T/.gitlab-ci.yml" <<'PYEOF' && pass "the generated .gitlab-ci.yml parses as YAML" || fail "the generated .gitlab-ci.yml parses as YAML"
+import sys
+try:
+    import yaml
+except ImportError:
+    sys.exit(0)
+d = yaml.safe_load(open(sys.argv[1]))
+assert d["terraform"]["script"] == ["bash scripts/ci-terraform-validate.sh || exit $?"], d["terraform"]["script"]
+assert d["terraform"]["allow_failure"] == {"exit_codes": 42}
+PYEOF
+
 # The provider mirror setting becomes a Terraform CLI config.
 out="$(cd "$T" && NSX_TF_NETWORK_MIRROR=https://mirror.corp/tf/ bash -c '. scripts/tf-mirror.sh; nsx_tf_mirror_setup; cat "$TF_CLI_CONFIG_FILE"')"
 check "NSX_TF_NETWORK_MIRROR becomes a network_mirror block" grep -q 'network_mirror' <<<"$out"

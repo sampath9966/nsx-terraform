@@ -9663,7 +9663,10 @@ data:
 terraform:
   stage: validate
   script:
-    - bash scripts/ci-terraform-validate.sh
+    # '|| exit $?' is deliberate. GitLab honours allow_failure:exit_codes only when
+    # the job's own shell runs 'exit 42'; a command that merely returns 42 is
+    # recorded as exit code 1 and the job would show as a hard failure.
+    - bash scripts/ci-terraform-validate.sh || exit $?
   # Exit 42 means formatting passed but providers could not be downloaded from
   # this network, so 'validate' did not run: shown as a warning, never silent.
   allow_failure:
