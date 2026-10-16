@@ -126,6 +126,7 @@ check "the CI image was built" docker image inspect nsx-ci:1
 check "the converge report lists the CI image as ready" grep -q "CI image nsx-ci:1" "$SCRATCH/update.log"
 check "the runner was registered with the local-image pull policy" docker exec nsx-gitlab-runner grep -q 'if-not-present' /etc/gitlab-runner/config.toml
 check "the runner passes the (blocked) proxy into jobs" docker exec nsx-gitlab-runner grep -q 'HTTPS_PROXY=http://127.0.0.1:9' /etc/gitlab-runner/config.toml
+check "the runner disables that proxy for the GitLab clone" docker exec nsx-gitlab-runner grep -q 'pre_get_sources_script' /etc/gitlab-runner/config.toml
 check "the converge report warns that providers cannot be downloaded" grep -q "cannot download Terraform providers" "$SCRATCH/update.log"
 
 started_runner="$(docker inspect -f '{{.State.StartedAt}}' nsx-gitlab-runner)"
