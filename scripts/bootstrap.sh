@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.2.4"
+VERSION="1.2.5"
 
 ROOT="$PWD"
 FORCE=0
@@ -8538,9 +8538,13 @@ write_file scripts/gitlab-runner.sh <<'SCAFFOLD_EOF'
 #   * GitLab's own CA plus the host trust store, when GitLab is served over HTTPS.
 #     Git in a job trusts only that file, so a TLS-inspecting proxy that the
 #     runner itself accepts will otherwise fail every clone with exit 1.
-#   * a pre-get-sources script that points git at CI_SERVER_TLS_CA_FILE. It does
-#     not change the proxy; private addresses stay direct because of NO_PROXY.
+#   * a pre-get-sources script that copies CI_SERVER_TLS_CA_FILE into the
+#     helper's temp dir (readable path) and sets sslCAInfo for this GitLab URL.
+#     A direct pointer at the runner's path often fails with "Problem with the
+#     SSL CA cert (path? access rights?)" during git clone.
 # Overrides, if you need them, go in deploy/gitlab/ci-network.env (KEY=VALUE lines).
+# When GitLab is on another host, set NSX_GITLAB_CA_FILE to that GitLab's ca.crt
+# on this machine (the file install_ca copies into the runner container).
 #
 # If anything about that differs from what the runner has, the runner is
 # re-registered (its old registration is removed). Otherwise nothing is touched,
@@ -8607,8 +8611,13 @@ URL="$SCHEME://$HOST:$PORT"
 SSL_DIR="${GITLAB_SSL_DIR:-$(saved GITLAB_SSL_DIR)}"
 SSL_DIR="${SSL_DIR:-/opt/nsx-gitlab/ssl}"
 CA="$SSL_DIR/ca.crt"
+[ -n "${NSX_GITLAB_CA_FILE:-}" ] && [ -f "$NSX_GITLAB_CA_FILE" ] && CA="$NSX_GITLAB_CA_FILE"
 CI_IMAGE="${NSX_CI_IMAGE:-nsx-ci:1}"
 HOST_CA_BUNDLE="${NSX_HOST_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}"
+
+# One line for --pre-get-sources-script. Git clone runs in the helper; the path in
+# CI_SERVER_TLS_CA_FILE is not always readable there. Copy to RUNNER_TEMP_PROJECT_DIR.
+PRE_GET_SOURCES_CA='if [ -n "${CI_SERVER_TLS_CA_FILE:-}" ] && [ -r "$CI_SERVER_TLS_CA_FILE" ]; then _d="${RUNNER_TEMP_PROJECT_DIR:-/tmp}"; _f="${_d}/nsx-gitlab-ca.pem"; mkdir -p "$_d" 2>/dev/null || true; cp "$CI_SERVER_TLS_CA_FILE" "$_f" && chmod 644 "$_f" && git config --global --unset-all http.sslCAInfo 2>/dev/null || true; if [ -n "${CI_SERVER_URL:-}" ]; then _u="${CI_SERVER_URL%/}"; git config --global "http.${_u}.sslCAInfo" "$_f"; git config --global "http.${_u}/.sslCAInfo" "$_f"; fi; fi'
 
 # The file git is told to trust (http.<gitlab>/.sslCAInfo) REPLACES the system
 # store. The runner's own client trusts this file AND the system store. A proxy
@@ -8635,6 +8644,13 @@ install_ca_into_runner() {
 	docker cp "$tmp" "$RUNNER:/etc/gitlab-runner/certs/$HOST.crt" >/dev/null || { rm -f "$tmp"; return 1; }
 	docker cp "$tmp" "$RUNNER:/etc/gitlab-runner/certs/ca.crt" >/dev/null || { rm -f "$tmp"; return 1; }
 	rm -f "$tmp"
+	# The runner process and the helper's git must be able to read tls-ca-file.
+	docker exec "$RUNNER" chmod 644 "/etc/gitlab-runner/certs/$HOST.crt" "/etc/gitlab-runner/certs/ca.crt" >/dev/null 2>&1 || true
+}
+
+runner_ca_bundle_ok() {
+	[ "$SCHEME" = https ] || return 0
+	docker exec "$RUNNER" sh -c "test -r /etc/gitlab-runner/certs/$HOST.crt && grep -q BEGIN /etc/gitlab-runner/certs/$HOST.crt" >/dev/null 2>&1
 }
 
 # --- the profile: what the runner should look like on this host ---------------
@@ -8690,9 +8706,7 @@ compute_profile() {
 	[ -f "$HOST_CA_BUNDLE" ] && flags+=(--docker-volumes "$HOST_CA_BUNDLE:$HOST_CA_BUNDLE:ro")
 	[ "$SCHEME" = https ] && flags+=(--tls-ca-file "/etc/gitlab-runner/certs/$HOST.crt")
 	for kv in ${envs[@]+"${envs[@]}"}; do flags+=(--env "$kv"); done
-	# Trust the CA file the runner injects. Leave the proxy alone: internet
-	# uses the host proxy, and NO_PROXY keeps private addresses direct.
-	flags+=(--pre-get-sources-script 'if [ -n "${CI_SERVER_TLS_CA_FILE:-}" ] && [ -f "$CI_SERVER_TLS_CA_FILE" ]; then git config --global http.sslCAInfo "$CI_SERVER_TLS_CA_FILE"; fi')
+	flags+=(--pre-get-sources-script "$PRE_GET_SOURCES_CA")
 	profile_hash="$(printf '%s\n' "$URL" "${flags[@]}" | sha256sum | cut -c1-16)"
 }
 compute_profile
@@ -8799,6 +8813,7 @@ pid="$(curl_gl -H "PRIVATE-TOKEN: $token" "$URL/api/v4/projects/$(printf '%s' "$
 if registered; then docker exec "$RUNNER" gitlab-runner unregister --all-runners >/dev/null 2>&1; fi
 
 install_ca_into_runner || die "could not install the CA bundle into the runner ($CA)."
+runner_ca_bundle_ok || die "the CA bundle in the runner is missing or not readable at /etc/gitlab-runner/certs/$HOST.crt. For GitLab on another host, copy its ca.crt here and set NSX_GITLAB_CA_FILE, then run scripts/converge.sh again."
 
 resp="$(curl_gl -H "PRIVATE-TOKEN: $token" -X POST "$URL/api/v4/user/runners" \
 	--data runner_type=project_type --data "project_id=$pid" --data run_untagged=true \
