@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.2.2"
+VERSION="1.2.3"
 
 ROOT="$PWD"
 FORCE=0
@@ -8530,14 +8530,16 @@ write_file scripts/gitlab-runner.sh <<'SCAFFOLD_EOF'
 #   * pull_policy if-not-present: the CI image is built here, there is nothing to pull
 #   * proxy settings for jobs, first found of: NSX_HTTP_PROXY / NSX_HTTPS_PROXY /
 #     NSX_NO_PROXY, this shell's HTTP(S)_PROXY, the Docker daemon's own proxy
+#   * NO_PROXY always includes every private range (RFC 1918: 10.0.0.0/8,
+#     172.16.0.0/12, 192.168.0.0/16), plus this host and GitLab. A re-register
+#     must not send internal traffic back out through the proxy.
 #   * the host's CA bundle mounted into jobs, so a TLS-inspecting proxy does not break them
 #   * GitLab's own CA plus the host trust store, when GitLab is served over HTTPS.
 #     Git in a job trusts only that file, so a TLS-inspecting proxy that the
 #     runner itself accepts will otherwise fail every clone with exit 1.
 #   * a pre-get-sources script: before git fetches, ignore the proxy for this
 #     GitLab and trust CI_SERVER_TLS_CA_FILE. The helper reports a failed clone
-#     as exit code 1 on every job. NO_PROXY is not enough: a CIDR there is not
-#     honoured by the helper's git, and sslCAInfo replaces the system store.
+#     as exit code 1 on every job.
 # Overrides, if you need them, go in deploy/gitlab/ci-network.env (KEY=VALUE lines).
 #
 # If anything about that differs from what the runner has, the runner is
@@ -8656,8 +8658,22 @@ compute_profile() {
 	fi
 	envs=()
 	if [ -n "$p_http$p_https" ]; then
-		# GitLab and this host must never go through the proxy.
-		p_no="${p_no:+$p_no,}localhost,127.0.0.1,$HOST,$GITLAB"
+		# Anything already in NO_PROXY stays. These are added when missing, so a
+		# later re-register cannot drop them. RFC 1918 is the whole private
+		# space (10/8, 172.16/12, 192.168/16), not one host and not 172.16/16.
+		append_no_proxy() {
+			case ",${p_no}," in
+			*",$1,"*) ;;
+			*) p_no="${p_no:+$p_no,}$1" ;;
+			esac
+		}
+		append_no_proxy localhost
+		append_no_proxy 127.0.0.1
+		append_no_proxy "$HOST"
+		append_no_proxy "$GITLAB"
+		append_no_proxy 10.0.0.0/8
+		append_no_proxy 172.16.0.0/12
+		append_no_proxy 192.168.0.0/16
 		[ -n "$p_http" ] && envs+=("HTTP_PROXY=$p_http" "http_proxy=$p_http")
 		[ -n "$p_https" ] && envs+=("HTTPS_PROXY=$p_https" "https_proxy=$p_https")
 		envs+=("NO_PROXY=$p_no" "no_proxy=$p_no")

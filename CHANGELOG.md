@@ -13,6 +13,12 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.2.3
+
+**Internal addresses stay off the proxy, in the runner config.** Whenever the runner is given a proxy, its `NO_PROXY` / `no_proxy` now always includes every private range (RFC 1918): `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, plus this host and GitLab. Entries you already set are kept, and a range already listed is not added twice.
+
+That list is part of the registered profile. `scripts/converge.sh` re-registers when it changes, so a later converge cannot put GitLab, NSX, or vCenter back through the corporate proxy. Public hosts (the Terraform registry, Docker Hub) still use the proxy.
+
 ## 1.2.2
 
 **Jobs were still failing in a few seconds with exit code 1, all of them, the same way.** That message is what the runner prints when `git fetch` in the helper fails. The job script never starts, so every job looks identical.
