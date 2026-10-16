@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.2.2"
+VERSION="1.2.4"
 
 ROOT="$PWD"
 FORCE=0
@@ -8528,16 +8528,18 @@ write_file scripts/gitlab-runner.sh <<'SCAFFOLD_EOF'
 # It looks at this host and configures the runner to match:
 #   * docker executor, image NSX_CI_IMAGE (default nsx-ci:1), host network
 #   * pull_policy if-not-present: the CI image is built here, there is nothing to pull
-#   * proxy settings for jobs, first found of: NSX_HTTP_PROXY / NSX_HTTPS_PROXY /
-#     NSX_NO_PROXY, this shell's HTTP(S)_PROXY, the Docker daemon's own proxy
+#   * the host proxy for internet access. Jobs get HTTP(S)_PROXY from this
+#     shell, then from the Docker daemon. If the host set only one of them, it
+#     is used for both. NSX_HTTP_PROXY / NSX_HTTPS_PROXY override that.
+#   * NO_PROXY is the only default written into the container config: localhost,
+#     this host, GitLab, and every private range (RFC 1918). The host's own
+#     NO_PROXY is not copied. NSX_NO_PROXY adds extra entries on top.
 #   * the host's CA bundle mounted into jobs, so a TLS-inspecting proxy does not break them
 #   * GitLab's own CA plus the host trust store, when GitLab is served over HTTPS.
 #     Git in a job trusts only that file, so a TLS-inspecting proxy that the
 #     runner itself accepts will otherwise fail every clone with exit 1.
-#   * a pre-get-sources script: before git fetches, ignore the proxy for this
-#     GitLab and trust CI_SERVER_TLS_CA_FILE. The helper reports a failed clone
-#     as exit code 1 on every job. NO_PROXY is not enough: a CIDR there is not
-#     honoured by the helper's git, and sslCAInfo replaces the system store.
+#   * a pre-get-sources script that points git at CI_SERVER_TLS_CA_FILE. It does
+#     not change the proxy; private addresses stay direct because of NO_PROXY.
 # Overrides, if you need them, go in deploy/gitlab/ci-network.env (KEY=VALUE lines).
 #
 # If anything about that differs from what the runner has, the runner is
@@ -8643,35 +8645,54 @@ daemon_proxy() { # daemon_proxy HTTPProxy|HTTPSProxy|NoProxy
 }
 
 compute_profile() {
+	# Internet access uses the host proxy. An explicit NSX_* value wins, then
+	# this shell, then the Docker daemon. One value covers both schemes when
+	# the host only exported one.
 	p_http="${NSX_HTTP_PROXY:-${HTTP_PROXY:-${http_proxy:-}}}"
 	p_https="${NSX_HTTPS_PROXY:-${HTTPS_PROXY:-${https_proxy:-}}}"
-	p_no="${NSX_NO_PROXY:-${NO_PROXY:-${no_proxy:-}}}"
 	[ -n "$p_http" ] || p_http="$(daemon_proxy HTTPProxy)"
 	[ -n "$p_https" ] || p_https="$(daemon_proxy HTTPSProxy)"
-	[ -n "$p_no" ] || p_no="$(daemon_proxy NoProxy)"
+	[ -n "$p_https" ] || p_https="$p_http"
+	[ -n "$p_http" ] || p_http="$p_https"
 	# Test hook: make every outside address unreachable, as on a network with no egress.
 	if [ "${NSX_TEST_BLOCK_EGRESS:-}" = 1 ]; then
 		p_http="http://127.0.0.1:9"
 		p_https="http://127.0.0.1:9"
 	fi
-	envs=()
-	if [ -n "$p_http$p_https" ]; then
-		# GitLab and this host must never go through the proxy.
-		p_no="${p_no:+$p_no,}localhost,127.0.0.1,$HOST,$GITLAB"
-		[ -n "$p_http" ] && envs+=("HTTP_PROXY=$p_http" "http_proxy=$p_http")
-		[ -n "$p_https" ] && envs+=("HTTPS_PROXY=$p_https" "https_proxy=$p_https")
-		envs+=("NO_PROXY=$p_no" "no_proxy=$p_no")
+	# The only default in the container config. The host's NO_PROXY is not
+	# copied; a re-register must not drop these or send private addresses out
+	# through the proxy. NSX_NO_PROXY adds to this list.
+	p_no=""
+	append_no_proxy() {
+		[ -n "$1" ] || return 0
+		case ",${p_no}," in
+		*",$1,"*) ;;
+		*) p_no="${p_no:+$p_no,}$1" ;;
+		esac
+	}
+	for item in localhost 127.0.0.1 "$HOST" "$GITLAB" 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+		append_no_proxy "$item"
+	done
+	if [ -n "${NSX_NO_PROXY:-}" ]; then
+		local oldifs="$IFS"
+		IFS=','
+		for item in $NSX_NO_PROXY; do
+			append_no_proxy "$item"
+		done
+		IFS="$oldifs"
 	fi
+	envs=()
+	[ -n "$p_http" ] && envs+=("HTTP_PROXY=$p_http" "http_proxy=$p_http")
+	[ -n "$p_https" ] && envs+=("HTTPS_PROXY=$p_https" "https_proxy=$p_https")
+	envs+=("NO_PROXY=$p_no" "no_proxy=$p_no")
 	flags=(--executor docker --docker-image "$CI_IMAGE" --docker-network-mode host
 		--docker-pull-policy if-not-present --docker-volumes /cache)
 	[ -f "$HOST_CA_BUNDLE" ] && flags+=(--docker-volumes "$HOST_CA_BUNDLE:$HOST_CA_BUNDLE:ro")
 	[ "$SCHEME" = https ] && flags+=(--tls-ca-file "/etc/gitlab-runner/certs/$HOST.crt")
 	for kv in ${envs[@]+"${envs[@]}"}; do flags+=(--env "$kv"); done
-	# Runs in the helper, after the runner has written CI_SERVER_TLS_CA_FILE and
-	# before git fetch. An empty http.<url>.proxy overrides HTTPS_PROXY for that
-	# URL only (git treats "" as "do not proxy"). Both spellings: with and
-	# without a trailing slash. GitLab on this network is reached directly.
-	flags+=(--pre-get-sources-script 'if [ -n "${CI_SERVER_TLS_CA_FILE:-}" ] && [ -f "$CI_SERVER_TLS_CA_FILE" ]; then git config --global http.sslCAInfo "$CI_SERVER_TLS_CA_FILE"; fi; if [ -n "${CI_SERVER_URL:-}" ]; then _u="${CI_SERVER_URL%/}"; git config --global "http.${_u}.proxy" ""; git config --global "http.${_u}/.proxy" ""; fi')
+	# Trust the CA file the runner injects. Leave the proxy alone: internet
+	# uses the host proxy, and NO_PROXY keeps private addresses direct.
+	flags+=(--pre-get-sources-script 'if [ -n "${CI_SERVER_TLS_CA_FILE:-}" ] && [ -f "$CI_SERVER_TLS_CA_FILE" ]; then git config --global http.sslCAInfo "$CI_SERVER_TLS_CA_FILE"; fi')
 	profile_hash="$(printf '%s\n' "$URL" "${flags[@]}" | sha256sum | cut -c1-16)"
 }
 compute_profile
