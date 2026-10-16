@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 ROOT="$PWD"
 FORCE=0
@@ -1115,7 +1115,7 @@ for d in \
 	data/groups data/policies data/services data/schema data/network data/platform data/vm-tags \
 	modules/dfw-policy modules/group modules/service modules/segment modules/tier1 modules/tier0 modules/vm-tags \
 	stacks/global-security stacks/local-security stacks/local-network stacks/platform stacks/local-tags \
-	envs scripts docs deploy/gitlab; do
+	envs scripts docs deploy/gitlab deploy/ci-image; do
 	make_dir "$d"
 done
 wants_ci gitlab && make_dir .gitlab/merge_request_templates
@@ -1168,6 +1168,8 @@ reports/
 # Host-specific GitLab container settings written by scripts/gitlab-https.sh.
 deploy/gitlab/.env
 deploy/gitlab/ssl/
+# Optional per-host CI network overrides (may hold proxy credentials).
+deploy/gitlab/ci-network.env
 
 # Originals saved by the generator's update script before it overwrites a file.
 .nsx-update-backup/
@@ -4692,6 +4694,12 @@ eval "$(python3 "$REPO_ROOT/scripts/ci-matrix.py" --export "$site")"
 export TF_VAR_site="$site"
 export TF_VAR_domain="${TF_VAR_domain:-${NSX_DOMAIN:-default}}"
 export TF_IN_AUTOMATION=1
+# Provider mirror, for networks that cannot reach registry.terraform.io (scripts/tf-mirror.sh).
+if [ -f "$REPO_ROOT/scripts/tf-mirror.sh" ]; then
+	# shellcheck source=scripts/tf-mirror.sh
+	. "$REPO_ROOT/scripts/tf-mirror.sh"
+	nsx_tf_mirror_setup
+fi
 
 # global-security takes no site variable; the other stacks require one.
 if [ "$stack" = global-security ]; then
@@ -5221,7 +5229,11 @@ def _strip_comment(text: str) -> str:
 
 
 def _split_key(text: str) -> tuple[str, bool, str]:
+    # A colon only separates a key when it is outside quotes and outside any
+    # [...] or {...}: '- { scope: workload, tag: x }' is one flow mapping, not
+    # a mapping whose first key is '{ scope'.
     quote = None
+    depth = 0
     for i, ch in enumerate(text):
         if quote:
             if ch == quote:
@@ -5230,7 +5242,11 @@ def _split_key(text: str) -> tuple[str, bool, str]:
         if ch in "'\"":
             quote = ch
             continue
-        if ch == ":" and (i + 1 == len(text) or text[i + 1] in " \t"):
+        if ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+        elif depth == 0 and ch == ":" and (i + 1 == len(text) or text[i + 1] in " \t"):
             return _unquote(text[:i].strip()), True, text[i + 1 :]
     return text, False, ""
 
@@ -7376,6 +7392,20 @@ reissues it when 30 days remain and reloads nginx. Import `ca.crt` (default
 `/opt/nsx-gitlab/ssl/ca.crt`) into browsers and other clients. A private IP
 cannot get a public certificate; if GitLab has a public DNS name, use certbot.
 
+## The CI image, and restricted networks
+
+Pipeline jobs run in `nsx-ci:1` (Python, Terraform, bash, curl, git), built on this
+host by `scripts/converge.sh` from two Docker Hub images, so jobs never download
+packages. `scripts/converge.sh` (run for you by `update.sh`) also registers the
+runner and configures it for this host: proxy settings found on the host, the
+host's CA bundle, and a pull policy that uses the local image.
+
+Terraform providers are the one thing jobs still download. If this network cannot
+reach `registry.terraform.io`, the validate job shows a warning rather than
+failing; set the CI/CD variable `NSX_TF_NETWORK_MIRROR` to an internal mirror, or
+put `NSX_HTTPS_PROXY=...` in `deploy/gitlab/ci-network.env` and run
+`scripts/converge.sh`. `scripts/converge.sh --check` reports without changing anything.
+
 ## What it is not
 
 Not a production GitLab. No backups, no HA, and the initial root
@@ -7829,27 +7859,19 @@ push_repository() {
 }
 
 register_runner() {
-	local token
-	token="$(api POST "/user/runners" \
-		--data "runner_type=project_type" \
-		--data-urlencode "description=nsx-local" \
-		--data "run_untagged=true" \
-		--data-urlencode "project_id=$(api GET "/projects/root%2F$PROJECT_NAME" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)" 2>/dev/null |
-		sed -n 's/.*"token":"\([^"]*\)".*/\1/p' | head -1)"
-	if [ -z "$token" ]; then
-		say "note: could not mint a runner token automatically."
-		say "      Register one by hand: Settings -> CI/CD -> Runners in the project."
-		return 0
+	# One implementation, shared with converge.sh: registers the runner and
+	# configures it for this host's network (proxy, CA, pull policy).
+	if [ -x "$REPO_ROOT/scripts/gitlab-runner.sh" ]; then
+		GITLAB_HOST="$GITLAB_HOST" GITLAB_PORT="$GITLAB_PORT" GITLAB_SCHEME=http \
+			"$REPO_ROOT/scripts/gitlab-runner.sh" --project "root/$PROJECT_NAME" ||
+			say "note: runner registration failed; run scripts/converge.sh, or register one from the project's CI/CD settings."
+	else
+		say "note: scripts/gitlab-runner.sh is missing; register a runner from the project's CI/CD settings."
 	fi
-	docker exec nsx-gitlab-runner gitlab-runner register \
-		--non-interactive \
-		--url "http://${GITLAB_HOST}:${GITLAB_PORT}/" \
-		--token "$token" \
-		--executor docker \
-		--docker-image "hashicorp/terraform:1.9.8" \
-		--docker-network-mode host >/dev/null 2>&1 &&
-		say "runner registered." ||
-		say "note: runner registration failed; register one from the project's CI/CD settings."
+	# The image the pipeline's jobs run in, built here from Docker Hub images.
+	if [ -x "$REPO_ROOT/scripts/ci-image.sh" ]; then
+		"$REPO_ROOT/scripts/ci-image.sh" || say "note: the CI image could not be built; run scripts/converge.sh for details."
+	fi
 }
 
 summary() {
@@ -8094,7 +8116,11 @@ trust_runner() {
 		say "no runner container found; skipping runner trust."
 		return 0
 	}
-	local certs=/etc/gitlab-runner/certs
+	local certs=/etc/gitlab-runner/certs before after
+	# Restarting the runner kills the job it is running, so only do it when its
+	# trust or URL actually changed: this script is safe to run any time.
+	state() { docker exec nsx-gitlab-runner sh -c "cat /etc/gitlab-runner/config.toml '$certs/${GITLAB_HOST}.crt' 2>/dev/null | sha256sum" 2>/dev/null; }
+	before="$(state)"
 	docker exec nsx-gitlab-runner mkdir -p "$certs"
 	docker cp "$GITLAB_SSL_DIR/ca.crt" "nsx-gitlab-runner:$certs/${GITLAB_HOST}.crt"
 	docker exec nsx-gitlab-runner sh -c "
@@ -8103,8 +8129,13 @@ trust_runner() {
 		sed -i 's|^\\([[:space:]]*url = \\)\".*\"|\\1\"${URL}/\"|' \$f
 		grep -q tls-ca-file \$f || sed -i '/^[[:space:]]*url = /a\\  tls-ca-file = \"${certs}/${GITLAB_HOST}.crt\"' \$f
 	"
-	docker restart nsx-gitlab-runner >/dev/null
-	say "runner now trusts the CA and points at $URL."
+	after="$(state)"
+	if [ "$before" != "$after" ]; then
+		docker restart nsx-gitlab-runner >/dev/null
+		say "runner now trusts the CA and points at $URL."
+	else
+		say "runner already trusts the CA and points at $URL."
+	fi
 }
 
 install_cron() {
@@ -8158,9 +8189,8 @@ main() {
 	*) die "unknown option: $1. Try --renew or --status." ;;
 	esac
 
-	need docker
-	need curl
-	docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon."
+	# Checks that only read the compose file come first: they need no Docker, and
+	# they explain what to do even on a host where Docker is not running yet.
 	[ -f "$COMPOSE_DIR/docker-compose.yml" ] || die "$COMPOSE_DIR/docker-compose.yml is missing."
 	grep -q GITLAB_SCHEME "$COMPOSE_DIR/docker-compose.yml" ||
 		die "docker-compose.yml predates HTTPS support. Bring the tree up to date first: update.sh in your clone of the generator."
@@ -8168,6 +8198,9 @@ main() {
 	# 'gitlab-ctl reconfigure' abort, and the container then cannot start.
 	grep -Eq "^[[:space:]]*grafana\[" "$COMPOSE_DIR/docker-compose.yml" &&
 		die "docker-compose.yml has a grafana[...] setting, which GitLab 17 rejects. Bring the tree up to date first (update.sh), or delete that line."
+	need docker
+	need curl
+	docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon."
 	lock_ssl
 	if port_clash; then
 		die "port $GITLAB_PORT is already in use on this host by something else."
@@ -8205,6 +8238,663 @@ DONE
 main "$@"
 SCAFFOLD_EOF
 mark_executable scripts/gitlab-https.sh
+
+write_file deploy/ci-image/Dockerfile <<'SCAFFOLD_EOF'
+# The image every pipeline job runs in.
+#
+# Built on the runner host by scripts/ci-image.sh from these two Docker Hub
+# images and nothing else: no apk, apt or pip. A network that blocks package
+# mirrors but allows Docker Hub (the usual corporate shape) therefore still
+# works, and jobs start with everything already installed.
+#
+# Python 3 (validation and pipeline generation), Terraform, and the tools the
+# scripts use: bash, curl, git, make. Changing this file changes its hash, and
+# the next converge rebuilds the image.
+
+FROM hashicorp/terraform:1.9.8 AS terraform
+FROM python:3.12-bookworm
+
+COPY --from=terraform /bin/terraform /usr/local/bin/terraform
+
+ENV TF_IN_AUTOMATION=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Fail the build, not a job, if anything the scripts rely on is missing.
+RUN terraform version && python3 --version && bash --version >/dev/null \
+    && curl --version >/dev/null && git --version && make --version >/dev/null
+SCAFFOLD_EOF
+
+write_file scripts/tf-mirror.sh <<'SCAFFOLD_EOF'
+# shellcheck shell=bash
+# Provider installation for networks that cannot reach registry.terraform.io.
+# Source this file, then call nsx_tf_mirror_setup before 'terraform init'.
+#
+#   NSX_TF_NETWORK_MIRROR   https://mirror.example/terraform/providers/
+#                           an internal network mirror (Artifactory, Nexus, ...)
+#   NSX_TF_FS_MIRROR        /path/inside/the/job
+#                           a directory made with 'terraform providers mirror'
+#
+# Set them as CI/CD variables (Settings -> CI/CD -> Variables). With neither set,
+# Terraform installs providers directly from registry.terraform.io, as usual.
+# A TF_CLI_CONFIG_FILE that is already set is left alone.
+
+nsx_tf_mirror_setup() {
+	[ -n "${TF_CLI_CONFIG_FILE:-}" ] && return 0
+	local rc
+	if [ -n "${NSX_TF_NETWORK_MIRROR:-}" ]; then
+		rc="$(mktemp "${TMPDIR:-/tmp}/nsx-terraformrc.XXXXXX")"
+		printf 'provider_installation {\n  network_mirror {\n    url = "%s"\n  }\n}\n' "$NSX_TF_NETWORK_MIRROR" >"$rc"
+	elif [ -n "${NSX_TF_FS_MIRROR:-}" ]; then
+		rc="$(mktemp "${TMPDIR:-/tmp}/nsx-terraformrc.XXXXXX")"
+		printf 'provider_installation {\n  filesystem_mirror {\n    path = "%s"\n  }\n  direct {}\n}\n' "$NSX_TF_FS_MIRROR" >"$rc"
+	else
+		return 0
+	fi
+	export TF_CLI_CONFIG_FILE="$rc"
+}
+SCAFFOLD_EOF
+
+write_file scripts/ci-terraform-validate.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# The 'terraform' validate job: formatting, then init + validate for every stack.
+#
+# Formatting is offline and always runs. 'init' has to download providers, which
+# a locked-down network may not allow. That case is reported as a WARNING, not
+# a failure, and never silently:
+#
+#   exit 0    everything checked
+#   exit 1    a real problem: unformatted code, an invalid stack, a provider
+#             version that does not exist
+#   exit 42   formatting passed but providers could not be downloaded, so
+#             'terraform validate' did not run. The pipeline marks this job
+#             as passed-with-warnings (allow_failure: exit_codes: 42).
+#
+# To make validation run on such a network, give the job a provider mirror:
+# CI/CD variable NSX_TF_NETWORK_MIRROR or NSX_TF_FS_MIRROR (see tf-mirror.sh),
+# or open egress to registry.terraform.io and releases.hashicorp.com.
+
+set -uo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
+# shellcheck source=scripts/tf-mirror.sh
+. scripts/tf-mirror.sh
+nsx_tf_mirror_setup
+
+failed=0
+skipped=()
+
+# A download problem, as opposed to a problem with the code or the constraints.
+network_failure() {
+	grep -Eqi 'dial tcp|no such host|lookup [^ ]+: |i/o timeout|timeout awaiting|connection refused|connection reset|network is unreachable|proxyconnect|tls: |x509:|unexpected EOF|could not connect to' <<<"$1"
+}
+
+echo "--- terraform fmt"
+terraform fmt -recursive -check -diff . || failed=1
+
+for stack in stacks/*/; do
+	echo "--- ${stack}"
+	out=""
+	ok=0
+	for attempt in 1 2 3; do
+		if out="$(terraform -chdir="${stack}" init -backend=false -input=false -no-color 2>&1)"; then
+			ok=1
+			break
+		fi
+		network_failure "$out" || break # a real error will not fix itself
+		echo "init failed (attempt $attempt of 3), retrying..." >&2
+		sleep $((attempt * ${NSX_INIT_RETRY_SLEEP:-4}))
+	done
+	if [ "$ok" = 1 ]; then
+		printf '%s\n' "$out" | tail -3
+		terraform -chdir="${stack}" validate -no-color || failed=1
+	elif network_failure "$out"; then
+		printf '%s\n' "$out" | tail -8
+		skipped+=("${stack}")
+	else
+		printf '%s\n' "$out"
+		failed=1
+	fi
+done
+
+[ "$failed" -eq 0 ] || exit 1
+
+if [ "${#skipped[@]}" -gt 0 ]; then
+	cat <<MSG
+
+==============================================================================
+ WARNING: terraform validate did NOT run for ${#skipped[@]} stack(s):
+   ${skipped[*]}
+ Providers could not be downloaded from this job. Formatting passed.
+ Fix it once and this warning goes away:
+   * set the CI/CD variable NSX_TF_NETWORK_MIRROR (an internal provider mirror), or
+   * allow this runner to reach registry.terraform.io and releases.hashicorp.com.
+ Plan and apply jobs need the same access; they will fail at 'init' without it.
+==============================================================================
+MSG
+	exit 42
+fi
+SCAFFOLD_EOF
+mark_executable scripts/ci-terraform-validate.sh
+
+write_file scripts/ci-image.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# Build the image every pipeline job runs in, and prove it works.
+#
+#   scripts/ci-image.sh            build if missing or out of date, then verify
+#   scripts/ci-image.sh --check    report only; exit 1 if it is missing or stale
+#
+# The image holds everything a job needs (Python, Terraform, bash, curl, git),
+# so jobs never download packages. It is built here, on the runner host, from
+# two Docker Hub images and nothing else: no apk, apt or pip, which a locked-down
+# network usually blocks even when Docker Hub is reachable through a proxy.
+#
+# NSX_CI_IMAGE (default nsx-ci:1). A name that does not start with 'nsx-ci:' is
+# treated as an image from your own registry: it is pulled, not built.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IMAGE="${NSX_CI_IMAGE:-nsx-ci:1}"
+CONTEXT="$REPO_ROOT/deploy/ci-image"
+CHECK=0
+[ "${1:-}" = "--check" ] && CHECK=1
+
+die() {
+	printf 'error: %s\n' "$*" >&2
+	exit 1
+}
+say() { printf '%s\n' "$*"; }
+
+command -v docker >/dev/null 2>&1 || die "docker is not installed."
+docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon. Is it running, and are you root or in the docker group?"
+
+verify() {
+	docker run --rm --entrypoint "" "$IMAGE" sh -c \
+		'terraform version >/dev/null && python3 --version >/dev/null && bash --version >/dev/null && curl --version >/dev/null && git --version >/dev/null' \
+		>/dev/null 2>&1
+}
+
+why_build_failed() {
+	local log="$1"
+	if grep -Eqi 'toomanyrequests|too many requests|rate limit|\b429\b' "$log"; then
+		say "  Docker Hub is rate-limiting this host (anonymous pulls are limited per address; the limit resets after a few"
+		say "  hours). Run 'docker login' with a Docker Hub account, or wait and re-run scripts/converge.sh. Once the base"
+		say "  images are on this host the build needs no registry at all."
+	elif grep -Eqi 'x509|certificate' "$log"; then
+		say "  A TLS certificate problem reaching Docker Hub (an inspecting proxy?). The Docker daemon must trust"
+		say "  your proxy's CA: install it in the host trust store (update-ca-certificates) and restart Docker."
+	elif grep -Eqi 'dial tcp|no such host|lookup |timeout|proxyconnect|connection refused|unreachable' "$log"; then
+		say "  This host cannot reach Docker Hub. Configure the Docker daemon's proxy (systemd drop-in with"
+		say "  HTTPS_PROXY/NO_PROXY, then 'systemctl restart docker'), or point NSX_CI_IMAGE at an image in a registry you can reach."
+	else
+		say "  See the build output above."
+	fi
+}
+
+if [[ "$IMAGE" != nsx-ci:* ]]; then
+	# An image from the operator's own registry.
+	if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+		[ "$CHECK" = 1 ] && die "$IMAGE is not on this host."
+		say "pulling $IMAGE..."
+		docker pull "$IMAGE" >/dev/null 2>&1 || die "could not pull $IMAGE. Is the registry reachable from this host?"
+	fi
+	verify || die "$IMAGE is present but lacks a tool the pipeline needs (terraform, python3, bash, curl, git)."
+	say "CI image $IMAGE (external) ready."
+	exit 0
+fi
+
+[ -f "$CONTEXT/Dockerfile" ] || die "$CONTEXT/Dockerfile is missing. Bring the tree up to date with update.sh."
+want="$(sha256sum "$CONTEXT/Dockerfile" | cut -c1-12)"
+have="$(docker image inspect -f '{{ index .Config.Labels "nsx.dockerfile" }}' "$IMAGE" 2>/dev/null || true)"
+
+if [ "$have" = "$want" ]; then
+	if verify; then
+		say "CI image $IMAGE is current."
+		exit 0
+	fi
+	say "CI image $IMAGE is present but does not pass its checks; rebuilding."
+elif [ -n "$have" ]; then
+	say "CI image $IMAGE is out of date; rebuilding."
+fi
+[ "$CHECK" = 1 ] && die "CI image $IMAGE is missing or out of date."
+
+log="$(mktemp)"
+trap 'rm -f "$log"' EXIT
+
+# The base images named by FROM lines.
+bases() { sed -n 's/^FROM[[:space:]]\{1,\}\([^[:space:]]\{1,\}\).*/\1/Ip' "$CONTEXT/Dockerfile"; }
+
+# Get the base images into the local image store first, retrying: Docker Hub rate-limits
+# anonymous pulls and networks blip. A build from images already here needs no registry.
+ensure_bases() {
+	local b attempt plog
+	plog="$(mktemp)"
+	for b in $(bases); do
+		docker image inspect "$b" >/dev/null 2>&1 && continue
+		for attempt in 1 2 3; do
+			say "pulling $b (attempt $attempt of 3)..."
+			docker pull -q "$b" >"$plog" 2>&1 && break
+			cat "$plog" >>"$log"
+			[ "$attempt" -lt 3 ] && sleep $((attempt * ${NSX_PULL_RETRY_SLEEP:-15}))
+		done
+	done
+	rm -f "$plog"
+}
+
+ensure_bases
+say "building CI image $IMAGE (a minute or two the first time)..."
+if ! docker build --pull=false --label "nsx.dockerfile=$want" -t "$IMAGE" "$CONTEXT" >>"$log" 2>&1; then
+	# Registry metadata lookups can fail where a plain build of cached images still works.
+	if ! DOCKER_BUILDKIT=0 docker build --pull=false --label "nsx.dockerfile=$want" -t "$IMAGE" "$CONTEXT" >>"$log" 2>&1; then
+		tail -15 "$log" | sed 's/^/    /' >&2
+		why_build_failed "$log" >&2
+		die "could not build $IMAGE."
+	fi
+fi
+verify || {
+	tail -5 "$log" | sed 's/^/    /' >&2
+	die "built $IMAGE but it failed its own checks."
+}
+say "CI image $IMAGE built and verified."
+SCAFFOLD_EOF
+mark_executable scripts/ci-image.sh
+
+write_file scripts/gitlab-runner.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# Make this host's GitLab runner registered, online and configured for the
+# network it is on. Safe to run any number of times.
+#
+#   scripts/gitlab-runner.sh                 converge
+#   scripts/gitlab-runner.sh --print-profile show what it would configure; change nothing
+#   scripts/gitlab-runner.sh --print-env     the proxy variables jobs will get (KEY=VALUE)
+#
+# It looks at this host and configures the runner to match:
+#   * docker executor, image NSX_CI_IMAGE (default nsx-ci:1), host network
+#   * pull_policy if-not-present: the CI image is built here, there is nothing to pull
+#   * proxy settings for jobs, first found of: NSX_HTTP_PROXY / NSX_HTTPS_PROXY /
+#     NSX_NO_PROXY, this shell's HTTP(S)_PROXY, the Docker daemon's own proxy
+#   * the host's CA bundle mounted into jobs, so a TLS-inspecting proxy does not break them
+#   * GitLab's own CA, when GitLab is served over HTTPS here
+# Overrides, if you need them, go in deploy/gitlab/ci-network.env (KEY=VALUE lines).
+#
+# If anything about that differs from what the runner has, the runner is
+# re-registered (its old registration is removed). Otherwise nothing is touched,
+# so running this never interrupts a job.
+#
+# Registration needs an admin token. On the host that runs GitLab in Docker it is
+# minted on the spot and revoked afterwards. For another GitLab, export
+# GITLAB_TOKEN (scope api, Maintainer on the project).
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMPOSE_DIR="$REPO_ROOT/deploy/gitlab"
+ENV_FILE="$COMPOSE_DIR/.env"
+NET_FILE="$COMPOSE_DIR/ci-network.env"
+RUNNER=nsx-gitlab-runner
+GITLAB=nsx-gitlab
+MODE=converge
+PROJECT="${GITLAB_PROJECT:-}"
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--print-profile) MODE=profile ;;
+	--print-env) MODE="env" ;;
+	--project)
+		PROJECT="${2:?--project needs GROUP/NAME}"
+		shift
+		;;
+	*)
+		printf 'error: unknown option %s\n' "$1" >&2
+		exit 1
+		;;
+	esac
+	shift
+done
+
+die() {
+	printf 'error: %s\n' "$*" >&2
+	exit 1
+}
+say() { printf '%s\n' "$*"; }
+
+saved() { [ -f "$ENV_FILE" ] && sed -n "s/^$1=//p" "$ENV_FILE" | tail -1 || true; }
+if [ -f "$NET_FILE" ]; then
+	set -a
+	# shellcheck disable=SC1090
+	. "$NET_FILE"
+	set +a
+fi
+
+SCHEME="${GITLAB_SCHEME:-$(saved GITLAB_SCHEME)}"
+SCHEME="${SCHEME:-http}"
+HOST="${GITLAB_HOST:-$(saved GITLAB_HOST)}"
+HOST="${HOST:-localhost}"
+if [ "$SCHEME" = https ]; then PORT="${GITLAB_PORT:-$(saved GITLAB_PORT)}"; PORT="${PORT:-8443}"; else PORT="${GITLAB_PORT:-$(saved GITLAB_PORT)}"; PORT="${PORT:-8929}"; fi
+URL="$SCHEME://$HOST:$PORT"
+SSL_DIR="${GITLAB_SSL_DIR:-$(saved GITLAB_SSL_DIR)}"
+SSL_DIR="${SSL_DIR:-/opt/nsx-gitlab/ssl}"
+CA="$SSL_DIR/ca.crt"
+CI_IMAGE="${NSX_CI_IMAGE:-nsx-ci:1}"
+HOST_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
+# --- the profile: what the runner should look like on this host ---------------
+
+daemon_proxy() { # daemon_proxy HTTPProxy|HTTPSProxy|NoProxy
+	command -v docker >/dev/null 2>&1 || return 0
+	docker info --format "{{.$1}}" 2>/dev/null || true
+}
+
+compute_profile() {
+	p_http="${NSX_HTTP_PROXY:-${HTTP_PROXY:-${http_proxy:-}}}"
+	p_https="${NSX_HTTPS_PROXY:-${HTTPS_PROXY:-${https_proxy:-}}}"
+	p_no="${NSX_NO_PROXY:-${NO_PROXY:-${no_proxy:-}}}"
+	[ -n "$p_http" ] || p_http="$(daemon_proxy HTTPProxy)"
+	[ -n "$p_https" ] || p_https="$(daemon_proxy HTTPSProxy)"
+	[ -n "$p_no" ] || p_no="$(daemon_proxy NoProxy)"
+	# Test hook: make every outside address unreachable, as on a network with no egress.
+	if [ "${NSX_TEST_BLOCK_EGRESS:-}" = 1 ]; then
+		p_http="http://127.0.0.1:9"
+		p_https="http://127.0.0.1:9"
+	fi
+	envs=()
+	if [ -n "$p_http$p_https" ]; then
+		# GitLab and this host must never go through the proxy.
+		p_no="${p_no:+$p_no,}localhost,127.0.0.1,$HOST,$GITLAB"
+		[ -n "$p_http" ] && envs+=("HTTP_PROXY=$p_http" "http_proxy=$p_http")
+		[ -n "$p_https" ] && envs+=("HTTPS_PROXY=$p_https" "https_proxy=$p_https")
+		envs+=("NO_PROXY=$p_no" "no_proxy=$p_no")
+	fi
+	flags=(--executor docker --docker-image "$CI_IMAGE" --docker-network-mode host
+		--docker-pull-policy if-not-present --docker-volumes /cache)
+	[ -f "$HOST_CA_BUNDLE" ] && flags+=(--docker-volumes "$HOST_CA_BUNDLE:$HOST_CA_BUNDLE:ro")
+	[ "$SCHEME" = https ] && flags+=(--tls-ca-file "/etc/gitlab-runner/certs/$HOST.crt")
+	for kv in ${envs[@]+"${envs[@]}"}; do flags+=(--env "$kv"); done
+	profile_hash="$(printf '%s\n' "$URL" "${flags[@]}" | sha256sum | cut -c1-16)"
+}
+compute_profile
+
+case "$MODE" in
+profile)
+	say "gitlab     $URL"
+	say "project    ${PROJECT:-(taken from the git remote)}"
+	say "ci image   $CI_IMAGE"
+	say "profile    $profile_hash"
+	printf '  %s\n' "${flags[@]}"
+	exit 0
+	;;
+env)
+	printf '%s\n' ${envs[@]+"${envs[@]}"}
+	exit 0
+	;;
+esac
+
+# --- converge -----------------------------------------------------------------
+
+command -v docker >/dev/null 2>&1 || die "docker is not installed."
+docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon."
+
+if [ -z "$PROJECT" ]; then
+	remote="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
+	PROJECT="$(printf '%s' "$remote" | sed -E 's#^(https?://[^/]+/|[^@]+@[^:]+:)##; s#\.git$##')"
+fi
+[ -n "$PROJECT" ] || die "cannot tell which GitLab project this runner belongs to. Pass --project GROUP/NAME."
+
+curl_gl() { # curl_gl <curl args...> against GitLab, trusting our CA when on HTTPS
+	local ca=()
+	[ "$SCHEME" = https ] && [ -f "$CA" ] && ca=(--cacert "$CA")
+	curl -sS --max-time 60 ${ca[@]+"${ca[@]}"} --noproxy '*' "$@"
+}
+
+runner_up() {
+	docker inspect -f '{{.State.Running}}' "$RUNNER" 2>/dev/null | grep -q true && return 0
+	[ -f "$COMPOSE_DIR/docker-compose.yml" ] || return 1
+	say "starting the runner container..."
+	if docker compose version >/dev/null 2>&1; then
+		(cd "$COMPOSE_DIR" && docker compose up -d runner >/dev/null 2>&1)
+	elif command -v docker-compose >/dev/null 2>&1; then
+		(cd "$COMPOSE_DIR" && docker-compose up -d runner >/dev/null 2>&1)
+	fi
+	sleep 3
+	docker inspect -f '{{.State.Running}}' "$RUNNER" 2>/dev/null | grep -q true
+}
+runner_up || die "the runner container '$RUNNER' is not running and could not be started."
+
+registered() { docker exec "$RUNNER" grep -q '^\[\[runners\]\]' /etc/gitlab-runner/config.toml 2>/dev/null; }
+valid() { docker exec "$RUNNER" gitlab-runner verify 2>&1 | grep -qi 'is valid'; }
+have_profile() { docker exec "$RUNNER" cat /etc/gitlab-runner/nsx-profile 2>/dev/null | tr -d '\r\n'; }
+
+if registered && valid && [ "$(have_profile)" = "$profile_hash" ]; then
+	say "runner already registered and current ($profile_hash)."
+	exit 0
+fi
+
+if registered; then
+	if valid; then say "runner settings changed for this host; re-registering."; else say "runner registration is no longer valid on GitLab; re-registering."; fi
+else
+	say "runner is not registered; registering."
+fi
+
+# A token that can create a runner.
+seed=""
+revoke() { [ -n "$seed" ] && docker exec "$GITLAB" gitlab-rails runner "PersonalAccessToken.find_by_token('$seed')&.revoke!" >/dev/null 2>&1; }
+trap revoke EXIT
+token="${GITLAB_TOKEN:-}"
+if [ -z "$token" ]; then
+	docker inspect "$GITLAB" >/dev/null 2>&1 || die "no GitLab container ('$GITLAB') on this host and no GITLAB_TOKEN set, so a runner token cannot be created. Export GITLAB_TOKEN (scope api) and re-run."
+	seed="nsxrunner$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+	got="$(docker exec "$GITLAB" gitlab-rails runner "
+		u = User.find_by_username('root')
+		t = u.personal_access_tokens.create!(scopes: ['api'], name: 'nsx-runner', expires_at: 1.day.from_now)
+		t.set_token('$seed'); t.save!
+		puts '$seed'" 2>/dev/null | tr -d '\r' | tail -1)"
+	[ "$got" = "$seed" ] || die "could not mint a token inside $GITLAB. Is GitLab fully started? Check: docker logs --tail=50 $GITLAB"
+	token="$seed"
+fi
+
+pid="$(curl_gl -H "PRIVATE-TOKEN: $token" "$URL/api/v4/projects/$(printf '%s' "$PROJECT" | sed 's#/#%2F#g')" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)"
+[ -n "$pid" ] || die "GitLab at $URL does not know a project '$PROJECT' (or $URL is not reachable from this host / its certificate is not trusted: $CA)."
+
+# Clear the old registration first, so runners never pile up.
+if registered; then docker exec "$RUNNER" gitlab-runner unregister --all-runners >/dev/null 2>&1; fi
+
+if [ "$SCHEME" = https ] && [ -f "$CA" ]; then
+	docker exec "$RUNNER" mkdir -p /etc/gitlab-runner/certs
+	docker cp "$CA" "$RUNNER:/etc/gitlab-runner/certs/$HOST.crt" >/dev/null || die "could not copy the CA into the runner."
+fi
+
+resp="$(curl_gl -H "PRIVATE-TOKEN: $token" -X POST "$URL/api/v4/user/runners" \
+	--data runner_type=project_type --data "project_id=$pid" --data run_untagged=true \
+	--data-urlencode "description=nsx-$(hostname -s 2>/dev/null || echo host)")"
+rtoken="$(printf '%s' "$resp" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
+rid="$(printf '%s' "$resp" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+[ -n "$rtoken" ] || die "GitLab refused to create a runner: $resp"
+
+out="$(docker exec "$RUNNER" gitlab-runner register --non-interactive --url "$URL/" --token "$rtoken" "${flags[@]}" 2>&1)" ||
+	die "runner registration failed: $(printf '%s' "$out" | tail -3)"
+docker exec "$RUNNER" sh -c "printf '%s\n' '$profile_hash' >/etc/gitlab-runner/nsx-profile"
+
+valid || die "the runner registered but 'gitlab-runner verify' does not say it is valid. See: docker logs --tail=30 $RUNNER"
+
+# Wait until GitLab sees it online.
+online=0
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18; do
+	if curl_gl -H "PRIVATE-TOKEN: $token" "$URL/api/v4/runners/$rid" | grep -q '"online":true'; then
+		online=1
+		break
+	fi
+	sleep 5
+done
+[ "$online" = 1 ] || die "the runner registered but GitLab does not show it online after 90 s. See: docker logs --tail=30 $RUNNER"
+say "runner registered, valid and online ($profile_hash)."
+SCAFFOLD_EOF
+mark_executable scripts/gitlab-runner.sh
+
+write_file scripts/converge.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# Bring this host to the state this release expects, and say plainly what it found.
+#
+#   scripts/converge.sh             do it
+#   scripts/converge.sh --check     only look and report; change nothing
+#
+# update.sh runs this after every update, so a release that needs something new
+# from the host (a CI image, runner settings, a GitLab container setting) just
+# arrives. Run it by hand whenever you want to know whether the host is healthy.
+#
+# Every step is independent: one failing does not stop the others from being
+# checked, and each failure says what to do about it. It exits non-zero only
+# when something essential (the CI image, GitLab, the runner) is not working.
+# Network limits that only affect Terraform provider downloads are warnings.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMPOSE_DIR="$REPO_ROOT/deploy/gitlab"
+ENV_FILE="$COMPOSE_DIR/.env"
+CHECK=0
+[ "${1:-}" = "--check" ] && CHECK=1
+CI_IMAGE="${NSX_CI_IMAGE:-nsx-ci:1}"
+
+fails=0
+warns=0
+ok() { printf '  [ ok ]  %s\n' "$*"; }
+warn() {
+	printf '  [warn]  %s\n' "$1"
+	shift
+	for l in "$@"; do printf '          %s\n' "$l"; done
+	warns=$((warns + 1))
+}
+fail() {
+	printf '  [FAIL]  %s\n' "$1"
+	shift
+	for l in "$@"; do printf '          %s\n' "$l"; done
+	fails=$((fails + 1))
+}
+indent() { sed 's/^/          /'; }
+
+echo "converge: $REPO_ROOT"
+
+# --- Docker --------------------------------------------------------------------
+if ! command -v docker >/dev/null 2>&1; then
+	fail "Docker is not installed" "Install Docker Engine: https://docs.docker.com/engine/install/"
+	echo
+	echo "converge: cannot continue without Docker."
+	exit 1
+elif ! docker info >/dev/null 2>&1; then
+	fail "Cannot talk to the Docker daemon" "Is it running (systemctl status docker)? Are you root or in the docker group?"
+	echo
+	echo "converge: cannot continue without Docker."
+	exit 1
+fi
+ok "Docker is reachable"
+
+# --- the CI image ---------------------------------------------------------------
+img_args=()
+[ "$CHECK" = 1 ] && img_args=(--check)
+if out="$("$REPO_ROOT/scripts/ci-image.sh" ${img_args[@]+"${img_args[@]}"} 2>&1)"; then
+	ok "$(printf '%s' "$out" | tail -1)"
+else
+	fail "CI image $CI_IMAGE" "$(printf '%s' "$out" | tail -12 | sed 's/^/ /')"
+fi
+
+# --- GitLab on this host ---------------------------------------------------------
+gitlab_here=0
+if docker inspect nsx-gitlab >/dev/null 2>&1; then
+	gitlab_here=1
+	if [ "$CHECK" = 1 ]; then
+		if [ "$(docker inspect -f '{{.State.Health.Status}}' nsx-gitlab 2>/dev/null)" = healthy ]; then
+			ok "GitLab container is healthy"
+		else
+			fail "GitLab container is not healthy" "docker logs --tail=50 nsx-gitlab"
+		fi
+	elif [ -f "$ENV_FILE" ] && grep -q '^GITLAB_SCHEME=https' "$ENV_FILE"; then
+		# Idempotent: re-applies compose changes, waits for HTTPS, keeps the runner's trust current.
+		if out="$("$REPO_ROOT/scripts/gitlab-https.sh" 2>&1)"; then
+			ok "GitLab is serving HTTPS ($(sed -n 's/^GITLAB_HOST=//p' "$ENV_FILE"):$(sed -n 's/^GITLAB_PORT=//p' "$ENV_FILE"))"
+		else
+			fail "GitLab HTTPS" "$(printf '%s' "$out" | tail -12 | sed 's/^/ /')"
+		fi
+	else
+		if (cd "$COMPOSE_DIR" && docker compose up -d >/dev/null 2>&1); then
+			ok "GitLab and the runner are up (plain HTTP; run scripts/gitlab-https.sh for HTTPS)"
+		else
+			fail "Could not start GitLab" "cd deploy/gitlab && docker compose up -d   (then: docker compose logs --tail=50 gitlab)"
+		fi
+	fi
+else
+	ok "No GitLab container on this host (external GitLab): container steps skipped"
+fi
+
+# --- the runner --------------------------------------------------------------------
+if [ "$gitlab_here" = 1 ] || [ -n "${GITLAB_TOKEN:-}" ]; then
+	if [ "$CHECK" = 1 ]; then
+		if docker exec nsx-gitlab-runner gitlab-runner verify 2>&1 | grep -qi 'is valid'; then
+			ok "Runner is registered and valid"
+		else
+			fail "Runner is not registered or not valid" "Run scripts/converge.sh (without --check) to register it."
+		fi
+	else
+		if out="$("$REPO_ROOT/scripts/gitlab-runner.sh" 2>&1)"; then
+			ok "$(printf '%s' "$out" | tail -1)"
+		else
+			fail "Runner" "$(printf '%s' "$out" | tail -8 | sed 's/^/ /')"
+		fi
+	fi
+else
+	warn "Runner not checked" "GitLab is not on this host and GITLAB_TOKEN is not set. Register a runner with the CI image '$CI_IMAGE' yourself, or export GITLAB_TOKEN and re-run."
+fi
+
+# --- can a job container reach what Terraform needs? -------------------------------
+if docker image inspect "$CI_IMAGE" >/dev/null 2>&1; then
+	envfile="$(mktemp)"
+	trap 'rm -f "$envfile"' EXIT
+	"$REPO_ROOT/scripts/gitlab-runner.sh" --print-env >"$envfile" 2>/dev/null
+	bundle=()
+	[ -f /etc/ssl/certs/ca-certificates.crt ] && bundle=(-v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro)
+	probe='
+import urllib.request, sys
+bad = 0
+for url in ("https://registry.terraform.io/.well-known/terraform.json", "https://releases.hashicorp.com/"):
+    host = url.split("/")[2]
+    try:
+        urllib.request.urlopen(url, timeout=10).read(1)
+        print("PASS " + host)
+    except Exception as e:
+        print("FAIL " + host + ": " + str(getattr(e, "reason", e)))
+        bad = 1
+sys.exit(bad)'
+	if out="$(docker run --rm --network host --env-file "$envfile" ${bundle[@]+"${bundle[@]}"} --entrypoint "" "$CI_IMAGE" python3 -c "$probe" 2>&1)"; then
+		ok "Job containers can reach registry.terraform.io and releases.hashicorp.com"
+	else
+		mirror=""
+		[ -f "$COMPOSE_DIR/ci-network.env" ] && mirror="$(grep -E '^NSX_TF_(NETWORK|FS)_MIRROR=' "$COMPOSE_DIR/ci-network.env" || true)"
+		if [ -n "${NSX_TF_NETWORK_MIRROR:-}${NSX_TF_FS_MIRROR:-}$mirror" ]; then
+			ok "Job containers cannot reach the public Terraform registry, but a provider mirror is configured"
+		else
+			warn "Job containers cannot download Terraform providers" \
+				"$(printf '%s' "$out" | tr '\n' ' ')" \
+				"What still works: validate-data, the matrix job, formatting. terraform validate shows a" \
+				"warning instead of failing. Plan and apply need providers, so before using them:" \
+				"  * set the GitLab CI/CD variable NSX_TF_NETWORK_MIRROR to an internal provider mirror, or" \
+				"  * allow this host to reach registry.terraform.io and releases.hashicorp.com, through a" \
+				"    proxy if that is how this network works (set NSX_HTTPS_PROXY in deploy/gitlab/ci-network.env," \
+				"    then run scripts/converge.sh again)."
+		fi
+	fi
+fi
+
+echo
+if [ "$fails" -gt 0 ]; then
+	echo "converge: $fails problem(s) need attention, $warns warning(s)."
+	exit 1
+fi
+echo "converge: healthy ($warns warning(s))."
+SCAFFOLD_EOF
+mark_executable scripts/converge.sh
 
 write_file scripts/selftest.sh <<'SCAFFOLD_EOF'
 #!/usr/bin/env bash
@@ -8948,13 +9638,17 @@ stages:
   - apply
 
 default:
-  image: hashicorp/terraform:1.9.8
-  before_script:
-    - apk add --no-cache python3 curl git bash >/dev/null
+  # Everything a job needs is already in this image: Python, Terraform, bash,
+  # curl and git. scripts/converge.sh builds it on the runner host from Docker
+  # Hub images, so jobs never download packages (a locked-down network usually
+  # blocks that). To use an image from your own registry instead, set the
+  # CI/CD variable NSX_CI_IMAGE.
+  image: $NSX_CI_IMAGE
   interruptible: true
 
 variables:
   GIT_DEPTH: "20"
+  NSX_CI_IMAGE: "nsx-ci:1"
 
 # --- validate: offline, no credentials, runs on everything ------------------
 
@@ -8969,14 +9663,14 @@ data:
 terraform:
   stage: validate
   script:
-    - terraform fmt -recursive -check -diff .
-    - |
-      set -eu
-      for stack in stacks/*/; do
-        echo "--- ${stack}"
-        terraform -chdir="${stack}" init -backend=false -input=false
-        terraform -chdir="${stack}" validate
-      done
+    # '|| exit $?' is deliberate. GitLab honours allow_failure:exit_codes only when
+    # the job's own shell runs 'exit 42'; a command that merely returns 42 is
+    # recorded as exit code 1 and the job would show as a hard failure.
+    - bash scripts/ci-terraform-validate.sh || exit $?
+  # Exit 42 means formatting passed but providers could not be downloaded from
+  # this network, so 'validate' did not run: shown as a warning, never silent.
+  allow_failure:
+    exit_codes: 42
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
@@ -9069,9 +9763,8 @@ def main() -> int:
     out.append("stages: [plan, apply]")
     out.append("")
     out.append("default:")
-    out.append("  image: hashicorp/terraform:1.9.8")
-    out.append("  before_script:")
-    out.append("    - apk add --no-cache python3 curl git bash jq >/dev/null")
+    # The same image as the parent pipeline, where it is a CI/CD variable.
+    out.append("  image: " + os.environ.get("NSX_CI_IMAGE", "nsx-ci:1"))
     out.append("")
 
     for row in rows:
@@ -9195,6 +9888,7 @@ post_gitlab() {
 		return 0
 	}
 	curl --silent --show-error --fail-with-body --max-time 60 \
+		${CI_SERVER_TLS_CA_FILE:+--cacert "$CI_SERVER_TLS_CA_FILE"} \
 		--header "PRIVATE-TOKEN: ${CI_API_TOKEN}" \
 		--data-urlencode "body@$body_file" \
 		--request POST \
@@ -10204,6 +10898,11 @@ if [ "$DRY_RUN" != 1 ] && [ -s "$STAGE/generated.sha256" ]; then
 	} | LC_ALL=C sort -k2,2 -s -u >"$STAGE/merged.sha256" &&
 		cat "$STAGE/merged.sha256" >"$ROOT/.nsx-generated.sha256" 2>/dev/null ||
 		warn "could not write $ROOT/.nsx-generated.sha256; scripts/update.sh will treat differing files as conflicts"
+fi
+
+# The release this tree was generated at, so update.sh can show what is new.
+if [ "$DRY_RUN" != 1 ]; then
+	printf '%s\n' "$VERSION" >"$ROOT/.nsx-generator-version" 2>/dev/null || true
 fi
 
 # Remember the answers, so a later bare re-run does not quietly change the shape
