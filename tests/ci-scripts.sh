@@ -28,6 +28,10 @@ fmt*) [ "${TF_STUB_FMT:-ok}" = ok ] && exit 0 || { echo "main.tf"; exit 3; } ;;
 		echo 'Error: Failed to query available provider packages'
 		echo 'Could not retrieve the list of available versions for provider vmware/nsxt: could not connect to registry.terraform.io: Failed to request discovery document: Get "https://registry.terraform.io/.well-known/terraform.json": dial tcp: lookup registry.terraform.io: no such host'
 		exit 1 ;;
+	denied)
+		echo 'Error: Failed to query available provider packages'
+		echo 'Could not retrieve the list of available versions for provider vmware/nsxt: 403 Forbidden'
+		exit 1 ;;
 	real)
 		echo 'Error: Failed to query available provider packages'
 		echo 'Could not retrieve the list of available versions for provider vmware/nsxt: no available releases match the given constraints >= 99.0.0'
@@ -54,6 +58,8 @@ check "...and says plainly what to do" grep -q "NSX_TF_NETWORK_MIRROR" "$SCRATCH
 check "...and says validate did not run" grep -q "did NOT run" "$SCRATCH/v.out"
 TF_STUB_INIT=real run_validate
 check "a real provider error is a hard failure (exit 1), not a warning" test $? -eq 1
+TF_STUB_INIT=denied run_validate
+check "a proxy 403 on provider download is a warning (exit 42), not a hard failure" test $? -eq 42
 TF_STUB_INIT=ok TF_STUB_VALIDATE=bad run_validate
 check "an invalid stack is a hard failure" test $? -eq 1
 TF_STUB_INIT=ok TF_STUB_FMT=bad run_validate
@@ -78,6 +84,7 @@ except ImportError:
 d = yaml.safe_load(open(sys.argv[1]))
 assert d["terraform"]["script"] == ["bash scripts/ci-terraform-validate.sh || exit $?"], d["terraform"]["script"]
 assert d["terraform"]["allow_failure"] == {"exit_codes": 42}
+assert d["default"]["image"]["entrypoint"] == [""], d["default"]["image"]
 PYEOF
 
 # The provider mirror setting becomes a Terraform CLI config.
@@ -124,6 +131,19 @@ check "deploy/gitlab/ci-network.env is honoured" grep -q "http://fromfile:9" <<<
 rm -f "$T/deploy/gitlab/ci-network.env"
 env_out="$(clean env PATH="$base_path" GITLAB_HOST=gitlab.corp HTTPS_PROXY=http://proxy.corp:3128 "$R" --print-env)"
 check "--print-env gives KEY=VALUE lines for docker --env-file" grep -q "^https_proxy=http://proxy.corp:3128$" <<<"$env_out"
+
+# Jobs must not inherit an image entrypoint. 'terraform sh' exits 1 in a couple of
+# seconds and every job fails the same way.
+check "every job clears the image entrypoint" grep -q 'entrypoint: \[""\]' "$T/.gitlab-ci.yml"
+child="$(cd "$T" && python3 scripts/gitlab-child-pipeline.py)"
+check "the child pipeline clears it too" grep -q 'entrypoint: \[""\]' <<<"$child"
+
+# Git is given only the runner's tls-ca-file. That file has to carry the host
+# trust store as well, or a TLS-inspecting proxy fails every clone.
+printf '%s\n' '-----BEGIN CERTIFICATE-----' 'GITLAB-CA' '-----END CERTIFICATE-----' >"$SCRATCH/ca.crt"
+printf '%s\n' '-----BEGIN CERTIFICATE-----' 'HOST-CA' '-----END CERTIFICATE-----' >"$SCRATCH/host-ca.crt"
+clean env GITLAB_SCHEME=https GITLAB_SSL_DIR="$SCRATCH" NSX_HOST_CA_BUNDLE="$SCRATCH/host-ca.crt" "$R" --bundle-ca "$SCRATCH/bundle.pem"
+check "the CA bundle contains the GitLab CA and the host trust store" bash -c 'grep -q GITLAB-CA "$1" && grep -q HOST-CA "$1"' _ "$SCRATCH/bundle.pem"
 
 # ---------------------------------------------------------------------------
 echo "no Docker on the host"

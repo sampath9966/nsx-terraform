@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 
 ROOT="$PWD"
 FORCE=0
@@ -8122,7 +8122,8 @@ trust_runner() {
 	state() { docker exec nsx-gitlab-runner sh -c "cat /etc/gitlab-runner/config.toml '$certs/${GITLAB_HOST}.crt' 2>/dev/null | sha256sum" 2>/dev/null; }
 	before="$(state)"
 	docker exec nsx-gitlab-runner mkdir -p "$certs"
-	docker cp "$GITLAB_SSL_DIR/ca.crt" "nsx-gitlab-runner:$certs/${GITLAB_HOST}.crt"
+	# GitLab CA plus the host trust store. Git in a job trusts only this file.
+	"$REPO_ROOT/scripts/gitlab-runner.sh" --install-ca || die "could not install the CA bundle into the runner."
 	docker exec nsx-gitlab-runner sh -c "
 		f=/etc/gitlab-runner/config.toml
 		[ -f \$f ] || exit 0
@@ -8261,6 +8262,11 @@ ENV TF_IN_AUTOMATION=1 \
     PYTHONUNBUFFERED=1
 
 # Fail the build, not a job, if anything the scripts rely on is missing.
+# No ENTRYPOINT. GitLab starts the job with 'sh -c'. An image whose entrypoint
+# is terraform (or anything else) is handed 'sh' and exits 1 at once.
+ENTRYPOINT []
+CMD ["bash"]
+
 RUN terraform version && python3 --version && bash --version >/dev/null \
     && curl --version >/dev/null && git --version && make --version >/dev/null
 SCAFFOLD_EOF
@@ -8326,7 +8332,10 @@ skipped=()
 
 # A download problem, as opposed to a problem with the code or the constraints.
 network_failure() {
-	grep -Eqi 'dial tcp|no such host|lookup [^ ]+: |i/o timeout|timeout awaiting|connection refused|connection reset|network is unreachable|proxyconnect|tls: |x509:|unexpected EOF|could not connect to' <<<"$1"
+	# A constraint that matches nothing is a problem in the code, even though
+	# Terraform introduces it with the same "Failed to query" line as a download.
+	grep -Eqi 'no available releases match|checksum mismatch' <<<"$1" && return 1
+	grep -Eqi 'dial tcp|no such host|lookup [^ ]+: |i/o timeout|timeout awaiting|connection refused|connection reset|network is unreachable|proxyconnect|tls: |x509:|unexpected EOF|could not connect to|failed to query available provider packages|failed to install provider|403 forbidden|407 proxy|client\.timeout|context deadline exceeded|tls handshake timeout|certificate signed by unknown|self-signed|self signed' <<<"$1"
 }
 
 echo "--- terraform fmt"
@@ -8510,6 +8519,8 @@ write_file scripts/gitlab-runner.sh <<'SCAFFOLD_EOF'
 #   scripts/gitlab-runner.sh                 converge
 #   scripts/gitlab-runner.sh --print-profile show what it would configure; change nothing
 #   scripts/gitlab-runner.sh --print-env     the proxy variables jobs will get (KEY=VALUE)
+#   scripts/gitlab-runner.sh --install-ca    refresh the CA bundle in the runner; change nothing else
+#   scripts/gitlab-runner.sh --bundle-ca F   write that bundle to F; change nothing (for tests)
 #
 # It looks at this host and configures the runner to match:
 #   * docker executor, image NSX_CI_IMAGE (default nsx-ci:1), host network
@@ -8517,7 +8528,9 @@ write_file scripts/gitlab-runner.sh <<'SCAFFOLD_EOF'
 #   * proxy settings for jobs, first found of: NSX_HTTP_PROXY / NSX_HTTPS_PROXY /
 #     NSX_NO_PROXY, this shell's HTTP(S)_PROXY, the Docker daemon's own proxy
 #   * the host's CA bundle mounted into jobs, so a TLS-inspecting proxy does not break them
-#   * GitLab's own CA, when GitLab is served over HTTPS here
+#   * GitLab's own CA plus the host trust store, when GitLab is served over HTTPS.
+#     Git in a job trusts only that file, so a TLS-inspecting proxy that the
+#     runner itself accepts will otherwise fail every clone with exit 1.
 # Overrides, if you need them, go in deploy/gitlab/ci-network.env (KEY=VALUE lines).
 #
 # If anything about that differs from what the runner has, the runner is
@@ -8538,11 +8551,18 @@ RUNNER=nsx-gitlab-runner
 GITLAB=nsx-gitlab
 MODE=converge
 PROJECT="${GITLAB_PROJECT:-}"
+BUNDLE_OUT=""
 
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--print-profile) MODE=profile ;;
 	--print-env) MODE="env" ;;
+	--install-ca) MODE=install-ca ;;
+	--bundle-ca)
+		MODE=bundle
+		BUNDLE_OUT="${2:?--bundle-ca needs a path}"
+		shift
+		;;
 	--project)
 		PROJECT="${2:?--project needs GROUP/NAME}"
 		shift
@@ -8579,7 +8599,34 @@ SSL_DIR="${GITLAB_SSL_DIR:-$(saved GITLAB_SSL_DIR)}"
 SSL_DIR="${SSL_DIR:-/opt/nsx-gitlab/ssl}"
 CA="$SSL_DIR/ca.crt"
 CI_IMAGE="${NSX_CI_IMAGE:-nsx-ci:1}"
-HOST_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+HOST_CA_BUNDLE="${NSX_HOST_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}"
+
+# The file git is told to trust (http.<gitlab>/.sslCAInfo) REPLACES the system
+# store. The runner's own client trusts this file AND the system store. A proxy
+# that re-signs TLS is therefore fine for the runner and fatal for every clone
+# unless the host bundle is in this file too.
+write_ca_bundle() { # write_ca_bundle DEST
+	local dest="$1"
+	[ -f "$CA" ] || return 1
+	cat "$CA" >"$dest"
+	if [ -n "$HOST_CA_BUNDLE" ] && [ -f "$HOST_CA_BUNDLE" ]; then
+		printf '\n' >>"$dest"
+		cat "$HOST_CA_BUNDLE" >>"$dest"
+	fi
+}
+
+install_ca_into_runner() {
+	[ "$SCHEME" = https ] || return 0
+	[ -f "$CA" ] || return 0
+	docker inspect "$RUNNER" >/dev/null 2>&1 || return 0
+	local tmp
+	tmp="$(mktemp)"
+	write_ca_bundle "$tmp" || { rm -f "$tmp"; return 1; }
+	docker exec "$RUNNER" mkdir -p /etc/gitlab-runner/certs || { rm -f "$tmp"; return 1; }
+	docker cp "$tmp" "$RUNNER:/etc/gitlab-runner/certs/$HOST.crt" >/dev/null || { rm -f "$tmp"; return 1; }
+	docker cp "$tmp" "$RUNNER:/etc/gitlab-runner/certs/ca.crt" >/dev/null || { rm -f "$tmp"; return 1; }
+	rm -f "$tmp"
+}
 
 # --- the profile: what the runner should look like on this host ---------------
 
@@ -8630,6 +8677,19 @@ env)
 	printf '%s\n' ${envs[@]+"${envs[@]}"}
 	exit 0
 	;;
+bundle)
+	write_ca_bundle "$BUNDLE_OUT" || die "CA not found at $CA"
+	exit 0
+	;;
+install-ca)
+	command -v docker >/dev/null 2>&1 || die "docker is not installed."
+	docker inspect "$RUNNER" >/dev/null 2>&1 || die "the runner container '$RUNNER' is not running."
+	[ "$SCHEME" = https ] || { say "GitLab is not on HTTPS; no CA to install."; exit 0; }
+	[ -f "$CA" ] || die "CA not found at $CA"
+	install_ca_into_runner || die "could not install the CA bundle into the runner."
+	say "CA bundle installed for $HOST (GitLab CA plus the host trust store)."
+	exit 0
+	;;
 esac
 
 # --- converge -----------------------------------------------------------------
@@ -8662,6 +8722,10 @@ runner_up() {
 	docker inspect -f '{{.State.Running}}' "$RUNNER" 2>/dev/null | grep -q true
 }
 runner_up || die "the runner container '$RUNNER' is not running and could not be started."
+
+# Refresh even when the registration itself is already current: the runner
+# re-reads this file, and the next job's git clone receives it. No restart.
+install_ca_into_runner || die "could not install the CA bundle into the runner ($CA)."
 
 registered() { docker exec "$RUNNER" grep -q '^\[\[runners\]\]' /etc/gitlab-runner/config.toml 2>/dev/null; }
 valid() { docker exec "$RUNNER" gitlab-runner verify 2>&1 | grep -qi 'is valid'; }
@@ -8701,10 +8765,7 @@ pid="$(curl_gl -H "PRIVATE-TOKEN: $token" "$URL/api/v4/projects/$(printf '%s' "$
 # Clear the old registration first, so runners never pile up.
 if registered; then docker exec "$RUNNER" gitlab-runner unregister --all-runners >/dev/null 2>&1; fi
 
-if [ "$SCHEME" = https ] && [ -f "$CA" ]; then
-	docker exec "$RUNNER" mkdir -p /etc/gitlab-runner/certs
-	docker cp "$CA" "$RUNNER:/etc/gitlab-runner/certs/$HOST.crt" >/dev/null || die "could not copy the CA into the runner."
-fi
+install_ca_into_runner || die "could not install the CA bundle into the runner ($CA)."
 
 resp="$(curl_gl -H "PRIVATE-TOKEN: $token" -X POST "$URL/api/v4/user/runners" \
 	--data runner_type=project_type --data "project_id=$pid" --data run_untagged=true \
@@ -9643,7 +9704,15 @@ default:
   # Hub images, so jobs never download packages (a locked-down network usually
   # blocks that). To use an image from your own registry instead, set the
   # CI/CD variable NSX_CI_IMAGE.
-  image: $NSX_CI_IMAGE
+  #
+  # The empty entrypoint is required. GitLab starts a job by running 'sh -c'.
+  # If the image's own entrypoint is left in place and that entrypoint is
+  # terraform (the hashicorp/terraform image, or an nsx-ci:1 that was tagged
+  # from it), the job runs 'terraform sh' and exits 1 in a couple of seconds:
+  # "Terraform has no command named sh". Every job fails the same way.
+  image:
+    name: $NSX_CI_IMAGE
+    entrypoint: [""]
   interruptible: true
 
 variables:
@@ -9748,6 +9817,17 @@ def job_name(prefix: str, row: dict) -> str:
     return f"{prefix} {row['stack']} @ {row['site']}"
 
 
+def image_block(indent: str = "  ") -> list[str]:
+    # Empty entrypoint: see .gitlab-ci.yml. Without it a terraform entrypoint
+    # turns every job into 'terraform sh', which exits 1 immediately.
+    name = os.environ.get("NSX_CI_IMAGE", "nsx-ci:1")
+    return [
+        f"{indent}image:",
+        f"{indent}  name: {name}",
+        f'{indent}  entrypoint: [""]',
+    ]
+
+
 def main() -> int:
     rows = entries(None)
     if not rows:
@@ -9755,6 +9835,7 @@ def main() -> int:
         # no managers yet, and there is nothing to plan.
         print("no-managers:")
         print("  stage: plan")
+        print("\n".join(image_block("  ")))
         print("  script:")
         print('    - echo "inventory/managers.yaml lists no enabled managers; nothing to plan."')
         return 0
@@ -9764,7 +9845,7 @@ def main() -> int:
     out.append("")
     out.append("default:")
     # The same image as the parent pipeline, where it is a CI/CD variable.
-    out.append("  image: " + os.environ.get("NSX_CI_IMAGE", "nsx-ci:1"))
+    out.extend(image_block("  "))
     out.append("")
 
     for row in rows:

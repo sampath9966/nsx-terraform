@@ -13,6 +13,15 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.2.1
+
+**Jobs were failing in a few seconds with exit code 1, all of them, the same way.** Two separate causes, both fixed:
+
+- The job image's entrypoint was winning. GitLab starts a job with `sh -c`. On the Terraform image that runs `terraform sh`, which exits 1 immediately (`Terraform has no command named "sh"`). Every job now sets an empty entrypoint, so the shell actually runs. This still matters if `nsx-ci:1` on the host is a leftover Terraform image.
+- Git clones were trusting only the GitLab CA. The runner itself trusts that CA *and* the host trust store, so it stays connected through a TLS-inspecting proxy. Git in the job does not: `sslCAInfo` replaces the system store. The CA file installed in the runner is now the GitLab CA plus the host bundle, which is what the job's git is given. `scripts/converge.sh` refreshes it on an already-registered runner.
+
+A provider download that fails because the proxy refused it (403, timeout, handshake) is reported as the existing warning (exit 42), not as a hard failure. A constraint that matches no release is still a hard failure.
+
 ## 1.2.0
 
 **Pipeline jobs no longer download anything.** The first jobs on a real runner
