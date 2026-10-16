@@ -28,13 +28,21 @@
 #   --remote NAME|URL   where to pull this repository from   (default: origin)
 #   --branch NAME       branch to pull                        (default: main)
 #   --no-pull           do not pull; use this repository as it is
+#   --no-converge       update files only; do not run scripts/converge.sh afterwards
 #   --overwrite-unknown also apply CONFLICT files (backed up first)
 #   --commit            in a git tree, commit the result on a new branch
 #                       update/<generator-commit>. Never pushes.
 #   --summary           list files only, no diffs
 #   -h, --help          this text
 #
-# Exit status: 0 up to date or applied, 3 changes pending (--check), 1 error.
+# After the files are updated it runs scripts/converge.sh in the tree, which
+# brings this host to what the release expects (CI image, runner, GitLab
+# container) and reports anything it cannot fix by itself. Run it again whenever
+# a converge step failed: updating is idempotent.
+#
+# Exit status: 0 up to date or applied and healthy, 3 changes pending (--check),
+# 4 files are current but the host is not healthy (--check), 1 error or the
+# host could not be converged.
 
 set -o pipefail
 
@@ -53,6 +61,7 @@ YES=0
 OVERWRITE_UNKNOWN=0
 COMMIT=0
 SUMMARY=0
+NO_CONVERGE=0
 
 die() {
 	printf 'error: %s\n' "$*" >&2
@@ -78,6 +87,7 @@ while [ $# -gt 0 ]; do
 		shift
 		;;
 	--no-pull) PULL=0 ;;
+	--no-converge) NO_CONVERGE=1 ;;
 	--check | --dry-run) CHECK=1 ;;
 	--yes | -y) YES=1 ;;
 	--overwrite-unknown) OVERWRITE_UNKNOWN=1 ;;
@@ -144,6 +154,7 @@ if [ "$PULL" = 1 ]; then
 			[ "$OVERWRITE_UNKNOWN" = 1 ] && fwd+=(--overwrite-unknown)
 			[ "$COMMIT" = 1 ] && fwd+=(--commit)
 			[ "$SUMMARY" = 1 ] && fwd+=(--summary)
+			[ "$NO_CONVERGE" = 1 ] && fwd+=(--no-converge)
 			NSX_UPDATE_LOCKED=1 exec "$GEN_ROOT/scripts/update.sh" "${fwd[@]}"
 		fi
 		say "this repository is already up to date."
@@ -153,6 +164,49 @@ if [ "$PULL" = 1 ]; then
 fi
 
 GEN_REV="$(git -C "$GEN_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+GEN_VERSION="$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$GEN_ROOT/scripts/bootstrap.sh" 2>/dev/null | head -1)"
+GEN_VERSION="${GEN_VERSION:-unknown}"
+VERSION_FILE=".nsx-generator-version"
+TREE_VERSION="$(tr -d '\r\n' <"$TARGET/$VERSION_FILE" 2>/dev/null || true)"
+
+version_gt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]; }
+
+# The sections of CHANGELOG.md newer than this tree (just the newest, the first time).
+release_notes() {
+	local file="$GEN_ROOT/CHANGELOG.md" show=0 first=1 printed=0 line v
+	[ -f "$file" ] || return 0
+	while IFS= read -r line; do
+		if [[ "$line" =~ ^##[[:space:]]+\[?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+			v="${BASH_REMATCH[1]}"
+			if [ -z "$TREE_VERSION" ]; then
+				show=$first
+			elif version_gt "$v" "$TREE_VERSION"; then
+				show=1
+			else
+				show=0
+			fi
+			first=0
+			if [ "$show" = 1 ] && [ "$printed" = 0 ]; then
+				say ""
+				say "WHAT'S NEW"
+				printed=1
+			fi
+		fi
+		[ "$show" = 1 ] && printf '  %s\n' "$line"
+	done <"$file"
+	return 0
+}
+
+# Bring this host in line with the release. Prints its own report.
+converge() {
+	[ "$NO_CONVERGE" = 1 ] && return 0
+	[ -x "$TARGET/scripts/converge.sh" ] || return 0
+	local args=()
+	[ "$CHECK" = 1 ] && args=(--check)
+	say ""
+	say "== host =="
+	"$TARGET/scripts/converge.sh" ${args[@]+"${args[@]}"}
+}
 [ -x "$GEN_ROOT/scripts/bootstrap.sh" ] || die "$GEN_ROOT/scripts/bootstrap.sh is missing."
 
 # --- 3. generate what the tree would be today, in a scratch directory ------
@@ -190,7 +244,7 @@ is_estate_data() {
 # Written by the scratch run, not part of the tree.
 is_scratch_only() {
 	case "$1" in
-	.nsx-bootstrap.conf | .nsx-generated.sha256 | .git/*) return 0 ;;
+	.nsx-bootstrap.conf | .nsx-generated.sha256 | .nsx-generator-version | .git/*) return 0 ;;
 	esac
 	return 1
 }
@@ -228,7 +282,9 @@ show_diff() { diff -u --label "your tree: $1" --label "generator now: $1" "$TARG
 
 say ""
 say "tree        $TARGET"
-say "generator   $GEN_ROOT @ $GEN_REV"
+say "generator   $GEN_ROOT @ $GEN_REV (release $GEN_VERSION)"
+say "tree        is at release ${TREE_VERSION:-unrecorded}"
+release_notes
 say ""
 say "  ${#NEW[@]} new   ${#UPDATE[@]} update   ${#LOCAL[@]} yours, kept   ${#CONFLICT[@]} conflict   ${#SAME[@]} unchanged"
 say "  (data/, inventory/ and envs/ are never read or written)"
@@ -268,16 +324,27 @@ if [ "${#TO_APPLY[@]}" -eq 0 ]; then
 	say ""
 	if [ "${#CONFLICT[@]}" -gt 0 ]; then
 		say "nothing is applied automatically. Review the CONFLICT files above."
-		[ "$CHECK" = 1 ] && exit 3
 	else
-		say "up to date."
+		say "files are up to date."
 	fi
-	exit 0
+	converge
+	crc=$?
+	if [ "$CHECK" = 1 ]; then
+		[ "${#CONFLICT[@]}" -gt 0 ] && exit 3
+		[ "$crc" -ne 0 ] && exit 4
+		exit 0
+	fi
+	# Nothing to write, so this release is adopted once the host is healthy.
+	if [ "$crc" -eq 0 ] && [ "$TREE_VERSION" != "$GEN_VERSION" ]; then
+		printf '%s\n' "$GEN_VERSION" >"$TARGET/$VERSION_FILE"
+	fi
+	exit "$crc"
 fi
 
 if [ "$CHECK" = 1 ]; then
 	say ""
 	say "${#TO_APPLY[@]} change(s) pending. Run scripts/update.sh to apply."
+	converge >/dev/null 2>&1 || true
 	exit 3
 fi
 
@@ -353,7 +420,7 @@ say "applied ${#TO_APPLY[@]} change(s)."
 followups=()
 for r in "${TO_APPLY[@]}"; do
 	case "$r" in
-	deploy/gitlab/*) followups+=("deploy/gitlab changed: restart the container to pick it up. scripts/gitlab-https.sh re-applies HTTPS and keeps your data.") ;;
+	deploy/gitlab/*) followups+=("deploy/gitlab changed: the host step below recreates the GitLab/runner containers if their configuration changed (data is kept).") ;;
 	.gitlab-ci.yml | .github/*) followups+=("the pipeline definition changed: it takes effect on the next push; review it in a merge request.") ;;
 	stacks/*/backend.tf) followups+=("a backend.tf changed: run 'terraform init' in that stack before the next plan.") ;;
 	esac
@@ -364,9 +431,13 @@ if [ "${#followups[@]}" -gt 0 ]; then
 	printf '%s\n' "${followups[@]}" | sort -u | sed 's/^/  - /'
 fi
 
+printf '%s\n' "$GEN_VERSION" >"$TARGET/$VERSION_FILE"
+converge
+crc=$?
+
 if [ "$COMMIT" = 1 ]; then
 	# Only the files this run wrote, never whatever else is lying around.
-	for r in ${TO_APPLY[@]+"${TO_APPLY[@]}"} "$BASELINE"; do
+	for r in ${TO_APPLY[@]+"${TO_APPLY[@]}"} "$BASELINE" "$VERSION_FILE"; do
 		git -C "$TARGET" add -- "$r" 2>/dev/null
 	done
 	# The same update on the same parent gives the same commit id on every server
@@ -393,3 +464,5 @@ elif git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
 	say ""
 	say "review with 'git -C $TARGET diff', then commit on a branch and open a merge request."
 fi
+
+exit "$crc"

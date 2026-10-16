@@ -648,6 +648,38 @@ Some updates need an action afterwards (a changed `deploy/gitlab/` file means
 restarting the container; a changed `backend.tf` means `terraform init`); the
 command lists them at the end and does not do them silently.
 
+### What the update does to the host
+
+After the files, `update.sh` runs `scripts/converge.sh` in your tree, so a release
+that needs something new from the server just arrives:
+
+| Step | What it does when it is not already right |
+|---|---|
+| Docker | reports clearly if it is missing or unreachable, and stops |
+| CI image `nsx-ci:1` | builds it from Docker Hub images (Python, Terraform, bash, curl, git); jobs download nothing |
+| GitLab container | recreates it if its configuration changed (data kept), waits until it answers |
+| Runner | registers it, or re-registers it if it was lost or the settings for this host changed |
+| Network check | from inside a job container: can Terraform providers be downloaded? |
+
+Each step is independent and says what to do when it fails. It never restarts the
+runner unless the runner's configuration changed, so it is safe to run while a job
+is running. Run it any time with `scripts/converge.sh` (or `--check` to only look).
+
+**Locked-down networks.** The jobs need no package mirrors. They do need Terraform
+providers for `init`; if the job containers cannot reach `registry.terraform.io`:
+
+- the `terraform` validate job ends as a **warning** (exit 42), never silently and
+  never as a hard failure, and its log says what to set;
+- set the CI/CD variable `NSX_TF_NETWORK_MIRROR` to an internal provider mirror
+  (or `NSX_TF_FS_MIRROR` to a directory made with `terraform providers mirror`);
+- if the network uses a proxy, it is found automatically (your shell, then the
+  Docker daemon's settings). To set it explicitly, put `NSX_HTTPS_PROXY=...`,
+  `NSX_HTTP_PROXY=...` and `NSX_NO_PROXY=...` in `deploy/gitlab/ci-network.env`
+  (never overwritten, never committed) and run `scripts/converge.sh`.
+
+The release notes for every version are in `CHANGELOG.md`; `update.sh` prints the
+ones your tree has not seen.
+
 A tree generated before this existed has no record of last time, so its first
 update shows every differing file as **CONFLICT**. Read the diffs once, apply
 with `--overwrite-unknown` if they are all the generator's, and it is

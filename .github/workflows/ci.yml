@@ -22,17 +22,25 @@ jobs:
         run: tests/run.sh
 
   e2e:
-    name: real GitLab (HTTP -> HTTPS on 8443 -> renewal)
+    name: real GitLab (${{ matrix.mode }})
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # fresh:   a new tree, then the whole path, then repairs
+        # upgrade: a tree from the previous release, upgraded with update.sh as a consumer would
+        mode: [fresh, upgrade]
     steps:
       - uses: actions/checkout@v4
-      - name: Free disk for the GitLab image
+        with:
+          fetch-depth: 0 # upgrade mode needs the previous release (origin/main)
+      - name: Free disk for the GitLab and CI images
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android || true
           df -h /
-      - name: Boot GitLab, switch to HTTPS, renew
-        run: tests/e2e-gitlab.sh
+      - name: Boot GitLab, upgrade, switch to HTTPS, run a pipeline on a network with no outside access
+        run: tests/e2e-gitlab.sh ${{ matrix.mode }}
       - name: GitLab logs on failure
         if: failure()
         run: docker logs --tail=200 nsx-gitlab || true

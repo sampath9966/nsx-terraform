@@ -39,8 +39,12 @@ Any flag on the command line suppresses the menu, so CI is unaffected.
 Later, to pick up improvements to this repository **without changing your steps**:
 
 ```bash
-scripts/update.sh        # pulls, shows exactly what would change in your tree, asks, applies
+scripts/update.sh        # pulls, shows the release notes and every change, asks, applies,
+                         # then fixes up the host (CI image, runner, GitLab) and says what it found
 ```
+
+The same command is the upgrade for every release. What changed is in
+[CHANGELOG.md](CHANGELOG.md).
 
 > The repository name contains a typo for "terraform". It is reproduced verbatim
 > in remotes and CI config; renaming is the owner's call.

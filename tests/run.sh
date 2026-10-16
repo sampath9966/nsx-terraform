@@ -27,10 +27,18 @@ scripts/bootstrap.sh --dir "$t" --vcs none --no-interactive >/dev/null 2>&1 || r
 (cd "$t" && scripts/selftest.sh --quick 2>&1 | grep -E "^selftest:|FAIL") || true
 (cd "$t" && scripts/selftest.sh --quick >/dev/null 2>&1) || rc=1
 
+if command -v shellcheck >/dev/null 2>&1; then
+	echo "== shellcheck on the generated scripts"
+	(cd "$t" && shellcheck -S warning scripts/converge.sh scripts/gitlab-runner.sh scripts/ci-image.sh \
+		scripts/ci-terraform-validate.sh scripts/gitlab-https.sh scripts/gitlab-up.sh scripts/tf-mirror.sh) || rc=1
+fi
+
 echo "== update.sh lifecycle and concurrency"
 tests/lifecycle.sh || rc=1
 echo "== YAML fallback parser"
 tests/yaml-fallback.sh || rc=1
+echo "== CI scripts (provider downloads, runner profile, no Docker)"
+tests/ci-scripts.sh || rc=1
 echo "== gitlab-https.sh certificates and guards"
 tests/https-cert.sh || rc=1
 
