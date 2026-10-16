@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 
 ROOT="$PWD"
 FORCE=0
@@ -8420,7 +8420,10 @@ command -v docker >/dev/null 2>&1 || die "docker is not installed."
 docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon. Is it running, and are you root or in the docker group?"
 
 verify() {
-	docker run --rm --entrypoint "" "$IMAGE" sh -c \
+	# Do not pass --entrypoint. GitLab starts a job with 'sh -c', and an image
+	# whose entrypoint is terraform turns that into 'terraform sh' and exits 1
+	# at once. Clearing the entrypoint here would hide that image.
+	docker run --rm "$IMAGE" sh -c \
 		'terraform version >/dev/null && python3 --version >/dev/null && bash --version >/dev/null && curl --version >/dev/null && git --version >/dev/null' \
 		>/dev/null 2>&1
 }
@@ -8531,6 +8534,10 @@ write_file scripts/gitlab-runner.sh <<'SCAFFOLD_EOF'
 #   * GitLab's own CA plus the host trust store, when GitLab is served over HTTPS.
 #     Git in a job trusts only that file, so a TLS-inspecting proxy that the
 #     runner itself accepts will otherwise fail every clone with exit 1.
+#   * a pre-get-sources script: before git fetches, ignore the proxy for this
+#     GitLab and trust CI_SERVER_TLS_CA_FILE. The helper reports a failed clone
+#     as exit code 1 on every job. NO_PROXY is not enough: a CIDR there is not
+#     honoured by the helper's git, and sslCAInfo replaces the system store.
 # Overrides, if you need them, go in deploy/gitlab/ci-network.env (KEY=VALUE lines).
 #
 # If anything about that differs from what the runner has, the runner is
@@ -8660,6 +8667,11 @@ compute_profile() {
 	[ -f "$HOST_CA_BUNDLE" ] && flags+=(--docker-volumes "$HOST_CA_BUNDLE:$HOST_CA_BUNDLE:ro")
 	[ "$SCHEME" = https ] && flags+=(--tls-ca-file "/etc/gitlab-runner/certs/$HOST.crt")
 	for kv in ${envs[@]+"${envs[@]}"}; do flags+=(--env "$kv"); done
+	# Runs in the helper, after the runner has written CI_SERVER_TLS_CA_FILE and
+	# before git fetch. An empty http.<url>.proxy overrides HTTPS_PROXY for that
+	# URL only (git treats "" as "do not proxy"). Both spellings: with and
+	# without a trailing slash. GitLab on this network is reached directly.
+	flags+=(--pre-get-sources-script 'if [ -n "${CI_SERVER_TLS_CA_FILE:-}" ] && [ -f "$CI_SERVER_TLS_CA_FILE" ]; then git config --global http.sslCAInfo "$CI_SERVER_TLS_CA_FILE"; fi; if [ -n "${CI_SERVER_URL:-}" ]; then _u="${CI_SERVER_URL%/}"; git config --global "http.${_u}.proxy" ""; git config --global "http.${_u}/.proxy" ""; fi')
 	profile_hash="$(printf '%s\n' "$URL" "${flags[@]}" | sha256sum | cut -c1-16)"
 }
 compute_profile
