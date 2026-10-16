@@ -5221,7 +5221,11 @@ def _strip_comment(text: str) -> str:
 
 
 def _split_key(text: str) -> tuple[str, bool, str]:
+    # A colon only separates a key when it is outside quotes and outside any
+    # [...] or {...}: '- { scope: workload, tag: x }' is one flow mapping, not
+    # a mapping whose first key is '{ scope'.
     quote = None
+    depth = 0
     for i, ch in enumerate(text):
         if quote:
             if ch == quote:
@@ -5230,7 +5234,11 @@ def _split_key(text: str) -> tuple[str, bool, str]:
         if ch in "'\"":
             quote = ch
             continue
-        if ch == ":" and (i + 1 == len(text) or text[i + 1] in " \t"):
+        if ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+        elif depth == 0 and ch == ":" and (i + 1 == len(text) or text[i + 1] in " \t"):
             return _unquote(text[:i].strip()), True, text[i + 1 :]
     return text, False, ""
 
@@ -8158,9 +8166,8 @@ main() {
 	*) die "unknown option: $1. Try --renew or --status." ;;
 	esac
 
-	need docker
-	need curl
-	docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon."
+	# Checks that only read the compose file come first: they need no Docker, and
+	# they explain what to do even on a host where Docker is not running yet.
 	[ -f "$COMPOSE_DIR/docker-compose.yml" ] || die "$COMPOSE_DIR/docker-compose.yml is missing."
 	grep -q GITLAB_SCHEME "$COMPOSE_DIR/docker-compose.yml" ||
 		die "docker-compose.yml predates HTTPS support. Bring the tree up to date first: update.sh in your clone of the generator."
@@ -8168,6 +8175,9 @@ main() {
 	# 'gitlab-ctl reconfigure' abort, and the container then cannot start.
 	grep -Eq "^[[:space:]]*grafana\[" "$COMPOSE_DIR/docker-compose.yml" &&
 		die "docker-compose.yml has a grafana[...] setting, which GitLab 17 rejects. Bring the tree up to date first (update.sh), or delete that line."
+	need docker
+	need curl
+	docker info >/dev/null 2>&1 || die "cannot talk to the Docker daemon."
 	lock_ssl
 	if port_clash; then
 		die "port $GITLAB_PORT is already in use on this host by something else."
@@ -8955,7 +8965,7 @@ default:
     name: hashicorp/terraform:1.9.8
     entrypoint: [""]
   before_script:
-    - apk add --no-cache python3 curl git bash >/dev/null
+    - apk add --no-cache python3 py3-yaml curl git bash >/dev/null
   interruptible: true
 
 variables:
@@ -9078,7 +9088,7 @@ def main() -> int:
     out.append("    name: hashicorp/terraform:1.9.8")
     out.append('    entrypoint: [""]')
     out.append("  before_script:")
-    out.append("    - apk add --no-cache python3 curl git bash jq >/dev/null")
+    out.append("    - apk add --no-cache python3 py3-yaml curl git bash jq >/dev/null")
     out.append("")
 
     for row in rows:

@@ -29,6 +29,8 @@ scripts/bootstrap.sh --dir "$t" --vcs none --no-interactive >/dev/null 2>&1 || r
 
 echo "== update.sh lifecycle and concurrency"
 tests/lifecycle.sh || rc=1
+echo "== YAML fallback parser"
+tests/yaml-fallback.sh || rc=1
 echo "== gitlab-https.sh certificates and guards"
 tests/https-cert.sh || rc=1
 
