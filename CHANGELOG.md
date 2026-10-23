@@ -15,7 +15,15 @@ cannot fix itself. Run it again after fixing whatever it reported.
 
 ## 1.2.8
 
-**Plan jobs failed with `x509: certificate signed by unknown authority` when Terraform read its state from a GitLab that uses its own certificate authority.** The runner gives every job that CA as `CI_SERVER_TLS_CA_FILE`, and git and curl already used it, but Terraform did not. `scripts/tf.sh` now builds a bundle from the system roots plus that CA and sets `SSL_CERT_FILE` to it for the run. A `SSL_CERT_FILE` you set yourself is left alone. Run by hand outside CI, set `SSL_CERT_FILE` to a bundle that includes your GitLab CA.
+Hardening found in a review before production use. Nothing here changes data, and a tree on Vault needs no action.
+
+**Terraform now trusts the CAs it needs, so plan jobs no longer fail with `x509: certificate signed by unknown authority`.** `scripts/tf.sh` builds a bundle from the system roots plus two optional CAs and sets `SSL_CERT_FILE` for the run: the CA of a GitLab that serves its own certificate (the runner already gives every job this as `CI_SERVER_TLS_CA_FILE`; git and curl used it, Terraform did not), and the CA that signed your NSX managers' certificates, given as a CI/CD variable `NSX_CA_FILE` of type File. A missing or non-PEM `NSX_CA_FILE` stops the run with a clear error instead of failing later in TLS. An `SSL_CERT_FILE` you set yourself is left alone, and the temporary bundle is removed when the run ends. Run by hand outside CI, set `SSL_CERT_FILE` to a bundle that holds your CAs.
+
+**Credential selection from CI/CD variables is stricter and explains itself.** `scripts/with-credentials.sh --from env` with nothing set used to die with `invalid variable name`; it now says what it looked for, in order, for the job's scope (for example `NSX_HYD_GM01_PLAN_USERNAME`, `NSX_PLAN_USERNAME`, `NSX_USERNAME`) and reminds you that protected variables are not visible to merge request pipelines. A blank or whitespace-only value no longer counts as a credential. A plan job never falls back to the apply credential, or the other way round.
+
+**`scripts/update.sh` repeats any file it kept.** A file that differs from the generator is kept unless you pass `--overwrite-unknown`, and it was listed only in the middle of a long diff, so "applied N change(s)" read as complete while part of the release was not in effect. Every run that kept one now ends with an ATTENTION block naming the files and the exact command. Exit statuses are unchanged.
+
+**Smaller:** `scripts/readiness.sh` stops if it cannot change into the repository, `make ready` and the GitLab setup summary describe both credential options and `NSX_CA_FILE`, and the docs state plainly that unprotected plan variables are visible to anyone who can run a pipeline on the project, so the plan account must be read-only. Variable-based credentials are wired for GitLab; the generated GitHub workflow still uses Vault.
 
 ## 1.2.7
 

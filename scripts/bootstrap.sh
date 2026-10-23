@@ -1984,8 +1984,30 @@ Plan jobs on a merge request cannot read protected variables, which is why plan
 and apply have separate pairs. A masked value must be at least 8 characters
 with no spaces. The state backend needs no variable: jobs use `CI_JOB_TOKEN`.
 
+| Variable | Value | Flags |
+|---|---|---|
+| `NSX_CA_FILE` | PEM of the CA that signed your NSX managers' certificates | type **File**; needed only for an internal CA |
+
+Terraform otherwise rejects those certificates with `x509: certificate signed
+by unknown authority`. The generated jobs trust GitLab's own CA automatically.
+
+**Read this before you rely on unprotected plan variables.** Anyone who can push
+a branch or open a merge request can run pipeline code that reads every variable
+that is not protected, and masking does not stop a deliberate leak. So the
+`NSX_PLAN_*` account must be genuinely read-only in NSX (an auditor role, never
+the account you apply with), and write access to the project should be limited
+to people you would trust with that read access. Keep the write account in
+`NSX_APPLY_*`, protected, and protect the default branch. Do not put the write
+account in the shared `NSX_USERNAME` / `NSX_PASSWORD` fallback unless you mark
+it protected as well, because an unprotected shared pair is also used by merge
+request plans.
+
 If `CI_API_TOKEN` is absent the pipeline still runs; it just does not comment,
 and the approver reads the plan in the job log instead.
+
+Credentials held in CI/CD variables (`NSX_PLAN_*`, `NSX_APPLY_*`, `NSX_CA_FILE`)
+are wired up for GitLab only. The generated GitHub workflow still takes them
+from Vault; to use plain secrets there, add them to the job's `env:` yourself.
 
 On GitHub the equivalents are repository secrets `VAULT_ADDR`,
 `VAULT_PLAN_TOKEN` and `VAULT_APPLY_TOKEN`; the plan comment uses the built-in
@@ -4708,13 +4730,39 @@ eval "$(python3 "$REPO_ROOT/scripts/ci-matrix.py" --export "$site")"
 export TF_VAR_site="$site"
 export TF_VAR_domain="${TF_VAR_domain:-${NSX_DOMAIN:-default}}"
 export TF_IN_AUTOMATION=1
-# A GitLab that serves its own certificate authority. The runner hands every job
-# that CA as CI_SERVER_TLS_CA_FILE, and git and curl are pointed at it, but
-# Terraform reads the state over HTTPS too and fails with "x509: certificate
-# signed by unknown authority". Go replaces the system roots when SSL_CERT_FILE
-# is set, so the bundle is the system roots plus that CA. A SSL_CERT_FILE that is
-# already set is left alone.
-if [ -z "${SSL_CERT_FILE:-}" ] && [ -n "${CI_SERVER_TLS_CA_FILE:-}" ] && [ -r "$CI_SERVER_TLS_CA_FILE" ]; then
+# Certificate authorities Terraform must trust, beyond the system roots:
+#
+#   CI_SERVER_TLS_CA_FILE  the CA of a GitLab that serves its own certificate.
+#                          The runner gives every job this file and git and curl
+#                          use it, but Terraform reads state over HTTPS too and
+#                          otherwise fails with "x509: certificate signed by
+#                          unknown authority".
+#   NSX_CA_FILE            the CA that signed your NSX managers' certificates.
+#                          In GitLab, a CI/CD variable of type File holding the
+#                          PEM. Without it the NSX provider fails the same way
+#                          against any manager with an internal CA.
+#
+# Go replaces its default root file when SSL_CERT_FILE is set, so the bundle is
+# the system roots plus those CAs. An SSL_CERT_FILE you set yourself is left
+# alone, and then NSX_CA_FILE is not used.
+nsx_ca_file="${NSX_CA_FILE:-}"
+if [ -n "$nsx_ca_file" ]; then
+	[ -f "$nsx_ca_file" ] && [ -r "$nsx_ca_file" ] || {
+		echo "error: NSX_CA_FILE is set to '$nsx_ca_file', which is not a readable file." >&2
+		exit 1
+	}
+	grep -q 'BEGIN CERTIFICATE' "$nsx_ca_file" || {
+		echo "error: NSX_CA_FILE ($nsx_ca_file) holds no PEM certificate." >&2
+		exit 1
+	}
+fi
+gitlab_ca_file=""
+if [ -n "${CI_SERVER_TLS_CA_FILE:-}" ] && [ -r "$CI_SERVER_TLS_CA_FILE" ]; then
+	gitlab_ca_file="$CI_SERVER_TLS_CA_FILE"
+fi
+if [ -n "${SSL_CERT_FILE:-}" ]; then
+	[ -z "$nsx_ca_file" ] || echo "note: SSL_CERT_FILE is already set, so NSX_CA_FILE is not added to it." >&2
+elif [ -n "$gitlab_ca_file$nsx_ca_file" ]; then
 	ca_bundle="$(mktemp "${TMPDIR:-/tmp}/nsx-ca.XXXXXX")"
 	trap 'rm -f "$ca_bundle"' EXIT
 	for roots in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt; do
@@ -4723,7 +4771,10 @@ if [ -z "${SSL_CERT_FILE:-}" ] && [ -n "${CI_SERVER_TLS_CA_FILE:-}" ] && [ -r "$
 			break
 		fi
 	done
-	cat "$CI_SERVER_TLS_CA_FILE" >>"$ca_bundle"
+	for extra in "$gitlab_ca_file" "$nsx_ca_file"; do
+		[ -z "$extra" ] || printf '\n' >>"$ca_bundle"
+		[ -z "$extra" ] || cat "$extra" >>"$ca_bundle"
+	done
 	export SSL_CERT_FILE="$ca_bundle"
 fi
 # Provider mirror, for networks that cannot reach registry.terraform.io (scripts/tf-mirror.sh).
@@ -4882,37 +4933,57 @@ for k in sys.argv[1:]:
     d = d[int(k)] if isinstance(d, list) else d[k]
 print(d)' "$@"; }
 
-# Credential lookup in the environment. Prints "<username-var> <password-var>"
-# for the first prefix whose username and password are both set.
-env_credential_vars() {
-	local key scope prefix u p
+# Credential lookup in the environment. The prefixes are tried in this order and
+# the first whose username and password are BOTH set and not blank wins. SITE is
+# the manager key upper-cased, SCOPE the job's NSX_CRED_SCOPE (PLAN or APPLY).
+env_credential_prefixes() {
+	local key scope
 	key="$(printf '%s' "$SITE" | tr 'a-z' 'A-Z' | tr -c 'A-Z0-9\n' '_')"
 	scope="$(printf '%s' "${NSX_CRED_SCOPE:-}" | tr 'a-z' 'A-Z' | tr -c 'A-Z0-9\n' '_')"
-	for prefix in ${scope:+"NSX_${key}_${scope}"} "NSX_${key}" ${scope:+"NSX_${scope}"} NSX; do
+	[ -z "$scope" ] || printf 'NSX_%s_%s\n' "$key" "$scope"
+	printf 'NSX_%s\n' "$key"
+	[ -z "$scope" ] || printf 'NSX_%s\n' "$scope"
+	printf 'NSX\n'
+}
+
+# Prints "<username-var> <password-var>" for the first complete pair.
+env_credential_vars() {
+	local prefix u p
+	while IFS= read -r prefix; do
 		u="${prefix}_USERNAME"
 		p="${prefix}_PASSWORD"
-		if [ -n "${!u:-}" ] && [ -n "${!p:-}" ]; then
+		if [[ "${!u:-}" =~ [^[:space:]] && "${!p:-}" =~ [^[:space:]] ]]; then
 			printf '%s %s\n' "$u" "$p"
 			return 0
 		fi
-	done
+	done < <(env_credential_prefixes)
 	return 1
+}
+
+# The message an operator needs when nothing matched: what was looked for.
+no_credentials_message() {
+	local prefix list=""
+	while IFS= read -r prefix; do
+		list="${list:+$list, }${prefix}_USERNAME/_PASSWORD"
+	done < <(env_credential_prefixes)
+	printf "no NSX credentials for '%s'%s. Looked for %s (both of a pair, not blank). Or set VAULT_ADDR and VAULT_TOKEN. Variables must be visible to this job: protected variables are not available to merge request pipelines." \
+		"$SITE" "${NSX_CRED_SCOPE:+ (scope: $NSX_CRED_SCOPE)}" "$list"
 }
 
 if [ "$SOURCE" = auto ]; then
 	if [ -n "${VAULT_ADDR:-}" ]; then
 		SOURCE=vault
 	elif env_credential_vars >/dev/null; then
-		SOURCE=env
+		SOURCE="env"
 	else
-		die "no NSX credentials for '$SITE'. Set VAULT_ADDR and VAULT_TOKEN, or set NSX_USERNAME and NSX_PASSWORD (or per-site NSX_<SITE>_USERNAME / _PASSWORD) as masked CI/CD variables."
+		die "$(no_credentials_message)"
 	fi
 fi
 
 case "$SOURCE" in
 env)
-	read -r u_var p_var <<<"$(env_credential_vars)" ||
-		die "no NSX credential variables set for '$SITE' (looked for NSX_<SITE>[_<SCOPE>]_USERNAME / _PASSWORD and NSX_USERNAME / _PASSWORD)"
+	pair="$(env_credential_vars)" || die "$(no_credentials_message)"
+	read -r u_var p_var <<<"$pair"
 	NSXT_USERNAME="${!u_var}"
 	NSXT_PASSWORD="${!p_var}"
 	;;
@@ -7971,11 +8042,20 @@ summary() {
 Change that password at first login.
 
 Next, so the pipeline can reach your NSX managers — Settings -> CI/CD ->
-Variables in the project:
+Variables in the project. Either Vault:
 
   VAULT_ADDR          your Vault endpoint            masked
   VAULT_PLAN_TOKEN    a READ-ONLY token              masked
   VAULT_APPLY_TOKEN   a write token                  masked, PROTECTED
+
+or the credentials themselves, held in GitLab:
+
+  NSX_PLAN_USERNAME / NSX_PLAN_PASSWORD     a READ-ONLY NSX account   masked
+  NSX_APPLY_USERNAME / NSX_APPLY_PASSWORD   a write NSX account       masked, PROTECTED
+  NSX_CA_FILE         CA of your NSX managers, if internal            type File
+
+and, for plan comments on merge requests:
+
   CI_API_TOKEN        project token, 'api' scope     masked
 
 Then protect the default branch (Settings -> Repository -> Protected branches)
@@ -9402,7 +9482,7 @@ write_file scripts/readiness.sh <<'SCAFFOLD_EOF'
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO_ROOT"
+cd "$REPO_ROOT" || exit 1
 
 QUIET=0
 [ "${1:-}" = "--quiet" ] && QUIET=1
@@ -9560,8 +9640,9 @@ say ""
 say "=== cannot be checked from here ============================"
 manual "branch protection on the default branch, so nobody can push to it"
 manual "an approval requirement on merge/pull requests"
-manual "VAULT_ADDR and a READ-ONLY VAULT_PLAN_TOKEN in the CI settings"
-manual "VAULT_APPLY_TOKEN, marked PROTECTED so only protected branches can apply"
+manual "NSX credentials for merge request plans, READ-ONLY: VAULT_ADDR with VAULT_PLAN_TOKEN, or NSX_PLAN_USERNAME / NSX_PLAN_PASSWORD (masked, not protected)"
+manual "the apply credential, PROTECTED so only protected branches can apply: VAULT_APPLY_TOKEN, or NSX_APPLY_USERNAME / NSX_APPLY_PASSWORD"
+manual "NSX_CA_FILE (a CI/CD variable of type File) when the NSX managers use an internal certificate authority"
 manual "a protected environment (GitLab) or required reviewers (GitHub) on apply"
 manual "a terraform plan actually run against a manager — schema validity is not API validity"
 

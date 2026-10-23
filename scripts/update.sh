@@ -317,6 +317,27 @@ if [ "${#LOCAL[@]}" -gt 0 ]; then
 	printf '  = %s\n' "${LOCAL[@]}"
 fi
 
+# The last thing printed when files were kept. A conflict listed in the middle of
+# a long diff is easy to miss, and a kept file means part of the release does not
+# take effect, so it is repeated at the end with what to do about it.
+report_kept() {
+	[ "$OVERWRITE_UNKNOWN" = 1 ] && return 0
+	[ "${#CONFLICT[@]}" -gt 0 ] || return 0
+	say ""
+	say "================================================================"
+	say "ATTENTION: ${#CONFLICT[@]} file(s) were NOT updated, because they differ from the generator:"
+	printf '  ! %s\n' "${CONFLICT[@]}"
+	say ""
+	say "This release changes them, so those changes are not in effect yet."
+	say "Read the diffs above. If the difference is only an earlier copy of a"
+	say "generator change (for example a fix you applied by hand), take the"
+	say "generator's version; the original is backed up first:"
+	say "  scripts/update.sh --dir $TARGET --overwrite-unknown"
+	say "If it is a change you meant to keep, keep it and port the generator's"
+	say "change into it by hand."
+	say "================================================================"
+}
+
 TO_APPLY=(${NEW[@]+"${NEW[@]}"} ${UPDATE[@]+"${UPDATE[@]}"})
 [ "$OVERWRITE_UNKNOWN" = 1 ] && TO_APPLY+=(${CONFLICT[@]+"${CONFLICT[@]}"})
 
@@ -329,6 +350,7 @@ if [ "${#TO_APPLY[@]}" -eq 0 ]; then
 	fi
 	converge
 	crc=$?
+	[ "$CHECK" = 1 ] || report_kept
 	if [ "$CHECK" = 1 ]; then
 		[ "${#CONFLICT[@]}" -gt 0 ] && exit 3
 		[ "$crc" -ne 0 ] && exit 4
@@ -465,4 +487,5 @@ elif git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
 	say "review with 'git -C $TARGET diff', then commit on a branch and open a merge request."
 fi
 
+report_kept
 exit "$crc"

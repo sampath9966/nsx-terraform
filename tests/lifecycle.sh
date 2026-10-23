@@ -45,7 +45,9 @@ check "estate data is never listed" bash -c "! grep -q 'inventory/managers' <<<\
 git_quiet -C "$A" add -A && git_quiet -C "$A" commit -m "local edits"
 
 echo "unrelated file" >"$A/scratch-notes.txt"        # untracked, must not be swept into the commit
-"$UP" --no-converge --no-pull --dir "$A" --yes --commit --summary >/dev/null 2>&1
+upd_out="$("$UP" --no-converge --no-pull --dir "$A" --yes --commit --summary 2>&1)"
+check "a kept conflict is repeated in a banner at the very end" bash -c 'tail -14 <<<"$1" | grep -q "ATTENTION" && tail -14 <<<"$1" | grep -q "! modules/group/main.tf"' _ "$upd_out"
+check "the banner gives the exact command to take the generator's version" grep -q -- "--overwrite-unknown" <<<"$upd_out"
 check "--commit puts the update on a branch" test "$(git -C "$A" branch --show-current)" = "update/$(git -C "$GEN" rev-parse --short HEAD)"
 check "unrelated untracked files are not committed" bash -c "! git -C '$A' show --stat HEAD | grep -q scratch-notes"
 check "README (yours) untouched" test "$(tail -1 "$A/README.md")" = "# mine"
@@ -66,7 +68,8 @@ check "…and reuse the branch they already have" test "$(git -C "$B" branch --s
 git_quiet -C "$A" checkout main
 "$UP" --no-converge --no-pull --dir "$A" --check --summary >/dev/null 2>&1
 check "after applying, only the conflict remains (exit 3)" test $? -eq 3
-"$UP" --no-converge --no-pull --dir "$A" --yes --overwrite-unknown --summary >/dev/null 2>&1
+ow_out="$("$UP" --no-converge --no-pull --dir "$A" --yes --overwrite-unknown --summary 2>&1)"
+check "no banner once nothing was kept" bash -c '! grep -q ATTENTION <<<"$1"' _ "$ow_out"
 "$UP" --no-converge --no-pull --dir "$A" --check >/dev/null 2>&1
 check "after --overwrite-unknown: up to date" test $? -eq 0
 

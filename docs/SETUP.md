@@ -359,9 +359,22 @@ data source: the `vault_*` data sources write the fetched secret into state in
 plaintext.
 
 `scripts/with-credentials.sh` fetches outside Terraform and execs with `NSXT_*`
-in the environment. It assumes Vault KV v2 at the path recorded per manager in
-`inventory/managers.yaml`; the mount convention and auth method are yours to
-set. `vault_path` records **where the credential lives, never the credential**.
+in the environment. There are two sources, chosen automatically (Vault when
+`VAULT_ADDR` is set, otherwise the environment):
+
+- **Vault.** It assumes KV v2 at the path recorded per manager in
+  `inventory/managers.yaml`; the mount convention and auth method are yours to
+  set. `vault_path` records **where the credential lives, never the credential**.
+- **GitLab CI/CD variables.** `NSX_PLAN_USERNAME` / `NSX_PLAN_PASSWORD` for
+  merge request plans and `NSX_APPLY_USERNAME` / `NSX_APPLY_PASSWORD` for apply,
+  or per manager as `NSX_<SITE>_PLAN_USERNAME` and so on (`hyd-gm01` is
+  `HYD_GM01`). The exact lookup order, and why unprotected plan variables need a
+  read-only NSX account, are in `docs/GITOPS.md`.
+
+If the NSX managers use an internal certificate authority, give the pipeline its
+PEM as a CI/CD variable `NSX_CA_FILE` of type File. Run by hand, set
+`SSL_CERT_FILE` to a bundle that holds your CA and, for a GitLab with its own CA,
+GitLab's too.
 
 ### 2.4 Who tags the workloads — decide before writing group criteria
 
