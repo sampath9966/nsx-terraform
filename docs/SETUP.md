@@ -371,8 +371,12 @@ in the environment. There are two sources, chosen automatically (Vault when
   `HYD_GM01`). The exact lookup order, and why unprotected plan variables need a
   read-only NSX account, are in `docs/GITOPS.md`.
 
-If the NSX managers use an internal certificate authority, give the pipeline its
-PEM as a CI/CD variable `NSX_CA_FILE` of type File. Run by hand, set
+If a manager's certificate comes from an internal CA, or is self-signed, give
+the pipeline that PEM as a CI/CD variable of type File: `NSX_CA_FILE_<SITE>` for
+that manager (`hyd-gm01` is `NSX_CA_FILE_HYD_GM01`), or `NSX_CA_FILE` for every
+manager without its own. Check first that the certificate lists the manager's
+name or address as a Subject Alternative Name; one with only a Common Name is
+rejected whatever you trust (`docs/GITOPS.md` shows the one-line check). Run by hand, set
 `SSL_CERT_FILE` to a bundle that holds your CA and, for a GitLab with its own CA,
 GitLab's too.
 

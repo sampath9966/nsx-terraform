@@ -13,6 +13,16 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.2.9
+
+**Each NSX manager can have its own certificate authority.** Set `NSX_CA_FILE_<SITE>` (a CI/CD variable of type File; `hyd-gm01` is `NSX_CA_FILE_HYD_GM01`, the same naming as the credentials) to the PEM of the CA that signed that manager's certificate, or to the certificate itself if the manager is self-signed. It wins over `NSX_CA_FILE`, so each manager's run trusts only its own CA; `NSX_CA_FILE` remains the default for managers without their own, and may hold several PEMs. Nothing changes for a tree that uses `NSX_CA_FILE` today.
+
+**The importer's capture now trusts the same CA files.** `scripts/import-estate.py` read the manager with Python's default trust only, so capturing a manager with an internal or self-signed certificate failed even with `NSX_CA_FILE` set; its hint suggested `--insecure`. It now uses `NSX_CA_FILE_<SITE>`, then `NSX_CA_FILE`, and the hint names the variable to set. It also no longer applies Python 3.13's strict X.509 checks, which reject internal CAs that lack a keyUsage extension: Terraform accepts those, so the capture and the plan would have disagreed about the same manager. The chain and the hostname are still verified.
+
+**A certificate with only a Common Name is rejected whatever you trust** (`x509: certificate relies on legacy Common Name field`), by Terraform and by current Python alike. `docs/GITOPS.md` has a one-line `openssl` check to run against each manager before you start; such a certificate has to be replaced on the manager.
+
+**Tests:** `tests/brownfield-provider.sh` now verifies TLS for real: the mock manager presents a certificate from its own CA, trusted through `NSX_CA_FILE_<SITE>`, and a manager signed by another CA is refused by the real provider. `TEST_EXTRA_CA` adds a TLS-inspecting proxy's CA for provider downloads where one is in the way. The offline suite checks the per-manager choice in `tf.sh` and a real TLS capture against the mock.
+
 ## 1.2.8
 
 Adopting an existing estate safely, one policy of one manager at a time, and hardening found in a review before production use. A tree on Vault needs no action. Read **"Fixed: dangerous"** below if anyone runs `scripts/tf.sh` by hand for more than one manager from the same checkout.

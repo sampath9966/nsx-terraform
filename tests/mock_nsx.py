@@ -38,6 +38,10 @@ class H(BaseHTTPRequestHandler):
             found = [o for o in objs.values() if o.get("resource_type") == "Service"
                      and (wanted is None or fnmatch.fnmatchcase(o.get("display_name", ""), wanted))]
             return self.send(200, {"results": found, "result_count": len(found)})
+        # A collection (.../groups, .../security-policies): its direct children.
+        children = [o for k, o in objs.items() if k.startswith(path + "/") and "/" not in k[len(path) + 1:]]
+        if children:
+            return self.send(200, {"results": children, "result_count": len(children)})
         return self.send(404, {"error_code": 600, "error_message": f"mock: {path} not found"})
     def write(self):
         log.write(f"WRITE {self.command} {self.path}\n"); log.flush()

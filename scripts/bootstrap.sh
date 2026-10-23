@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.2.8"
+VERSION="1.2.9"
 
 ROOT="$PWD"
 FORCE=0
@@ -2024,10 +2024,25 @@ with no spaces. The state backend needs no variable: jobs use `CI_JOB_TOKEN`.
 
 | Variable | Value | Flags |
 |---|---|---|
-| `NSX_CA_FILE` | PEM of the CA that signed your NSX managers' certificates | type **File**; needed only for an internal CA |
+| `NSX_CA_FILE_<SITE>` | PEM of the CA that signed **that** manager's certificate, or the certificate itself if self-signed. `hyd-gm01` is `NSX_CA_FILE_HYD_GM01` | type **File**; needed for an internal CA or a self-signed manager |
+| `NSX_CA_FILE` | the same, for every manager without its own; several PEMs in one file trust all of them | type **File** |
 
-Terraform otherwise rejects those certificates with `x509: certificate signed
-by unknown authority`. The generated jobs trust GitLab's own CA automatically.
+A per-manager file wins, so where each manager has its own CA, each run trusts
+only that one. Without either, Terraform rejects the certificate with `x509:
+certificate signed by unknown authority`. The generated jobs trust GitLab's own
+CA automatically.
+
+A manager certificate with only a Common Name and no Subject Alternative Name is
+rejected whatever you trust (`x509: certificate relies on legacy Common Name
+field`). Check before you start, from any machine that reaches the manager:
+
+```bash
+openssl s_client -connect <manager>:443 -showcerts </dev/null 2>/dev/null |
+  openssl x509 -noout -subject -issuer -ext subjectAltName
+```
+
+The SAN must list the name or address in `inventory/managers.yaml`; if it does
+not, replace the certificate on the manager. Do not turn verification off.
 
 **Read this before you rely on unprotected plan variables.** Anyone who can push
 a branch or open a merge request can run pipeline code that reads every variable
@@ -2043,7 +2058,7 @@ request plans.
 If `CI_API_TOKEN` is absent the pipeline still runs; it just does not comment,
 and the approver reads the plan in the job log instead.
 
-Credentials held in CI/CD variables (`NSX_PLAN_*`, `NSX_APPLY_*`, `NSX_CA_FILE`)
+Credentials held in CI/CD variables (`NSX_PLAN_*`, `NSX_APPLY_*`, `NSX_CA_FILE*`)
 are wired up for GitLab only. The generated GitHub workflow still takes them
 from Vault; to use plain secrets there, add them to the job's `env:` yourself.
 
@@ -4811,22 +4826,32 @@ export TF_IN_AUTOMATION=1
 #                          use it, but Terraform reads state over HTTPS too and
 #                          otherwise fails with "x509: certificate signed by
 #                          unknown authority".
-#   NSX_CA_FILE            the CA that signed your NSX managers' certificates.
-#                          In GitLab, a CI/CD variable of type File holding the
-#                          PEM. Without it the NSX provider fails the same way
-#                          against any manager with an internal CA.
+#   NSX_CA_FILE_<SITE>     the CA that signed THIS manager's certificate, or the
+#                          manager's own certificate if it is self-signed. SITE
+#                          is the manager key upper-cased, as for credentials
+#                          (hyd-gm01 is NSX_CA_FILE_HYD_GM01). In GitLab, a CI/CD
+#                          variable of type File holding the PEM.
+#   NSX_CA_FILE            the same, for every manager without its own. Several
+#                          PEMs in one file trust all of them.
+#
+# A per-manager file wins, so each manager's run trusts only its own CA. Without
+# either, the NSX provider fails with "x509: certificate signed by unknown
+# authority" against any manager with an internal or self-signed certificate.
 #
 # Go replaces its default root file when SSL_CERT_FILE is set, so the bundle is
 # the system roots plus those CAs. An SSL_CERT_FILE you set yourself is left
-# alone, and then NSX_CA_FILE is not used.
-nsx_ca_file="${NSX_CA_FILE:-}"
+# alone, and then no NSX CA file is used.
+site_key="$(printf '%s' "$site" | tr 'a-z' 'A-Z' | tr -c 'A-Z0-9\n' '_')"
+nsx_ca_var="NSX_CA_FILE_${site_key}"
+[ -n "${!nsx_ca_var:-}" ] || nsx_ca_var=NSX_CA_FILE
+nsx_ca_file="${!nsx_ca_var:-}"
 if [ -n "$nsx_ca_file" ]; then
 	[ -f "$nsx_ca_file" ] && [ -r "$nsx_ca_file" ] || {
-		echo "error: NSX_CA_FILE is set to '$nsx_ca_file', which is not a readable file." >&2
+		echo "error: $nsx_ca_var is set to '$nsx_ca_file', which is not a readable file." >&2
 		exit 1
 	}
 	grep -q 'BEGIN CERTIFICATE' "$nsx_ca_file" || {
-		echo "error: NSX_CA_FILE ($nsx_ca_file) holds no PEM certificate." >&2
+		echo "error: $nsx_ca_var ($nsx_ca_file) holds no PEM certificate." >&2
 		exit 1
 	}
 fi
@@ -4835,7 +4860,7 @@ if [ -n "${CI_SERVER_TLS_CA_FILE:-}" ] && [ -r "$CI_SERVER_TLS_CA_FILE" ]; then
 	gitlab_ca_file="$CI_SERVER_TLS_CA_FILE"
 fi
 if [ -n "${SSL_CERT_FILE:-}" ]; then
-	[ -z "$nsx_ca_file" ] || echo "note: SSL_CERT_FILE is already set, so NSX_CA_FILE is not added to it." >&2
+	[ -z "$nsx_ca_file" ] || echo "note: SSL_CERT_FILE is already set, so $nsx_ca_var is not added to it." >&2
 elif [ -n "$gitlab_ca_file$nsx_ca_file" ]; then
 	ca_bundle="$(mktemp "${TMPDIR:-/tmp}/nsx-ca.XXXXXX")"
 	trap 'rm -f "$ca_bundle"' EXIT
@@ -6923,6 +6948,22 @@ LM_BASE = "/policy/api/v1/infra"
 # Fetching
 # --------------------------------------------------------------------------
 
+CA_SITE = ""  # set in main(): the manager whose CA file applies
+
+
+def nsx_ca_file() -> str | None:
+    """The CA to trust for this manager, as scripts/tf.sh chooses it:
+    NSX_CA_FILE_<SITE> first, then NSX_CA_FILE."""
+    key = re.sub(r"[^A-Z0-9]", "_", CA_SITE.upper())
+    for name in (f"NSX_CA_FILE_{key}", "NSX_CA_FILE"):
+        path = os.environ.get(name)
+        if path:
+            if not os.path.isfile(path):
+                sys.exit(f"error: {name} is set to '{path}', which is not a readable file")
+            return path
+    return None
+
+
 def api_get(host: str, path: str, user: str, password: str, insecure: bool) -> dict:
     url = f"https://{host}{path}"
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
@@ -6933,6 +6974,14 @@ def api_get(host: str, path: str, user: str, password: str, insecure: bool) -> d
     request.add_header("Authorization", f"Basic {token}")
 
     context = ssl.create_default_context()
+    # Python 3.13 turned on RFC 5280 strict checks, which reject internal CAs that
+    # lack a keyUsage extension. Terraform's Go TLS stack accepts them, and so did
+    # Python before 3.13; without this the capture and the plan would disagree
+    # about the same manager. The chain and the hostname are still verified.
+    context.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    ca_file = nsx_ca_file()
+    if ca_file:
+        context.load_verify_locations(cafile=ca_file)
     if insecure:
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
@@ -6946,8 +6995,9 @@ def api_get(host: str, path: str, user: str, password: str, insecure: bool) -> d
         hint = ""
         if "CERTIFICATE_VERIFY_FAILED" in str(exc.reason):
             hint = (
-                "\n       The manager is presenting a certificate this machine does not trust. "
-                "Install the CA, or re-run with --insecure if you accept the risk on a lab."
+                "\n       The manager is presenting a certificate this machine does not trust. Point "
+                f"NSX_CA_FILE_{re.sub(r'[^A-Z0-9]', '_', CA_SITE.upper())} (or NSX_CA_FILE) at the PEM of "
+                "its CA, or of the certificate itself if it is self-signed. --insecure is for a lab only."
             )
         sys.exit(f"error: cannot reach {host}: {exc.reason}{hint}")
 
@@ -7438,6 +7488,8 @@ def main() -> int:
                     help="name for this piece of work, used in the file names (default: the first --policy, or 'all')")
     args = ap.parse_args()
     tranche = args.tranche or (args.policy[0] if args.policy else "all")
+    global CA_SITE
+    CA_SITE = args.site
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", tranche):
         sys.exit(f"error: --tranche '{tranche}' must be letters, digits, '.', '_' or '-'")
 
@@ -8709,7 +8761,8 @@ or the credentials themselves, held in GitLab:
 
   NSX_PLAN_USERNAME / NSX_PLAN_PASSWORD     a READ-ONLY NSX account   masked
   NSX_APPLY_USERNAME / NSX_APPLY_PASSWORD   a write NSX account       masked, PROTECTED
-  NSX_CA_FILE         CA of your NSX managers, if internal            type File
+  NSX_CA_FILE_<SITE>  CA of that manager, if internal or self-signed  type File
+                      (NSX_CA_FILE: the same for every other manager)
 
 and, for plan comments on merge requests:
 
@@ -10305,7 +10358,7 @@ manual "branch protection on the default branch, so nobody can push to it"
 manual "an approval requirement on merge/pull requests"
 manual "NSX credentials for merge request plans, READ-ONLY: VAULT_ADDR with VAULT_PLAN_TOKEN, or NSX_PLAN_USERNAME / NSX_PLAN_PASSWORD (masked, not protected)"
 manual "the apply credential, PROTECTED so only protected branches can apply: VAULT_APPLY_TOKEN, or NSX_APPLY_USERNAME / NSX_APPLY_PASSWORD"
-manual "NSX_CA_FILE (a CI/CD variable of type File) when the NSX managers use an internal certificate authority"
+manual "NSX_CA_FILE_<SITE> per manager, or NSX_CA_FILE for all (CI/CD variables of type File), when a manager's certificate is internal or self-signed"
 manual "a protected environment (GitLab) or required reviewers (GitHub) on apply"
 manual "a terraform plan actually run against a manager — schema validity is not API validity"
 
