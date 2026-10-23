@@ -13,6 +13,10 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.2.8
+
+**Plan jobs failed with `x509: certificate signed by unknown authority` when Terraform read its state from a GitLab that uses its own certificate authority.** The runner gives every job that CA as `CI_SERVER_TLS_CA_FILE`, and git and curl already used it, but Terraform did not. `scripts/tf.sh` now builds a bundle from the system roots plus that CA and sets `SSL_CERT_FILE` to it for the run. A `SSL_CERT_FILE` you set yourself is left alone. Run by hand outside CI, set `SSL_CERT_FILE` to a bundle that includes your GitLab CA.
+
 ## 1.2.7
 
 **NSX credentials can come from masked GitLab CI/CD variables, with nothing stored on the runner host.** `scripts/with-credentials.sh` now defaults to `--from auto`: Vault when `VAULT_ADDR` is set (unchanged), otherwise the environment, otherwise an error that names the variables to set. In the environment the first complete pair wins: `NSX_<SITE>_<SCOPE>_USERNAME` / `_PASSWORD`, then `NSX_<SITE>_...`, then `NSX_<SCOPE>_...`, then `NSX_USERNAME` / `NSX_PASSWORD`, where SITE is the manager key upper-cased (`hyd-gm01` becomes `HYD_GM01`) and SCOPE is `PLAN` or `APPLY`. The generated plan and apply jobs set `NSX_CRED_SCOPE`, so a read-only NSX account can sit in unprotected `NSX_PLAN_*` variables for merge request plans and the write account in protected `NSX_APPLY_*` variables. The GitLab state backend needs no secret: jobs use `CI_JOB_TOKEN`. Existing Vault setups need no change.

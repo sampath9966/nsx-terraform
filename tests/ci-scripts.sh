@@ -171,6 +171,22 @@ check "a username with no password is ignored" grep -q "no NSX credentials" <<<"
 check "VAULT_ADDR still selects Vault" grep -q "VAULT_TOKEN is not set" <<<"$(wc VAULT_ADDR=http://x NSX_USERNAME=a NSX_PASSWORD=b)"
 check "the child pipeline tells each job its credential scope" grep -q 'NSX_CRED_SCOPE: plan' <<<"$(cd "$T" && python3 scripts/gitlab-child-pipeline.py)"
 
+# Terraform reads state from GitLab over HTTPS and must trust GitLab's own CA.
+printf 'address = "https://gitlab.test/state"\n' >"$T/envs/hyd-gm01.backend.hcl"
+mkdir -p "$SCRATCH/faketf"
+cat >"$SCRATCH/faketf/terraform" <<'STUB'
+#!/usr/bin/env bash
+echo "SSL_CERT_FILE=${SSL_CERT_FILE:-unset}"
+[ -n "${SSL_CERT_FILE:-}" ] && [ -r "$SSL_CERT_FILE" ] && grep -q GITLAB-CA "$SSL_CERT_FILE" && echo "bundle-has-gitlab-ca"
+exit 0
+STUB
+chmod +x "$SCRATCH/faketf/terraform"
+printf '%s\n' '-----BEGIN CERTIFICATE-----' 'GITLAB-CA' '-----END CERTIFICATE-----' >"$SCRATCH/gl.crt"
+tfenv() { (cd "$T" && env -u SSL_CERT_FILE PATH="$SCRATCH/faketf:$PATH" "$@" scripts/tf.sh init global-security hyd-gm01 2>/dev/null); }
+check "terraform is given a bundle holding the GitLab CA" grep -q "bundle-has-gitlab-ca" <<<"$(tfenv CI_SERVER_TLS_CA_FILE="$SCRATCH/gl.crt")"
+check "a SSL_CERT_FILE already set is left alone" grep -q "SSL_CERT_FILE=/already/set" <<<"$(tfenv CI_SERVER_TLS_CA_FILE="$SCRATCH/gl.crt" SSL_CERT_FILE=/already/set)"
+check "without the runner's CA nothing is set" grep -q "SSL_CERT_FILE=unset" <<<"$(tfenv X=1)"
+
 # Git is given only the runner's tls-ca-file. That file has to carry the host
 # trust store as well, or a TLS-inspecting proxy fails every clone.
 printf '%s\n' '-----BEGIN CERTIFICATE-----' 'GITLAB-CA' '-----END CERTIFICATE-----' >"$SCRATCH/ca.crt"

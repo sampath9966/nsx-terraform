@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.2.7"
+VERSION="1.2.8"
 
 ROOT="$PWD"
 FORCE=0
@@ -4708,6 +4708,24 @@ eval "$(python3 "$REPO_ROOT/scripts/ci-matrix.py" --export "$site")"
 export TF_VAR_site="$site"
 export TF_VAR_domain="${TF_VAR_domain:-${NSX_DOMAIN:-default}}"
 export TF_IN_AUTOMATION=1
+# A GitLab that serves its own certificate authority. The runner hands every job
+# that CA as CI_SERVER_TLS_CA_FILE, and git and curl are pointed at it, but
+# Terraform reads the state over HTTPS too and fails with "x509: certificate
+# signed by unknown authority". Go replaces the system roots when SSL_CERT_FILE
+# is set, so the bundle is the system roots plus that CA. A SSL_CERT_FILE that is
+# already set is left alone.
+if [ -z "${SSL_CERT_FILE:-}" ] && [ -n "${CI_SERVER_TLS_CA_FILE:-}" ] && [ -r "$CI_SERVER_TLS_CA_FILE" ]; then
+	ca_bundle="$(mktemp "${TMPDIR:-/tmp}/nsx-ca.XXXXXX")"
+	trap 'rm -f "$ca_bundle"' EXIT
+	for roots in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt; do
+		if [ -r "$roots" ]; then
+			cat "$roots" >>"$ca_bundle"
+			break
+		fi
+	done
+	cat "$CI_SERVER_TLS_CA_FILE" >>"$ca_bundle"
+	export SSL_CERT_FILE="$ca_bundle"
+fi
 # Provider mirror, for networks that cannot reach registry.terraform.io (scripts/tf-mirror.sh).
 if [ -f "$REPO_ROOT/scripts/tf-mirror.sh" ]; then
 	# shellcheck source=scripts/tf-mirror.sh
