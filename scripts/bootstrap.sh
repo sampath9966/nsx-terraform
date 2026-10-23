@@ -4005,8 +4005,8 @@ gen_backend() {
 # the token would be committed with it. Terraform reads them from the
 # environment instead:
 #
-#   export TF_HTTP_USERNAME=gitlab-ci-token
-#   export TF_HTTP_PASSWORD="$CI_JOB_TOKEN"     # in GitLab CI
+#   in GitLab CI scripts/tf.sh sets TF_HTTP_USERNAME=gitlab-ci-token and
+#   TF_HTTP_PASSWORD=$CI_JOB_TOKEN itself; set them only to override that
 #
 # Outside CI use a personal or project access token with the api scope, sourced
 # the same way the NSX credentials are — never written to disk.
@@ -4846,6 +4846,14 @@ eval "$(python3 "$REPO_ROOT/scripts/ci-matrix.py" --export "$site")"
 export TF_VAR_site="$site"
 export TF_VAR_domain="${TF_VAR_domain:-${NSX_DOMAIN:-default}}"
 export TF_IN_AUTOMATION=1
+# GitLab-managed state: inside a GitLab job, authenticate to the state API with
+# the job's own token, so no state credential is stored anywhere. Credentials
+# set explicitly (TF_HTTP_USERNAME / TF_HTTP_PASSWORD) are left alone; run by
+# hand outside CI, set them to a token with the api scope.
+if [ -n "${CI_JOB_TOKEN:-}" ] && [ -z "${TF_HTTP_PASSWORD:-}" ]; then
+	export TF_HTTP_USERNAME=gitlab-ci-token
+	export TF_HTTP_PASSWORD="$CI_JOB_TOKEN"
+fi
 # Certificate authorities Terraform must trust, beyond the system roots:
 #
 #   CI_SERVER_TLS_CA_FILE  the CA of a GitLab that serves its own certificate.
@@ -8334,8 +8342,8 @@ write_file envs/example.backend.hcl.example <<'SCAFFOLD_EOF'
 # retry_wait_min = 5
 #
 # Credentials from the environment, never here:
-#   export TF_HTTP_USERNAME=gitlab-ci-token
-#   export TF_HTTP_PASSWORD="$CI_JOB_TOKEN"
+#   in GitLab CI scripts/tf.sh sets TF_HTTP_USERNAME=gitlab-ci-token and
+#   TF_HTTP_PASSWORD=$CI_JOB_TOKEN itself; set them only to override that
 # Outside CI, a project access token with the api scope in place of the job token.
 
 # --- example: s3 (also MinIO or Ceph RGW, with endpoint set) ---------------

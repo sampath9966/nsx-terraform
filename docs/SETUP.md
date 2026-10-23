@@ -211,12 +211,10 @@ retry_wait_min = 5
 The state **name** at the end of the address must be unique per stack per
 manager — that is what keeps `lon1-local-security` and `lon1-local-tags` apart.
 
-Credentials never go in that file, because it is committed:
-
-```bash
-export TF_HTTP_USERNAME=gitlab-ci-token
-export TF_HTTP_PASSWORD="$CI_JOB_TOKEN"     # in GitLab CI
-```
+Credentials never go in that file, because it is committed. In a GitLab job
+`scripts/tf.sh` authenticates with the job's own token (`gitlab-ci-token` and
+`CI_JOB_TOKEN`), so nothing needs storing; set `TF_HTTP_USERNAME` and
+`TF_HTTP_PASSWORD` yourself only to override that.
 
 Outside CI, use a project access token with the `api` scope, sourced the same
 way NSX credentials are. `make validate` errors if a credential appears in
