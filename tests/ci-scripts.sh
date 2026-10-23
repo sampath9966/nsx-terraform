@@ -147,6 +147,9 @@ check "--print-env gives KEY=VALUE lines for docker --env-file" grep -q "^https_
 check "every job clears the image entrypoint" grep -q 'entrypoint: \[""\]' "$T/.gitlab-ci.yml"
 child="$(cd "$T" && python3 scripts/gitlab-child-pipeline.py)"
 check "the child pipeline clears it too" grep -q 'entrypoint: \[""\]' <<<"$child"
+# A child of a merge request pipeline is a merge request pipeline; jobs with no
+# rules default to 'only: branches, tags' and are all filtered out of it.
+check "the child pipeline is not filtered out of merge request pipelines" grep -qE '^workflow:' <<<"$child"
 
 # Git is given only the runner's tls-ca-file. That file has to carry the host
 # trust store as well, or a TLS-inspecting proxy fails every clone.

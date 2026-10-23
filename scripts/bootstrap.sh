@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.2.5"
+VERSION="1.2.6"
 
 ROOT="$PWD"
 FORCE=0
@@ -9881,6 +9881,7 @@ def main() -> int:
     if not rows:
         # An empty inventory must not fail the pipeline: a fresh repository has
         # no managers yet, and there is nothing to plan.
+        print("workflow:\n  rules:\n    - when: always\n")
         print("no-managers:")
         print("  stage: plan")
         print("\n".join(image_block("  ")))
@@ -9890,6 +9891,14 @@ def main() -> int:
 
     out: list[str] = []
     out.append("stages: [plan, apply]")
+    out.append("")
+    # A child of a merge request pipeline is itself a merge request pipeline.
+    # Jobs with no rules default to 'only: branches, tags', which GitLab leaves
+    # out of one, so without this every job is filtered and the trigger fails
+    # with "the resulting pipeline would have been empty".
+    out.append("workflow:")
+    out.append("  rules:")
+    out.append("    - when: always")
     out.append("")
     out.append("default:")
     # The same image as the parent pipeline, where it is a CI/CD variable.
