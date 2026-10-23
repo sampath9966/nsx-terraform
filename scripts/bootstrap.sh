@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.2.6"
+VERSION="1.2.7"
 
 ROOT="$PWD"
 FORCE=0
@@ -1969,6 +1969,20 @@ rather than a trap.
 | `VAULT_APPLY_TOKEN` | write token | masked, **protected** |
 | `CI_API_TOKEN` | project token, `api` scope, so plans can be posted to the MR | masked |
 | `NSX_APPLY_MODE` | `manual` (default) or `auto` | optional |
+
+Without Vault, put the NSX credentials in GitLab instead. The first complete
+pair wins, where `<SITE>` is the manager key upper-cased (`hyd-gm01` is
+`HYD_GM01`):
+
+| Variable pair | Flags |
+|---|---|
+| `NSX_<SITE>_PLAN_USERNAME` / `_PASSWORD`, or `NSX_PLAN_...` for every manager | masked; a **read-only** NSX account |
+| `NSX_<SITE>_APPLY_USERNAME` / `_PASSWORD`, or `NSX_APPLY_...` | masked, **protected** |
+| `NSX_<SITE>_USERNAME` / `_PASSWORD`, or `NSX_USERNAME` / `_PASSWORD` | fallback for both; masked |
+
+Plan jobs on a merge request cannot read protected variables, which is why plan
+and apply have separate pairs. A masked value must be at least 8 characters
+with no spaces. The state backend needs no variable: jobs use `CI_JOB_TOKEN`.
 
 If `CI_API_TOKEN` is absent the pipeline still runs; it just does not comment,
 and the approver reads the plan in the job log instead.
@@ -4778,8 +4792,22 @@ write_file scripts/with-credentials.sh <<'SCAFFOLD_EOF'
 #   * TF_VAR_* values that reach a provider or resource argument land in state
 #     and in saved plan files. 'sensitive = true' only redacts CLI output.
 #
-# Source of the secret, chosen with --from (default: vault):
+# Source of the secret, chosen with --from (default: auto):
 #
+#   --from auto    vault when VAULT_ADDR is set, otherwise env when a credential
+#                  is found there, otherwise an error that says what to set.
+#   --from env     read NSXT credentials from environment variables, which in
+#                  GitLab CI are masked CI/CD variables. Nothing is stored on
+#                  the runner host. The first of these that is set wins, with
+#                  SITE the manager key upper-cased (hyd-gm01 -> HYD_GM01) and
+#                  SCOPE the job's NSX_CRED_SCOPE (PLAN or APPLY):
+#                    NSX_<SITE>_<SCOPE>_USERNAME / _PASSWORD
+#                    NSX_<SITE>_USERNAME / _PASSWORD
+#                    NSX_<SCOPE>_USERNAME / _PASSWORD
+#                    NSX_USERNAME / _PASSWORD
+#                  Plan jobs on a merge request cannot read protected
+#                  variables, so give them a read-only NSX account in the PLAN
+#                  variables and keep the write account in protected APPLY ones.
 #   --from vault   read the KV v2 secret at the vault_path in the inventory.
 #                  Needs VAULT_ADDR and VAULT_TOKEN in the environment.
 #   --from vcf     ask SDDC Manager for the current NSX credentials.
@@ -4792,14 +4820,14 @@ write_file scripts/with-credentials.sh <<'SCAFFOLD_EOF'
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SOURCE=vault
+SOURCE=auto
 
 die() {
 	echo "error: $*" >&2
 	exit 1
 }
 
-[ $# -ge 1 ] || die "usage: with-credentials.sh <site> [--from vault|vcf] -- <command>"
+[ $# -ge 1 ] || die "usage: with-credentials.sh <site> [--from auto|vault|env|vcf] -- <command>"
 
 SITE="$1"
 shift
@@ -4836,7 +4864,40 @@ for k in sys.argv[1:]:
     d = d[int(k)] if isinstance(d, list) else d[k]
 print(d)' "$@"; }
 
+# Credential lookup in the environment. Prints "<username-var> <password-var>"
+# for the first prefix whose username and password are both set.
+env_credential_vars() {
+	local key scope prefix u p
+	key="$(printf '%s' "$SITE" | tr 'a-z' 'A-Z' | tr -c 'A-Z0-9\n' '_')"
+	scope="$(printf '%s' "${NSX_CRED_SCOPE:-}" | tr 'a-z' 'A-Z' | tr -c 'A-Z0-9\n' '_')"
+	for prefix in ${scope:+"NSX_${key}_${scope}"} "NSX_${key}" ${scope:+"NSX_${scope}"} NSX; do
+		u="${prefix}_USERNAME"
+		p="${prefix}_PASSWORD"
+		if [ -n "${!u:-}" ] && [ -n "${!p:-}" ]; then
+			printf '%s %s\n' "$u" "$p"
+			return 0
+		fi
+	done
+	return 1
+}
+
+if [ "$SOURCE" = auto ]; then
+	if [ -n "${VAULT_ADDR:-}" ]; then
+		SOURCE=vault
+	elif env_credential_vars >/dev/null; then
+		SOURCE=env
+	else
+		die "no NSX credentials for '$SITE'. Set VAULT_ADDR and VAULT_TOKEN, or set NSX_USERNAME and NSX_PASSWORD (or per-site NSX_<SITE>_USERNAME / _PASSWORD) as masked CI/CD variables."
+	fi
+fi
+
 case "$SOURCE" in
+env)
+	read -r u_var p_var <<<"$(env_credential_vars)" ||
+		die "no NSX credential variables set for '$SITE' (looked for NSX_<SITE>[_<SCOPE>]_USERNAME / _PASSWORD and NSX_USERNAME / _PASSWORD)"
+	NSXT_USERNAME="${!u_var}"
+	NSXT_PASSWORD="${!p_var}"
+	;;
 vault)
 	[ -n "${VAULT_ADDR:-}" ] || die "VAULT_ADDR is not set"
 	[ -n "${VAULT_TOKEN:-}" ] || die "VAULT_TOKEN is not set"
@@ -4880,7 +4941,7 @@ else:
     sys.exit("no NSX credential for " + want)
 ')" || die "no SDDC Manager credential matches $NSX_HOST"
 	;;
-*) die "unknown --from source: $SOURCE (vault|vcf)" ;;
+*) die "unknown --from source: $SOURCE (auto|vault|env|vcf)" ;;
 esac
 
 [ -n "${NSXT_USERNAME:-}" ] || die "no username retrieved"
@@ -9913,6 +9974,7 @@ def main() -> int:
         out.append(f'    SITE: "{row["site"]}"')
         out.append(f'    STACK: "{row["stack"]}"')
         out.append("    VAULT_TOKEN: $VAULT_PLAN_TOKEN")
+        out.append("    NSX_CRED_SCOPE: plan")
         out.append("  script:")
         out.append('    - scripts/with-credentials.sh "$SITE" -- scripts/tf.sh plan "$STACK" "$SITE"')
         out.append('    - scripts/tf.sh show "$STACK" "$SITE" | tee "plan-$STACK-$SITE.txt"')
@@ -9950,6 +10012,7 @@ def main() -> int:
         out.append(f'    SITE: "{row["site"]}"')
         out.append(f'    STACK: "{row["stack"]}"')
         out.append("    VAULT_TOKEN: $VAULT_APPLY_TOKEN")
+        out.append("    NSX_CRED_SCOPE: apply")
         out.append("    APPROVE: \"yes\"")
         out.append("  script:")
         # tf.sh refuses without a saved plan, so this cannot silently re-plan.
