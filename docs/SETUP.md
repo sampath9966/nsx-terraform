@@ -472,6 +472,10 @@ The common case, and the one to take slowly: one policy of one manager per merge
 request, each step reversible. `docs/IMPORT.md` in the generated tree is the full
 runbook, including what is deliberately not adopted.
 
+From the pipeline, with no credentials on any server: *Run pipeline* on the
+default branch with `ADOPT_SITE=lon1` lists what can be adopted; adding
+`ADOPT_POLICY=legacy-app` opens a merge request that adopts it. By hand:
+
 ```bash
 # 0. with no data for the manager yet, a plan must say "no changes"
 make plan STACK=local-security SITE=lon1

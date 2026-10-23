@@ -1342,6 +1342,29 @@ at a time, with every step reversible.
 3. Run a plan for that manager with no data. It must say **no changes**. That is
    your proof that the tooling is inert until you adopt something.
 
+## From the pipeline: the usual way
+
+No credentials on any server, and every step leaves a record in GitLab.
+
+1. **Survey.** *Build → Pipelines → Run pipeline* on the default branch, with the
+   variable `ADOPT_SITE` set to the manager (`lon1`). The `adopt` job reads the
+   manager with the read-only plan credential and lists its policies and whether
+   each can be adopted. It changes nothing.
+2. **Adopt one.** Run it again with `ADOPT_POLICY` set too (several ids, space
+   separated, are one tranche; `ADOPT_TRANCHE` names it). The job converts those
+   policies and what they need, commits that to a branch
+   `adopt/<site>-<tranche>`, and opens a merge request whose description is the
+   converter's report, including what was left in the UI and why.
+3. **Review and merge** that merge request as in steps 3 and 4 below: its
+   pipeline plans it, and `plan-guard` fails it unless it only imports.
+
+The job never applies, never pushes to the default branch, and never keeps the
+capture (it lives in a temporary directory for the length of the job). It needs
+`NSX_ADOPT_TOKEN`, a project access token with the `api` and `write_repository`
+scopes, masked and protected; branch protection still keeps it off the default
+branch. Steps 1 and 2 below are the same thing done by hand, for when you want to
+iterate on a conversion offline.
+
 ## 1. Capture, read-only
 
 ```bash
@@ -2043,6 +2066,10 @@ openssl s_client -connect <manager>:443 -showcerts </dev/null 2>/dev/null |
 
 The SAN must list the name or address in `inventory/managers.yaml`; if it does
 not, replace the certificate on the manager. Do not turn verification off.
+
+| Variable | Value | Flags |
+|---|---|---|
+| `NSX_ADOPT_TOKEN` | project access token, scopes `api` and `write_repository`, role Developer: lets the `adopt` job push an `adopt/*` branch and open a merge request | masked, **protected** |
 
 **Read this before you rely on unprotected plan variables.** Anyone who can push
 a branch or open a merge request can run pipeline code that reads every variable
@@ -7484,6 +7511,8 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="report what would be written")
     ap.add_argument("--policy", action="append", default=[], metavar="ID",
                     help="adopt only this policy and what it needs; repeat for more")
+    ap.add_argument("--list", action="store_true",
+                    help="survey: list the policies and whether each can be adopted; write nothing")
     ap.add_argument("--tranche", default=None, metavar="NAME",
                     help="name for this piece of work, used in the file names (default: the first --policy, or 'all')")
     args = ap.parse_args()
@@ -7529,6 +7558,9 @@ def main() -> int:
     all_groups = estate.get("groups", [])
     all_services = estate.get("services", [])
     all_policies = estate.get("policies", [])
+
+    if args.list:
+        return survey(args.site, all_groups, all_services, all_policies)
     sites = [args.site]
     owner = "gm" if role == "gm" else "lm"
 
@@ -7749,6 +7781,37 @@ def main() -> int:
     print("  3. the plan must only import: scripts/plan-guard.py refuses anything else")
     print("  4. apply, then confirm the next plan reports no changes")
     print(f"  5. delete stacks/{security_stack}/import-{args.site}-{tranche}.tf in its own merge request")
+    return 0
+
+
+def survey(site: str, groups: list, services: list, policies: list) -> int:
+    """What could be adopted from this manager, policy by policy. Writes nothing."""
+    bad = unsupported_objects(groups, services)
+    have = existing_keys()
+    rows = []
+    for policy in policies:
+        if is_system(policy):
+            continue
+        rules = policy.get("rules", [])
+        kept = [r for r in rules if rule_unsupported(r, bad)]
+        blocked = [p.rsplit("/", 1)[-1] for p in policy.get("scope") or [] if p in bad]
+        if policy["id"] in have["policies"]:
+            status = "managed already"
+        elif blocked:
+            status = f"not adoptable: Apply To uses {', '.join(blocked)}"
+        elif kept:
+            status = f"adoptable; {len(kept)} of {len(rules)} rule(s) stay in the UI"
+        else:
+            status = "adoptable"
+        rows.append((policy.get("category", ""), policy["id"], policy.get("display_name", ""), len(rules), status))
+    print(f"{len(rows)} policy/policies on {site}:")
+    print()
+    print(f"  {'CATEGORY':<14} {'POLICY ID':<36} {'RULES':>5}  STATUS")
+    for category, pid, name, count, status in sorted(rows):
+        label = pid if name in ("", pid) else f"{pid} ({name})"
+        print(f"  {category:<14} {label:<36} {count:>5}  {status}")
+    print()
+    print("Adopt one with: --policy <POLICY ID> (in the pipeline: ADOPT_POLICY).")
     return 0
 
 
@@ -8012,6 +8075,158 @@ if __name__ == "__main__":
     raise SystemExit(main())
 SCAFFOLD_EOF
 mark_executable scripts/hand-back.py
+
+write_file scripts/adopt.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# Adopt existing NSX objects from the pipeline: no credentials on any server.
+#
+# Run by the 'adopt' job, started by hand on the default branch from
+# Build -> Pipelines -> Run pipeline, with:
+#
+#   ADOPT_SITE     the manager, as in inventory/managers.yaml        (required)
+#   ADOPT_POLICY   policy ids to adopt, space separated               (optional)
+#   ADOPT_TRANCHE  a name for this piece of work                      (optional)
+#
+# Without ADOPT_POLICY it is a survey: it lists the manager's policies and what
+# can be adopted, and changes nothing. With it, it converts those policies and
+# what they need, commits that to a new branch adopt/<site>-<tranche>, and opens
+# a merge request. From there it is an ordinary change: the merge request
+# pipeline plans it, scripts/plan-guard.py refuses anything but a pure import,
+# a person reviews it, and the apply is the usual manual job after the merge.
+#
+# What it never does: apply, push to the default branch, or keep the capture.
+# It reads the manager with the read-only plan credential, and the capture
+# lives in a temporary directory removed when the job ends.
+#
+# Needs NSX_ADOPT_TOKEN: a project access token with the api and
+# write_repository scopes (role Developer is enough to push a branch and open a
+# merge request; branch protection still keeps it off the default branch).
+# Masked and protected.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+die() {
+	echo "error: $*" >&2
+	exit 1
+}
+
+SITE="${ADOPT_SITE:-}"
+POLICIES="${ADOPT_POLICY:-}"
+TRANCHE="${ADOPT_TRANCHE:-}"
+[ -n "$SITE" ] || die "ADOPT_SITE is not set: the manager to adopt from, as in inventory/managers.yaml"
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+dump="$work/capture.json"
+
+echo "== reading $SITE (read-only)"
+NSX_CRED_SCOPE=plan scripts/with-credentials.sh "$SITE" -- \
+	python3 scripts/import-estate.py --site "$SITE" --dump-only "$dump"
+
+if [ -z "$POLICIES" ]; then
+	echo
+	python3 scripts/import-estate.py --site "$SITE" --from-dump "$dump" --list
+	echo "Survey only: nothing was changed. Run the pipeline again with ADOPT_POLICY to adopt."
+	exit 0
+fi
+
+args=()
+for p in $POLICIES; do args+=(--policy "$p"); done
+[ -z "$TRANCHE" ] || args+=(--tranche "$TRANCHE")
+first="${POLICIES%% *}"
+tranche="${TRANCHE:-$first}"
+branch="adopt/${SITE}-${tranche}"
+
+[ -n "${NSX_ADOPT_TOKEN:-}${NSX_ADOPT_REMOTE:-}" ] ||
+	die "NSX_ADOPT_TOKEN is not set: a project access token (api, write_repository), masked and protected"
+
+echo "== converting: $POLICIES"
+git checkout -q -B "$branch"
+report="$(python3 scripts/import-estate.py --site "$SITE" --from-dump "$dump" "${args[@]}")"
+echo "$report"
+if ! grep -q "  wrote " <<<"$report"; then
+	echo "Nothing to adopt: everything named is already managed, or cannot be adopted (see above)."
+	exit 0
+fi
+
+validation="$(python3 scripts/validate-data.py 2>&1 || true)"
+echo "$validation" | tail -5
+
+git add -A data stacks
+git -c user.name="${GITLAB_USER_NAME:-nsx-adopt}" -c user.email="${GITLAB_USER_EMAIL:-nsx-adopt@localhost}" \
+	-c commit.gpgsign=false commit -q -m "Adopt $POLICIES from $SITE
+
+Converted by scripts/adopt.sh in pipeline ${CI_PIPELINE_ID:-local}. Imports only:
+nothing in NSX changes when this is applied."
+
+echo "== pushing $branch"
+push_env=()
+if [ -n "${NSX_ADOPT_REMOTE:-}" ]; then
+	remote="$NSX_ADOPT_REMOTE"
+	auth=()
+else
+	remote="${CI_SERVER_URL%/}/${CI_PROJECT_PATH}.git"
+	# The token goes in a header, never in the URL, so it cannot end up in a log.
+	auth=(-c "http.extraHeader=Authorization: Basic $(printf 'oauth2:%s' "$NSX_ADOPT_TOKEN" | base64 | tr -d '\n')")
+	# The runner's CA setup applies to the clone, which runs in another container;
+	# this push runs here, so it is given GitLab's CA itself. Through the
+	# environment, because an inherited GIT_SSL_CAINFO overrides git's config.
+	if [ -n "${CI_SERVER_TLS_CA_FILE:-}" ] && [ -r "$CI_SERVER_TLS_CA_FILE" ]; then
+		push_env=(GIT_SSL_CAINFO="$CI_SERVER_TLS_CA_FILE")
+	fi
+fi
+env "${push_env[@]}" git "${auth[@]}" push -q "$remote" "HEAD:refs/heads/$branch" ||
+	die "could not push $branch. If it exists already, an adoption of this tranche is open: merge or close it, or set ADOPT_TRANCHE."
+
+echo "== opening the merge request"
+api="${CI_API_V4_URL:?CI_API_V4_URL is not set}"
+body="$work/mr.json"
+REPORT="$report" VALIDATION="$validation" BRANCH="$branch" TARGET="${CI_DEFAULT_BRANCH:-main}" \
+	SITE="$SITE" POLICIES="$POLICIES" python3 - "$body" <<'PY'
+import json, os, sys
+e = os.environ
+lines = [l for l in e["REPORT"].splitlines() if l.strip() and not l.startswith(("next:", "  1.", "  2.", "  3.", "  4.", "  5."))]
+summary = [l for l in e["VALIDATION"].splitlines() if l.startswith(("ERROR", "checked"))]
+description = "\n".join([
+    f"Adopts `{e['POLICIES']}` from **{e['SITE']}**, as converted by the `adopt` pipeline job.",
+    "",
+    "**Imports only.** Applying this changes nothing in NSX. The plan in this merge request must read",
+    "`N to import, 0 to add, 0 to change, 0 to destroy`; `scripts/plan-guard.py` fails it otherwise.",
+    "",
+    "### Converter report",
+    "```", *lines, "```",
+    "",
+    "### Validation",
+    "```", *(summary or ["(clean)"]), "```",
+    "",
+    "### Before approving",
+    "- [ ] every `why_static` note replaced with the real reason",
+    "- [ ] new tag scopes are in `data/schema/tag-scopes.yaml` on purpose",
+    "- [ ] the objects listed as NOT ADOPTED are fine to leave in the UI",
+    "- [ ] the plan is a pure import",
+    "",
+    "After the apply, the next plan must report no changes; then delete the `import-*.tf` file this added, in its own merge request.",
+])
+json.dump({
+    "source_branch": e["BRANCH"], "target_branch": e["TARGET"], "remove_source_branch": True,
+    "title": f"Adopt {e['POLICIES']} from {e['SITE']}", "description": description,
+}, open(sys.argv[1], "w"))
+PY
+token_header=()
+[ -z "${NSX_ADOPT_TOKEN:-}" ] || token_header=(--header "PRIVATE-TOKEN: ${NSX_ADOPT_TOKEN}")
+response="$(curl --silent --show-error --fail-with-body --max-time 60 \
+	${CI_SERVER_TLS_CA_FILE:+--cacert "$CI_SERVER_TLS_CA_FILE"} \
+	"${token_header[@]}" --header "Content-Type: application/json" \
+	--data "@$body" "${api%/}/projects/${CI_PROJECT_ID:?CI_PROJECT_ID is not set}/merge_requests")" ||
+	die "the branch $branch was pushed, but the merge request could not be opened: $response"
+url="$(printf '%s' "$response" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("web_url",""))')"
+echo "merge request: ${url:-opened}"
+SCAFFOLD_EOF
+mark_executable scripts/adopt.sh
 
 write_file scripts/drift.sh <<'SCAFFOLD_EOF'
 #!/usr/bin/env bash
@@ -10614,9 +10829,14 @@ write_file .gitlab-ci.yml <<'SCAFFOLD_EOF'
 #   VAULT_ADDR          Vault endpoint
 #   VAULT_PLAN_TOKEN    READ-ONLY. Available to every branch.
 #   VAULT_APPLY_TOKEN   write. PROTECTED — protected branches and tags only.
-# See docs/GITOPS.md.
+# or the NSX credentials themselves (NSX_PLAN_*, NSX_APPLY_*). See docs/GITOPS.md.
+#
+# Adopting existing objects is a pipeline too: Run pipeline on the default branch
+# with ADOPT_SITE (and ADOPT_POLICY) set runs only the 'adopt' job, which opens a
+# merge request. docs/IMPORT.md.
 
 stages:
+  - adopt
   - validate
   - generate
   - plan
@@ -10643,6 +10863,22 @@ variables:
   GIT_DEPTH: "20"
   NSX_CI_IMAGE: "nsx-ci:1"
 
+# --- adopt: bring existing NSX objects under management ---------------------
+# Started by hand: Build -> Pipelines -> Run pipeline on the default branch, with
+# ADOPT_SITE, and ADOPT_POLICY to adopt (without it, a survey that changes
+# nothing). It reads the manager with the read-only plan credential and opens a
+# merge request; it never applies and never pushes to the default branch.
+
+adopt:
+  stage: adopt
+  variables:
+    NSX_CRED_SCOPE: plan
+    VAULT_TOKEN: $VAULT_PLAN_TOKEN
+  script:
+    - scripts/adopt.sh
+  rules:
+    - if: $ADOPT_SITE && $CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
 # --- validate: offline, no credentials, runs on everything ------------------
 
 data:
@@ -10650,6 +10886,8 @@ data:
   script:
     - python3 scripts/validate-data.py
   rules:
+    - if: $ADOPT_SITE && $CI_PIPELINE_SOURCE == "web"
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -10665,6 +10903,8 @@ terraform:
   allow_failure:
     exit_codes: 42
   rules:
+    - if: $ADOPT_SITE && $CI_PIPELINE_SOURCE == "web"
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -10679,6 +10919,8 @@ matrix:
     paths: [generated-pipeline.yml]
     expire_in: 1 week
   rules:
+    - if: $ADOPT_SITE && $CI_PIPELINE_SOURCE == "web"
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -10693,6 +10935,8 @@ managers:
         job: matrix
     strategy: depend
   rules:
+    - if: $ADOPT_SITE && $CI_PIPELINE_SOURCE == "web"
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 SCAFFOLD_EOF
