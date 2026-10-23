@@ -162,14 +162,62 @@ managers:
     vault_path: secret/nsx/hyd-gm01
     tier: prod
 INV
-wc() { (cd "$T" && env -i PATH="$PATH" "$@" scripts/with-credentials.sh hyd-gm01 -- sh -c 'echo "$NSXT_USERNAME:$NSXT_PASSWORD"' 2>&1); }
-check "no credentials anywhere: says what to set" grep -q "no NSX credentials" <<<"$(wc)"
-check "a shared NSX_USERNAME/NSX_PASSWORD is used" test "$(wc NSX_USERNAME=a NSX_PASSWORD=b)" = "a:b"
-check "a per-site variable beats the shared one" test "$(wc NSX_USERNAME=a NSX_PASSWORD=b NSX_HYD_GM01_USERNAME=c NSX_HYD_GM01_PASSWORD=d)" = "c:d"
-check "the job's scope beats the per-site variable" test "$(wc NSX_CRED_SCOPE=apply NSX_HYD_GM01_USERNAME=c NSX_HYD_GM01_PASSWORD=d NSX_HYD_GM01_APPLY_USERNAME=e NSX_HYD_GM01_APPLY_PASSWORD=f)" = "e:f"
-check "a username with no password is ignored" grep -q "no NSX credentials" <<<"$(wc NSX_USERNAME=a)"
-check "VAULT_ADDR still selects Vault" grep -q "VAULT_TOKEN is not set" <<<"$(wc VAULT_ADDR=http://x NSX_USERNAME=a NSX_PASSWORD=b)"
+nsxcred() { (cd "$T" && env -i PATH="$PATH" "$@" scripts/with-credentials.sh hyd-gm01 -- sh -c 'echo "$NSXT_USERNAME:$NSXT_PASSWORD"' 2>&1); }
+check "no credentials anywhere: says what to set" grep -q "no NSX credentials" <<<"$(nsxcred)"
+check "a shared NSX_USERNAME/NSX_PASSWORD is used" test "$(nsxcred NSX_USERNAME=a NSX_PASSWORD=b)" = "a:b"
+check "a per-site variable beats the shared one" test "$(nsxcred NSX_USERNAME=a NSX_PASSWORD=b NSX_HYD_GM01_USERNAME=c NSX_HYD_GM01_PASSWORD=d)" = "c:d"
+check "the job's scope beats the per-site variable" test "$(nsxcred NSX_CRED_SCOPE=apply NSX_HYD_GM01_USERNAME=c NSX_HYD_GM01_PASSWORD=d NSX_HYD_GM01_APPLY_USERNAME=e NSX_HYD_GM01_APPLY_PASSWORD=f)" = "e:f"
+check "a username with no password is ignored" grep -q "no NSX credentials" <<<"$(nsxcred NSX_USERNAME=a)"
+check "VAULT_ADDR still selects Vault" grep -q "VAULT_TOKEN is not set" <<<"$(nsxcred VAULT_ADDR=http://x NSX_USERNAME=a NSX_PASSWORD=b)"
 check "the child pipeline tells each job its credential scope" grep -q 'NSX_CRED_SCOPE: plan' <<<"$(cd "$T" && python3 scripts/gitlab-child-pipeline.py)"
+
+# Terraform reads state from GitLab over HTTPS and must trust GitLab's own CA.
+printf 'address = "https://gitlab.test/state"\n' >"$T/envs/hyd-gm01.backend.hcl"
+mkdir -p "$SCRATCH/faketf"
+cat >"$SCRATCH/faketf/terraform" <<'STUB'
+#!/usr/bin/env bash
+echo "SSL_CERT_FILE=${SSL_CERT_FILE:-unset}"
+[ -n "${SSL_CERT_FILE:-}" ] && [ -r "$SSL_CERT_FILE" ] && grep -q GITLAB-CA "$SSL_CERT_FILE" && echo "bundle-has-gitlab-ca"
+exit 0
+STUB
+chmod +x "$SCRATCH/faketf/terraform"
+printf '%s\n' '-----BEGIN CERTIFICATE-----' 'GITLAB-CA' '-----END CERTIFICATE-----' >"$SCRATCH/gl.crt"
+tfenv() { (cd "$T" && env -u SSL_CERT_FILE PATH="$SCRATCH/faketf:$PATH" "$@" scripts/tf.sh init global-security hyd-gm01 2>/dev/null); }
+check "terraform is given a bundle holding the GitLab CA" grep -q "bundle-has-gitlab-ca" <<<"$(tfenv CI_SERVER_TLS_CA_FILE="$SCRATCH/gl.crt")"
+check "a SSL_CERT_FILE already set is left alone" grep -q "SSL_CERT_FILE=/already/set" <<<"$(tfenv CI_SERVER_TLS_CA_FILE="$SCRATCH/gl.crt" SSL_CERT_FILE=/already/set)"
+check "without the runner's CA nothing is set" grep -q "SSL_CERT_FILE=unset" <<<"$(tfenv X=1)"
+
+# The NSX managers' CA, given as a File variable, goes into the same bundle.
+printf '%s\n' '-----BEGIN CERTIFICATE-----' 'NSX-CA' '-----END CERTIFICATE-----' >"$SCRATCH/nsx.crt"
+cat >"$SCRATCH/faketf/terraform" <<'STUB'
+#!/usr/bin/env bash
+echo "SSL_CERT_FILE=${SSL_CERT_FILE:-unset}"
+for want in GITLAB-CA NSX-CA; do
+	[ -n "${SSL_CERT_FILE:-}" ] && [ -r "$SSL_CERT_FILE" ] && grep -q "$want" "$SSL_CERT_FILE" && echo "has-$want"
+done
+exit 0
+STUB
+chmod +x "$SCRATCH/faketf/terraform"
+out="$(tfenv CI_SERVER_TLS_CA_FILE="$SCRATCH/gl.crt" NSX_CA_FILE="$SCRATCH/nsx.crt")"
+check "NSX_CA_FILE and the GitLab CA are both in the bundle" bash -c 'grep -q has-GITLAB-CA <<<"$1" && grep -q has-NSX-CA <<<"$1"' _ "$out"
+check "NSX_CA_FILE alone builds a bundle" grep -q has-NSX-CA <<<"$(tfenv NSX_CA_FILE="$SCRATCH/nsx.crt")"
+check "an NSX_CA_FILE that does not exist is an error, not silently ignored" bash -c '! (cd "$1" && env -u SSL_CERT_FILE NSX_CA_FILE=/no/such/file PATH="$2:$PATH" scripts/tf.sh init global-security hyd-gm01) >/dev/null 2>&1' _ "$T" "$SCRATCH/faketf"
+echo "not a certificate" >"$SCRATCH/junk.crt"
+check "an NSX_CA_FILE with no certificate in it is an error" bash -c '! (cd "$1" && env -u SSL_CERT_FILE NSX_CA_FILE="$3" PATH="$2:$PATH" scripts/tf.sh init global-security hyd-gm01) >/dev/null 2>&1' _ "$T" "$SCRATCH/faketf" "$SCRATCH/junk.crt"
+check "a preset SSL_CERT_FILE wins and says NSX_CA_FILE was not added" grep -q "NSX_CA_FILE is not added" <<<"$(cd "$T" && env PATH="$SCRATCH/faketf:$PATH" SSL_CERT_FILE=/already/set NSX_CA_FILE="$SCRATCH/nsx.crt" scripts/tf.sh init global-security hyd-gm01 2>&1)"
+leftover="$(ls "${TMPDIR:-/tmp}"/nsx-ca.* 2>/dev/null | wc -l)"
+check "the temporary CA bundle is removed after the run" test "$leftover" -eq 0
+
+# Credential selection: edge cases that matter in production.
+wc2() { (cd "$T" && env -i PATH="$PATH" "$@" scripts/with-credentials.sh hyd-gm01 -- sh -c 'printf "%s|%s" "$NSXT_USERNAME" "$NSXT_PASSWORD"' 2>&1); }
+check "explicit --from env with nothing set gives the real message, not a bash error" bash -c 'out="$(cd "$1" && env -i PATH="$PATH" scripts/with-credentials.sh hyd-gm01 --from env -- true 2>&1)"; grep -q "no NSX credentials" <<<"$out" && ! grep -q "invalid variable name" <<<"$out"' _ "$T"
+check "the error names the scope and the variables it looked for" bash -c 'grep -q "scope: plan" <<<"$1" && grep -q "NSX_HYD_GM01_PLAN_USERNAME" <<<"$1" && grep -q "NSX_PLAN_USERNAME" <<<"$1"' _ "$(wc2 NSX_CRED_SCOPE=plan)"
+check "a blank username and password are not credentials" grep -q "no NSX credentials" <<<"$(wc2 NSX_USERNAME=' ' NSX_PASSWORD=' ')"
+check "passwords with quotes, dollars, backslashes and spaces arrive intact" test "$(wc2 NSX_USERNAME='dom\svc user' NSX_PASSWORD='p a"s$s\n=#x')" = 'dom\svc user|p a"s$s\n=#x'
+check "a plan job cannot use the apply credential" grep -q "no NSX credentials" <<<"$(wc2 NSX_CRED_SCOPE=plan NSX_APPLY_USERNAME=w NSX_APPLY_PASSWORD=w)"
+check "an apply job cannot use the plan credential" grep -q "no NSX credentials" <<<"$(wc2 NSX_CRED_SCOPE=apply NSX_PLAN_USERNAME=r NSX_PLAN_PASSWORD=r)"
+check "a password never appears in an error message" bash -c '! grep -q SECRETVALUE <<<"$1"' _ "$(wc2 NSX_USERNAME=u NSX_PASSWORD=SECRETVALUE VAULT_ADDR=http://x)"
+check "the wrapped command's exit status is preserved" bash -c '(cd "$1" && env -i PATH="$PATH" NSX_USERNAME=u NSX_PASSWORD=p scripts/with-credentials.sh hyd-gm01 -- sh -c "exit 7") >/dev/null 2>&1; [ $? -eq 7 ]' _ "$T"
 
 # Git is given only the runner's tls-ca-file. That file has to carry the host
 # trust store as well, or a TLS-inspecting proxy fails every clone.

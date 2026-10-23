@@ -359,9 +359,22 @@ data source: the `vault_*` data sources write the fetched secret into state in
 plaintext.
 
 `scripts/with-credentials.sh` fetches outside Terraform and execs with `NSXT_*`
-in the environment. It assumes Vault KV v2 at the path recorded per manager in
-`inventory/managers.yaml`; the mount convention and auth method are yours to
-set. `vault_path` records **where the credential lives, never the credential**.
+in the environment. There are two sources, chosen automatically (Vault when
+`VAULT_ADDR` is set, otherwise the environment):
+
+- **Vault.** It assumes KV v2 at the path recorded per manager in
+  `inventory/managers.yaml`; the mount convention and auth method are yours to
+  set. `vault_path` records **where the credential lives, never the credential**.
+- **GitLab CI/CD variables.** `NSX_PLAN_USERNAME` / `NSX_PLAN_PASSWORD` for
+  merge request plans and `NSX_APPLY_USERNAME` / `NSX_APPLY_PASSWORD` for apply,
+  or per manager as `NSX_<SITE>_PLAN_USERNAME` and so on (`hyd-gm01` is
+  `HYD_GM01`). The exact lookup order, and why unprotected plan variables need a
+  read-only NSX account, are in `docs/GITOPS.md`.
+
+If the NSX managers use an internal certificate authority, give the pipeline its
+PEM as a CI/CD variable `NSX_CA_FILE` of type File. Run by hand, set
+`SSL_CERT_FILE` to a bundle that holds your CA and, for a GitLab with its own CA,
+GitLab's too.
 
 ### 2.4 Who tags the workloads — decide before writing group criteria
 
@@ -451,28 +464,38 @@ a plan has been reviewed against a real manager.
 
 ### Brownfield — adopt what is already there
 
-The common case, and the one to take slowly. `docs/IMPORT.md` in the generated
-tree is the full walkthrough.
+The common case, and the one to take slowly: one policy of one manager per merge
+request, each step reversible. `docs/IMPORT.md` in the generated tree is the full
+runbook, including what is deliberately not adopted.
 
 ```bash
+# 0. with no data for the manager yet, a plan must say "no changes"
+make plan STACK=local-security SITE=lon1
+
 # 1. capture, read-only (reports/ is gitignored)
 scripts/with-credentials.sh lon1 -- scripts/import-estate.py --site lon1 --dump-only reports/lon1-raw.json
 
-# 2. convert offline, iterating as often as you like
-scripts/import-estate.py --site lon1 --from-dump reports/lon1-raw.json
+# 2. convert one policy and what it needs, offline
+make import SITE=lon1 DUMP=reports/lon1-raw.json POLICY=legacy-app
 
-# 3. verify, then import one tranche
+# 3. merge request: the plan must only import; apply; the next plan says no changes
 make plan STACK=local-security SITE=lon1
 ```
 
-Two rules that matter more than the rest:
+What protects the live estate is mechanical, not a review checklist:
 
-- **A tranche is done when `plan` reports *no changes*.** Not "only small
-  changes".
-- **A *create* in an import plan means stop.** Terraform is about to build a
-  duplicate beside the object you meant to adopt — almost always an `nsx_id`
-  that does not match. Imported objects keep their real id verbatim, mixed case
-  and underscores included.
+- **`scripts/plan-guard.py` runs after every plan and before every apply.**
+  While a tranche is open the plan may only import: a create (a would-be
+  duplicate) or an update (data that does not match NSX yet) fails the job. Any
+  destroy or replace fails it too, unless that exact object is approved in
+  `allow-destroy.txt` in the same merge request.
+- **A tranche is done when the next plan reports *no changes*.** Then delete its
+  import file.
+- **Nothing is adopted lossily.** Objects the converter cannot represent exactly
+  (MAC or identity groups, unusual service entries, inline rule services) stay
+  in the UI and are listed.
+- **Undo is one command:** `make hand-back` stops managing an object without
+  deleting it.
 
 Imported files are recorded in `data/.import-manifest.json` and are never
 overwritten by the generator, by any flag. Re-running the importer writes a

@@ -13,6 +13,40 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.2.8
+
+Adopting an existing estate safely, one policy of one manager at a time, and hardening found in a review before production use. A tree on Vault needs no action. Read **"Fixed: dangerous"** below if anyone runs `scripts/tf.sh` by hand for more than one manager from the same checkout.
+
+**Nothing live is deleted, duplicated or changed by accident. This is enforced, not left to review.** A new `scripts/plan-guard.py` runs inside `scripts/tf.sh` after every plan and again before every apply, by hand and in CI:
+- any destroy or replace is refused unless that exact object is approved in `allow-destroy.txt` at the repository root, in the same merge request (the refusal prints the line to paste);
+- while an import tranche is open for that manager, the plan may only import: a create (an object about to be built twice) or an update (data that does not match NSX yet) fails the job. There is deliberately no override.
+
+**Adopt one policy at a time.** `make import SITE=<site> POLICY="id1 id2" [TRANCHE=name]` (`scripts/import-estate.py --policy`) converts only those policies and exactly what they need: referenced groups, nested groups followed through, and custom services. Anything already in `data/` is skipped. Each tranche gets its own files (`data/*/imported-<site>-<tranche>.yaml`, `stacks/<stack>/import-<site>-<tranche>.tf`). Whole-manager import still works and now writes `-all` files.
+
+**Import blocks no longer break other managers.** They were written to `stacks/<stack>/import.tf`, which every Local Manager running that stack evaluates, so a tranche for one manager failed every other manager's plan until it was applied. Import blocks are now gated on `var.site`.
+
+**Nothing is adopted lossily.** Terraform clears any setting it does not manage, so a lossy import changes the live object on its first apply. The converter now carries group tags, service entry names, rule notes, log labels, context profiles (App-ID, FQDN) and tags, and policy comments and tags; the modules and schema gained policy and rule tags and policy comments. What cannot be represented exactly (MAC, external-id or identity groups, extended criteria, other service entry types, inline rule service entries, and anything using them) is not adopted: it is listed with the reason and stays in the UI. The rest of a policy is still adopted, rule by rule. Context profiles are the one thing data may reference by path.
+
+**Custom services were never imported.** The converter wrote them to data without import blocks, so the first plan tried to create services that already exist. They are now imported.
+
+**Capture read only the first page of each list.** The policy API pages its results; large estates were silently cut short. Capture now follows the cursor.
+
+**Fixed: dangerous.** `scripts/tf.sh plan` initialised a stack only when `.terraform` was missing. Planning a second manager from the same checkout reused the first manager's backend, so the plan compared the second manager's data with the first manager's state and proposed destroying the first manager's objects through the second manager's credentials. Separately, the saved plan `stacks/<stack>/tfplan` was not tied to a manager, so a plan made for one manager could be applied with another's credentials. `tf.sh` now records the manager it initialised for and re-initialises when it changes, and records the manager with each saved plan (`tfplan.site`, carried with the plan artifact in CI); `show` and `apply` refuse a plan made for another manager. CI was not affected, because every job starts from a fresh checkout.
+
+**A site-local custom service was created on every Local Manager.** Services had no `sites`, unlike groups and policies, so adopting one manager's service would have created it on all the others. Services now take `sites`, `local-security` creates them only there, and the validator requires the list for a site-local service (`["*"]` for all). A service with no `sites` keeps its old behaviour until you add it, so nothing is destroyed by upgrading.
+
+**Hand an object back without deleting it.** `make hand-back STACK=<stack> ADDRESS='<address>'` (`scripts/hand-back.py`) stops managing one object, leaving it in NSX as it is: Terraform's `removed` block cannot name one instance of a `for_each`, so the file moves the instance to a stand-alone address and forgets it there. Terraform refuses the plan while the object is still in `data/`.
+
+**Terraform now trusts the CAs it needs.** `scripts/tf.sh` builds a bundle of the system roots plus GitLab's CA (`CI_SERVER_TLS_CA_FILE`, which git and curl already used) and the NSX managers' CA (`NSX_CA_FILE`, a CI/CD variable of type File) and sets `SSL_CERT_FILE` for the run. A missing or non-PEM `NSX_CA_FILE` stops the run; an `SSL_CERT_FILE` you set yourself is left alone.
+
+**Credentials from CI/CD variables explain themselves.** `--from env` with nothing set died with `invalid variable name`; it now lists what it looked for, in order, for the job's scope. Blank values are not credentials. A plan job never uses the apply credential, or the reverse.
+
+**`scripts/update.sh` repeats any file it kept** in an ATTENTION block at the end, with the exact command, so "applied N change(s)" can no longer read as complete while part of a release is not in effect.
+
+**Smaller:** `docs/IMPORT.md` is a runbook that names, for each guarantee, what enforces it. `make ready`, the GitLab setup summary and the docs describe both credential options, `NSX_CA_FILE`, and the exposure of unprotected plan variables. `readiness.sh` stops if it cannot change into the repository. The selftest check that re-running the generator changes nothing now actually compares the files, and every generated shell script is shellchecked. Variable-based credentials are wired for GitLab; the generated GitHub workflow still uses Vault.
+
+**Upgrading:** an open import tranche written by an earlier release (`stacks/<stack>/import.tf`) keeps working and still puts the stack in import-only mode for every manager; finish and delete it as before. A tree that runs `tf.sh` by hand needs nothing: the first run re-initialises once. A plan saved by an earlier release has no record of its manager, so `apply` refuses it: plan again.
+
 ## 1.2.7
 
 **NSX credentials can come from masked GitLab CI/CD variables, with nothing stored on the runner host.** `scripts/with-credentials.sh` now defaults to `--from auto`: Vault when `VAULT_ADDR` is set (unchanged), otherwise the environment, otherwise an error that names the variables to set. In the environment the first complete pair wins: `NSX_<SITE>_<SCOPE>_USERNAME` / `_PASSWORD`, then `NSX_<SITE>_...`, then `NSX_<SCOPE>_...`, then `NSX_USERNAME` / `NSX_PASSWORD`, where SITE is the manager key upper-cased (`hyd-gm01` becomes `HYD_GM01`) and SCOPE is `PLAN` or `APPLY`. The generated plan and apply jobs set `NSX_CRED_SCOPE`, so a read-only NSX account can sit in unprotected `NSX_PLAN_*` variables for merge request plans and the write account in protected `NSX_APPLY_*` variables. The GitLab state backend needs no secret: jobs use `CI_JOB_TOKEN`. Existing Vault setups need no change.

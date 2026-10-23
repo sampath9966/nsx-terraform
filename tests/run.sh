@@ -2,6 +2,7 @@
 # Run the generator's tests.
 #
 #   tests/run.sh            offline tests: no Docker, no network, ~1 minute
+#   tests/run.sh --provider also adopt into a mock NSX with the real nsxt provider (a few minutes)
 #   tests/run.sh --e2e      also boot a real GitLab in Docker (15-25 minutes)
 #
 # Run it before every merge. The offline set is what CI runs on every push; the
@@ -29,8 +30,13 @@ scripts/bootstrap.sh --dir "$t" --vcs none --no-interactive >/dev/null 2>&1 || r
 
 if command -v shellcheck >/dev/null 2>&1; then
 	echo "== shellcheck on the generated scripts"
-	(cd "$t" && shellcheck -S warning scripts/converge.sh scripts/gitlab-runner.sh scripts/ci-image.sh \
-		scripts/ci-terraform-validate.sh scripts/gitlab-https.sh scripts/gitlab-up.sh scripts/tf-mirror.sh) || rc=1
+	# Every generated shell script, so a new one is checked without anyone adding it
+	# here. bootstrap.sh is the generator's own copy, checked as the generator.
+	generated=()
+	for f in "$t"/scripts/*.sh; do
+		[ "${f##*/}" = bootstrap.sh ] || generated+=("$f")
+	done
+	shellcheck -S warning "${generated[@]}" || rc=1
 fi
 
 echo "== update.sh lifecycle and concurrency"
@@ -41,6 +47,13 @@ echo "== CI scripts (provider downloads, runner profile, no Docker)"
 tests/ci-scripts.sh || rc=1
 echo "== gitlab-https.sh certificates and guards"
 tests/https-cert.sh || rc=1
+echo "== brownfield adoption: importer, plan guard, hand-back, per-manager safety"
+tests/brownfield.sh || rc=1
+
+if [ "${1:-}" = "--provider" ]; then
+	echo "== brownfield adoption with the real NSX provider (needs Terraform and registry access)"
+	tests/brownfield-provider.sh || rc=1
+fi
 
 if [ "${1:-}" = "--e2e" ]; then
 	echo "== end to end against a real GitLab"

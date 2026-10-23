@@ -949,7 +949,8 @@ make matrix            # print the CI matrix from inventory/managers.yaml
 make add-rule POLICY=prod-payments RULE=allow-x ARGS='--source a --destination b --scope b'
 make tag-vm SITE=lon1 VM=payments-web-01 ARGS='--set workload=payments-web'
 make tags SITE=lon1                        # what is tagged from Terraform at this site
-make import SITE=lon1                      # adopt a live estate (DUMP=file to convert offline)
+make import SITE=lon1 POLICY=legacy-app    # adopt one policy and what it needs (DUMP=file to convert offline)
+make hand-back STACK=local-security ADDRESS='<address>'  # stop managing one object, without deleting it
 make drift STACK=local-security SITE=lon1  # report drift; never reverts, never writes data/
 make init  STACK=global-security SITE=gm1
 make plan  STACK=global-security SITE=gm1
