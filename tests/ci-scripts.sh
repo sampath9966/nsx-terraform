@@ -151,6 +151,26 @@ check "the child pipeline clears it too" grep -q 'entrypoint: \[""\]' <<<"$child
 # rules default to 'only: branches, tags' and are all filtered out of it.
 check "the child pipeline is not filtered out of merge request pipelines" grep -qE '^workflow:' <<<"$child"
 
+# NSX credentials from masked CI/CD variables instead of Vault.
+cat >"$T/inventory/managers.yaml" <<'INV'
+managers:
+  hyd-gm01:
+    role: gm
+    host: gm.example.net
+    site: hyd-gm01
+    vcf_instance: v.example.net
+    vault_path: secret/nsx/hyd-gm01
+    tier: prod
+INV
+wc() { (cd "$T" && env -i PATH="$PATH" "$@" scripts/with-credentials.sh hyd-gm01 -- sh -c 'echo "$NSXT_USERNAME:$NSXT_PASSWORD"' 2>&1); }
+check "no credentials anywhere: says what to set" grep -q "no NSX credentials" <<<"$(wc)"
+check "a shared NSX_USERNAME/NSX_PASSWORD is used" test "$(wc NSX_USERNAME=a NSX_PASSWORD=b)" = "a:b"
+check "a per-site variable beats the shared one" test "$(wc NSX_USERNAME=a NSX_PASSWORD=b NSX_HYD_GM01_USERNAME=c NSX_HYD_GM01_PASSWORD=d)" = "c:d"
+check "the job's scope beats the per-site variable" test "$(wc NSX_CRED_SCOPE=apply NSX_HYD_GM01_USERNAME=c NSX_HYD_GM01_PASSWORD=d NSX_HYD_GM01_APPLY_USERNAME=e NSX_HYD_GM01_APPLY_PASSWORD=f)" = "e:f"
+check "a username with no password is ignored" grep -q "no NSX credentials" <<<"$(wc NSX_USERNAME=a)"
+check "VAULT_ADDR still selects Vault" grep -q "VAULT_TOKEN is not set" <<<"$(wc VAULT_ADDR=http://x NSX_USERNAME=a NSX_PASSWORD=b)"
+check "the child pipeline tells each job its credential scope" grep -q 'NSX_CRED_SCOPE: plan' <<<"$(cd "$T" && python3 scripts/gitlab-child-pipeline.py)"
+
 # Git is given only the runner's tls-ca-file. That file has to carry the host
 # trust store as well, or a TLS-inspecting proxy fails every clone.
 printf '%s\n' '-----BEGIN CERTIFICATE-----' 'GITLAB-CA' '-----END CERTIFICATE-----' >"$SCRATCH/ca.crt"
