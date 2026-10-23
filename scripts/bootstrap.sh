@@ -1142,6 +1142,7 @@ write_file .gitignore <<'SCAFFOLD_EOF'
 
 # Saved plans are sensitive artifacts, not review attachments.
 tfplan
+tfplan.site
 *.tfplan
 plan.json
 plan.txt
@@ -1248,12 +1249,18 @@ tags: ## List the VMs tagged from Terraform at SITE
 	@$(PYTHON) scripts/tag-vm.py --site "$(SITE)" --list
 
 .PHONY: import
-import: ## Adopt an existing estate: SITE=<site> [DUMP=<file>]
-	@if [ -n "$(DUMP)" ]; then \
-		$(PYTHON) scripts/import-estate.py --site "$(SITE)" --from-dump "$(DUMP)"; \
+import: ## Adopt existing objects: SITE=<site> [DUMP=<file>] [POLICY="id1 id2"] [TRANCHE=<name>]
+	@set -- ; for p in $(POLICY); do set -- "$$@" --policy "$$p"; done; \
+	[ -z "$(TRANCHE)" ] || set -- "$$@" --tranche "$(TRANCHE)"; \
+	if [ -n "$(DUMP)" ]; then \
+		$(PYTHON) scripts/import-estate.py --site "$(SITE)" --from-dump "$(DUMP)" "$$@"; \
 	else \
-		scripts/with-credentials.sh "$(SITE)" -- $(PYTHON) scripts/import-estate.py --site "$(SITE)"; \
+		scripts/with-credentials.sh "$(SITE)" -- $(PYTHON) scripts/import-estate.py --site "$(SITE)" "$$@"; \
 	fi
+
+.PHONY: hand-back
+hand-back: ## Stop managing one object, without deleting it: STACK=<stack> ADDRESS='<resource address>'
+	@$(PYTHON) scripts/hand-back.py --stack "$(STACK)" --address '$(ADDRESS)'
 
 .PHONY: drift
 drift: ## Report drift for STACK at SITE. Reports only — never reverts, never writes data/.
@@ -1277,7 +1284,7 @@ apply: ## Apply the SAVED plan for STACK/SITE. Requires APPROVE=yes and a human 
 
 .PHONY: clean
 clean: ## Remove local plan files and python caches (never touches state)
-	@find . -name 'tfplan' -o -name '*.tfplan' -o -name 'plan.json' | xargs -r rm -f
+	@find . -name 'tfplan' -o -name 'tfplan.site' -o -name '*.tfplan' -o -name 'plan.json' | xargs -r rm -f
 	@find . -name '__pycache__' -type d | xargs -r rm -rf
 SCAFFOLD_EOF
 
@@ -1307,134 +1314,163 @@ indent_style = tab
 SCAFFOLD_EOF
 
 write_file docs/IMPORT.md <<'SCAFFOLD_EOF'
-# Starting from the estate you already have
+# Adopting the estate you already have
 
-You are not building a new network. NSX is already running, the rules already
-carry traffic, and nothing here may create a second copy of any of it.
+NSX is already running and the rules already carry traffic. Nothing here may
+create a second copy of any of it, change it on the way in, or delete it by
+accident. The approach is **adopt, never recreate**, one piece of one manager
+at a time, with every step reversible.
 
-The whole approach is **adopt, never recreate**: read what exists, write it out
-as data, and hand Terraform the existing objects by id so that the first apply
-changes nothing at all. A tranche is finished when `terraform plan` says *no
-changes* — not when it applies cleanly.
+## What you can rely on, and what enforces it
+
+| Guarantee | Enforced by |
+|---|---|
+| Pointing the pipeline at a manager changes nothing until you adopt something. Terraform only acts on objects in `data/`; it never touches what is not there. | Every resource is `for_each` over data. A manager with no data plans **no changes**. |
+| Adoption imports; it never creates, edits or deletes. | `scripts/plan-guard.py`, run by `scripts/tf.sh` after every plan and again before every apply: while a tranche is open, any create, update or destroy fails the plan. |
+| Nothing live is deleted unless that exact object is approved, in the merge request. | `plan-guard.py` refuses every destroy and replace not listed in `allow-destroy.txt`. Policies additionally carry `prevent_destroy`. |
+| An object is never built twice. | Objects keep their real NSX id (`nsx_id`), so a create of an existing object fails at the provider (`Resource with id … already exists`) before any write. |
+| Nothing is adopted lossily. | `import-estate.py` adopts only what it can represent exactly; the rest stays in the UI and is listed. |
+| A tranche on one manager does not affect the others that share the stack. | Import files are gated on `var.site`; the working directory is re-initialised per manager, and a saved plan only applies to the manager it was made for. |
+| Any adoption can be undone without touching NSX. | `scripts/hand-back.py` (below). |
 
 ## Before you start
 
-1. `make preflight`
-2. Put the real managers in `inventory/managers.yaml` and add one
+1. `make preflight`, and the managers in `inventory/managers.yaml` with one
    `envs/<site>.backend.hcl` each.
-3. Pick a **pilot**: one site, one application. Not the busiest one, and not
-   production-critical on the first pass.
+2. Pick a **pilot**: one Local Manager, one application policy. Not the busiest
+   one, and not production-critical on the first pass.
+3. Run a plan for that manager with no data. It must say **no changes**. That is
+   your proof that the tooling is inert until you adopt something.
 
-## Step 1 — capture the estate
-
-Credentials come from the environment, never from a file:
-
-```bash
-scripts/with-credentials.sh lon1 -- scripts/import-estate.py \
-    --site lon1 --dump-only reports/lon1-raw.json
-```
-
-`reports/` is gitignored. The dump is a read-only snapshot of your security
-posture — treat it like a plan file.
-
-Capturing separately from converting means you can iterate on the conversion
-without hammering the manager, and you can review exactly what was read.
-
-## Step 2 — convert it to data
+## 1. Capture, read-only
 
 ```bash
-scripts/import-estate.py --site lon1 --from-dump reports/lon1-raw.json
+scripts/with-credentials.sh lon1 -- scripts/import-estate.py --site lon1 \
+    --dump-only reports/lon1-raw.json
 ```
 
-Which writes:
+A read-only snapshot of groups, services and policies. `reports/` is gitignored;
+treat the dump like a plan file. Capturing once and converting offline means you
+can iterate without touching the manager.
 
-| File | What it holds |
+## 2. Convert one piece
+
+```bash
+make import SITE=lon1 DUMP=reports/lon1-raw.json POLICY="legacy-app"
+```
+
+`POLICY` takes one or more policy ids; `TRANCHE=<name>` names the piece of work
+(default: the first policy). Only those policies are converted, with exactly what
+they need: the groups they reference (nested groups followed through), and their
+custom services. Anything already in `data/` is skipped: it is managed already.
+
+| Written | Holds |
 |---|---|
-| `data/groups/imported-<site>.yaml` | groups, with NSX expressions converted to criteria |
-| `data/policies/<policy-id>.yaml` | one file per policy — this is what makes rule reuse work |
-| `data/services/imported-<site>.yaml` | custom services; predefined ones are referenced, not copied |
-| `stacks/<stack>/import.tf` | the import blocks |
-| `data/.import-manifest.json` | what was imported and from where |
+| `data/policies/<policy-id>.yaml` | the policy and its rules; new rules for it go here |
+| `data/groups/imported-<site>-<tranche>.yaml` | the groups it needs |
+| `data/services/imported-<site>-<tranche>.yaml` | its custom services, scoped to the site |
+| `stacks/<stack>/import-<site>-<tranche>.tf` | the import blocks, for this site only |
 
-**Nothing you already have is overwritten.** If a target exists the tool writes
-`<name>.new` beside it and tells you, so you diff and merge by hand.
+Nothing you already have is overwritten: an existing target is written as
+`<name>.new` for you to diff.
 
-## Step 3 — read what it produced
+**What is not adopted, and stays in the UI.** The report lists each one and why.
+Importing them would change them on the first apply, because Terraform clears
+any setting it does not manage:
 
-This is the step people skip. The converter is faithful, not clever:
+- groups with MAC, external-id or identity (AD) membership, or extended criteria,
+  and groups that nest one of those;
+- services with entries other than TCP/UDP ports and ICMP;
+- rules with inline service entries, or that use one of the above. The rest of
+  their policy is still adopted: Terraform manages rules one by one and leaves
+  the others alone;
+- a policy whose Apply To uses one of the above.
 
-- Every group with static IP membership gets a placeholder `why_static`. Replace
-  it with the real reason, or make the group dynamic.
-- Tag scopes must exist in `data/schema/tag-scopes.yaml`. Real estates contain
-  scopes nobody documented; add them deliberately rather than in bulk.
-- Rules with an empty `scope` are rules NSX is pushing to every host in the
-  span. The importer records what is there; `make validate` will fail them.
-  That failure is a finding about your estate, not a bug.
-- Object keys are the real nsx_ids and are adopted **verbatim** — mixed case and
-  underscores included. They must match or the import misses. The naming
-  convention applies to objects you create from here on, and the validator
-  knows the difference.
+## 3. Read what it produced
 
 ```bash
 make validate
 ```
 
-## Step 4 — import one tranche
+- Every group with static IP membership has a placeholder `why_static`. Replace
+  it with the real reason.
+- Tag scopes must be in `data/schema/tag-scopes.yaml`. Add the ones your estate
+  uses deliberately; a typo there silently empties a group.
+- A rule with an empty `scope` is pushed to every host in the span. The
+  validator fails it: that is a finding about your estate, not a bug.
+- Object keys are the real NSX ids, kept verbatim (mixed case included). The
+  naming convention applies to objects you create from here on.
 
-```bash
-scripts/with-credentials.sh lon1 -- scripts/tf.sh plan local-security lon1
-scripts/tf.sh show local-security lon1
+## 4. Plan, review, apply: a merge request per tranche
+
+The tranche goes through the pipeline like any change. The plan must read:
+
+```
+Plan: N to import, 0 to add, 0 to change, 0 to destroy.
+plan-guard lon1/local-security, import tranche (must be pure): N import, 0 create, 0 update, 0 destroy/replace
 ```
 
-Read the plan against this bar:
+Anything else and the plan job fails, saying which objects and why:
 
-- Every object appears as an **import**, not a create.
-- **Zero** creates, updates or destroys. A create means Terraform did not
-  recognise something that exists — stop; do not apply, or you get a duplicate.
-- An update usually means the data does not match reality yet. Fix the data,
-  not the manager.
+| Refused | Meaning | Do |
+|---|---|---|
+| update | the data does not match the live object yet | fix the data to match NSX, re-plan. Never "fix" NSX to match the data during adoption |
+| create | an object would be built a second time, or its import is missing | find the object's real id; add the import |
+| `Cannot import non-existent remote object` | the import id is wrong; nothing was written to state | re-run the converter with `--id-format domain-id` or `id` |
 
-When the plan is a pure import:
+There is no override for these during adoption, on purpose.
+
+Apply from the default branch as usual. Then the next plan must report **no
+changes**. Delete `stacks/<stack>/import-<site>-<tranche>.tf` in its own small
+merge request: until you do, `plan-guard` keeps that stack in import-only mode
+for that site and tells you so.
+
+## 5. Next piece
+
+Repeat 2 to 4. One policy, or one small related set, per merge request. Each
+tranche is independent and can be stopped at any point; nothing half-adopted
+affects traffic, because adoption never changes anything in NSX.
+
+## Undo: hand an object back to the UI
+
+To stop managing something without deleting it, for example to undo an
+adoption or retire a rule from code while it keeps running:
 
 ```bash
-APPROVE=yes scripts/with-credentials.sh lon1 -- \
-    scripts/tf.sh apply local-security lon1
+make hand-back STACK=local-security \
+  ADDRESS='module.policies["legacy-app"].nsxt_policy_security_policy_rule.this["old-rule"]'
 ```
 
-Then confirm the follow-up plan is empty, and delete `import.tf` — import blocks
-are one-shot.
+and, in the same merge request, remove it from `data/`. The plan says the object
+"will no longer be managed by Terraform, but will not be destroyed", and nothing
+else. Terraform refuses the plan if the object is still in `data/`, so the two
+cannot get out of step. The resource address is the one shown in the plan or by
+`terraform state list`.
 
-### If every import fails with a not-found error
+## Deleting something on purpose
 
-The id format is wrong for your provider version, and **nothing has been written
-to state** — it is a safe failure. Re-run the converter with a different form:
+Remove it from `data/`, and add one line per object to `allow-destroy.txt` at the
+repository root, in the same merge request:
 
-```bash
-scripts/import-estate.py --site lon1 --from-dump reports/lon1-raw.json --id-format domain-id
+```
+# <site> <stack> <resource address>
+lon1 local-security module.policies["legacy-app"].nsxt_policy_security_policy_rule.this["old-rule"]
 ```
 
-`path` (the default), `domain-id` and `id` are the three the nsxt provider has
-used. Confirm on the pilot; the rest of the estate then uses the same one.
-
-## Step 5 — repeat, one tranche at a time
-
-One policy or one site per pass, each its own PR. A PR spanning multiple sites
-cannot be rolled back cleanly.
+The refused plan prints these lines ready to paste. Remove them after the apply;
+`plan-guard` reports lines that no longer match anything. Deleting a whole
+policy also needs its `prevent_destroy` lifted in a reviewed commit.
 
 ## After the import: your data is yours
 
-Two guarantees, both enforced rather than documented:
-
 - `bootstrap.sh` will not overwrite estate data with `--force`, and refuses
-  outright — even with `--force-data` — for anything in the import manifest.
-- Drift detection is read-only. `scripts/drift.sh` runs a refresh-only plan,
-  writes its report to `reports/`, and **never** writes back into `data/`. Drift
-  is a ticket for a human, not an automatic rewrite of your imported estate.
+  outright, even with `--force-data`, anything in `data/.import-manifest.json`.
+- Drift detection is read-only: `scripts/drift.sh` writes a report and never
+  writes back into `data/`. Drift is a ticket for a human.
 
 ## Adding a rule after importing
 
-The point of one-file-per-policy: the rule goes into the policy that already
-exists.
+A new rule goes into the policy that already exists:
 
 ```bash
 scripts/add-rule.py --policy legacy-app --rule allow-monitoring \
@@ -1442,10 +1478,9 @@ scripts/add-rule.py --policy legacy-app --rule allow-monitoring \
     --service https --scope legacy-web
 ```
 
-It finds `legacy-app` by id or display name, appends to that file, and allocates
-the next free sequence number. If the policy does not exist it stops and tells
-you — creating one needs `--create-policy`, because a new policy is a new
-category placement, a new ordering, and a new blast radius.
+It finds the policy by id or display name, appends to that file and allocates the
+next free sequence number. Creating a new policy needs `--create-policy`, because
+a new policy is a new category placement, a new ordering and a new blast radius.
 SCAFFOLD_EOF
 
 write_file README.md <<'SCAFFOLD_EOF'
@@ -1882,8 +1917,11 @@ fails on a stale plan rather than quietly doing something nobody reviewed.
 |---|---|
 | Nobody can push to the default branch | branch protection, on the git host |
 | A change needs another person | merge request approval rules |
-| Plans cannot write | `VAULT_PLAN_TOKEN` is read-only |
-| Only protected branches can write | `VAULT_APPLY_TOKEN` marked **protected** |
+| Plans cannot write | a read-only plan credential: `VAULT_PLAN_TOKEN`, or the `NSX_PLAN_*` account |
+| Only protected branches can write | the apply credential marked **protected**: `VAULT_APPLY_TOKEN` or `NSX_APPLY_*` |
+| Nothing live is deleted by accident | `scripts/plan-guard.py` fails any plan that destroys or replaces an object not listed in `allow-destroy.txt` |
+| Adoption never creates, edits or deletes | `scripts/plan-guard.py`: while an import tranche is open, the plan may only import |
+| A plan is applied only to the manager it was made for | `scripts/tf.sh` records the manager with the saved plan and re-initialises per manager |
 | Apply needs a human | manual job + protected environment |
 | Apply cannot re-plan | `scripts/tf.sh apply` refuses without a saved plan and `APPROVE=yes` |
 | Bad data never reaches a plan | `scripts/validate-data.py` in the validate stage |
@@ -2034,8 +2072,10 @@ says what Terraform will do.
 
 - **Resource count delta matches the intent.** One rule added should not be
   fourteen resources changed.
-- **No unexpected destroys.** A destroy on a rule nobody touched means map keys
-  shifted — stop and find out why before approving.
+- **No unexpected destroys.** The plan job already fails on any destroy not
+  approved in `allow-destroy.txt`, so a destroy you see was asked for in this
+  merge request: check that `allow-destroy.txt` names exactly the objects the
+  change means to remove, and nothing else.
 - **`scope` is set on everything new or changed.** An unscoped rule goes to every
   hypervisor in the span.
 - **The default rule and the Emergency category are untouched**, unless that is
@@ -2591,6 +2631,8 @@ write_file data/schema/policy.schema.json <<'SCAFFOLD_EOF'
         "stateful": { "type": "boolean" },
         "tcp_strict": { "type": "boolean" },
         "locked": { "type": "boolean" },
+        "comments": { "type": "string" },
+        "tags": { "type": "array", "items": { "type": "object", "required": ["scope", "tag"], "additionalProperties": false, "properties": { "scope": { "type": "string" }, "tag": { "type": "string" } } } },
         "scope": {
           "type": "array",
           "minItems": 1,
@@ -2623,6 +2665,7 @@ write_file data/schema/policy.schema.json <<'SCAFFOLD_EOF'
           "notes": { "type": "string" },
           "log_label": { "type": "string" },
           "profiles": { "type": "array", "items": { "type": "string" } },
+          "tags": { "type": "array", "items": { "type": "object", "required": ["scope", "tag"], "additionalProperties": false, "properties": { "scope": { "type": "string" }, "tag": { "type": "string" } } } },
           "source_groups": { "type": "array", "items": { "type": "string" } },
           "destination_groups": { "type": "array", "items": { "type": "string" } },
           "sources_excluded": { "type": "boolean" },
@@ -2668,6 +2711,11 @@ write_file data/schema/service.schema.json <<'SCAFFOLD_EOF'
           "display_name": { "type": "string", "minLength": 1 },
           "description": { "type": "string" },
           "owner": { "enum": ["gm", "lm"] },
+          "sites": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Required for owner=lm: the Local Managers it is created on, or [\"*\"] for all."
+          },
           "l4_port_set": {
             "type": "array",
             "items": {
@@ -3320,6 +3368,17 @@ resource "nsxt_policy_parent_security_policy" "this" {
   stateful        = try(var.policy.stateful, true)
   tcp_strict      = try(var.policy.tcp_strict, null)
   locked          = try(var.policy.locked, false)
+  comments        = try(var.policy.comments, null)
+
+  # Tags are part of the object: a tag not listed here is removed on apply.
+  dynamic "tag" {
+    for_each = try(var.policy.tags, [])
+
+    content {
+      scope = tag.value.scope
+      tag   = tag.value.tag
+    }
+  }
 
   # Apply To. Mandatory — see the validation on var.policy.
   scope = local.policy_scope
@@ -3368,6 +3427,15 @@ resource "nsxt_policy_security_policy_rule" "this" {
   destinations_excluded = try(each.value.destinations_excluded, false)
   services              = local.rule_services[each.key]
   profiles              = try(each.value.profiles, null)
+
+  dynamic "tag" {
+    for_each = try(each.value.tags, [])
+
+    content {
+      scope = tag.value.scope
+      tag   = tag.value.tag
+    }
+  }
 
   # Apply To. Without it the rule is distributed to every hypervisor in the
   # policy's span; host rule capacity is finite and this is a multi-site span.
@@ -4238,7 +4306,13 @@ locals {
 
   predefined_services = merge([for d in local.service_docs : try(d.predefined, {})]...)
   custom_services_all = merge([for d in local.service_docs : try(d.custom, {})]...)
-  custom_services     = { for k, v in local.custom_services_all : k => v if try(v.owner, "gm") == "lm" }
+  # A site-local service is created only on the Local Managers it lists. One with
+  # no sites keeps the old meaning, every Local Manager; the validator asks for
+  # the list to be explicit.
+  custom_services = {
+    for k, v in local.custom_services_all : k => v
+    if try(v.owner, "gm") == "lm" && (contains(try(v.sites, ["*"]), var.site) || contains(try(v.sites, ["*"]), "*"))
+  }
 
   service_paths = merge(
     { for k, s in data.nsxt_policy_service.predefined : k => s.path },
@@ -4799,19 +4873,64 @@ run() {
 # sharing one state file.
 uses_local_backend() { grep -q 'backend "local"' "$stack_dir/backend.tf" 2>/dev/null; }
 
+# Every saved plan passes scripts/plan-guard.py: nothing live is destroyed unless
+# allow-destroy.txt approves it, and an import tranche only imports. Run after
+# each plan and again before each apply, so a hand-run apply is held to it too.
+guard() {
+	(cd "$stack_dir" && terraform show -json tfplan) |
+		python3 "$REPO_ROOT/scripts/plan-guard.py" --site "$site" --stack "$stack"
+}
+
 backend_args=(-backend-config="$backend_file")
 if uses_local_backend; then
 	mkdir -p "$REPO_ROOT/.local-state"
 	backend_args+=(-backend-config="path=$REPO_ROOT/.local-state/${site}-${stack}.tfstate")
 fi
 
+# Every manager has its own state, but they share the stack directory. So the
+# working directory records which manager it was initialised for, and is
+# initialised again whenever that changes. Without this, planning a second
+# manager from the same checkout reuses the first one's state: the second plan
+# then destroys the first manager's objects, through the second's credentials.
+site_marker="$stack_dir/.terraform/nsx-site"
+init_for_site() {
+	run init -reconfigure -input=false "${backend_args[@]}" "$@"
+	printf '%s\n' "$site" >"$site_marker"
+}
+ensure_init() {
+	if [ "$(cat "$site_marker" 2>/dev/null)" != "$site" ]; then
+		init_for_site
+	fi
+}
+
+# A saved plan belongs to the manager it was made for. tfplan.site records that,
+# and show and apply refuse a plan made for another manager, or one with no
+# record, instead of applying it through this manager's credentials.
+plan_site_file="$plan_file.site"
+require_plan_for_site() {
+	local recorded
+	recorded="$(cat "$plan_site_file" 2>/dev/null || true)"
+	if [ "$recorded" != "$site" ]; then
+		echo "error: stacks/$stack/tfplan was made for '${recorded:-an unknown manager}', not '$site'. Run: scripts/tf.sh plan $stack $site" >&2
+		exit 1
+	fi
+}
+
 case "$cmd" in
 init)
-	run init -reconfigure "${backend_args[@]}" "$@"
+	init_for_site "$@"
 	;;
 plan)
-	[ -d "$stack_dir/.terraform" ] || run init -reconfigure "${backend_args[@]}"
+	ensure_init
+	rm -f "$plan_file" "$plan_site_file"
 	run plan -out=tfplan -parallelism="$PARALLELISM" -input=false "$@"
+	printf '%s\n' "$site" >"$plan_site_file"
+	echo
+	if ! guard; then
+		echo
+		echo "the plan is kept in stacks/$stack/tfplan for review, and will not be applied as it stands." >&2
+		exit 2
+	fi
 	echo
 	echo "plan written to stacks/$stack/tfplan — a sensitive artifact, not a PR attachment."
 	echo "review it with: scripts/tf.sh show $stack $site"
@@ -4821,6 +4940,8 @@ show)
 		echo "error: no saved plan. Run: scripts/tf.sh plan $stack $site" >&2
 		exit 1
 	}
+	require_plan_for_site
+	ensure_init
 	run show tfplan
 	;;
 apply)
@@ -4832,12 +4953,18 @@ apply)
 		echo "error: apply requires an explicit human decision. Re-run with APPROVE=yes after reviewing the plan." >&2
 		exit 1
 	fi
+	require_plan_for_site
+	ensure_init
+	if ! guard; then
+		echo "error: refusing to apply: the saved plan does not pass plan-guard (above)." >&2
+		exit 2
+	fi
 	if uses_local_backend && [ "${ALLOW_LOCAL_STATE:-}" != 1 ]; then
 		echo "error: stack $stack is still on the placeholder local backend. State carries the security posture of the estate and needs a remote, encrypted, locked backend before any real apply. Set ALLOW_LOCAL_STATE=1 only for a lab." >&2
 		exit 1
 	fi
 	run apply -parallelism="$PARALLELISM" -input=false tfplan
-	rm -f "$plan_file"
+	rm -f "$plan_file" "$plan_site_file"
 	;;
 *)
 	usage 1
@@ -5687,6 +5814,10 @@ def walk_strings(value, trail: str = ""):
 
 def check_no_raw_paths(where: str, doc: dict, report: Report) -> None:
     for trail, value in walk_strings(doc):
+        # Context profiles (App-ID, FQDN) have no module to resolve a name: a rule
+        # refers to them by path, and only them.
+        if ".profiles[" in trail and "/context-profiles/" in value:
+            continue
         if value.startswith("/infra/") or value.startswith("/global-infra/"):
             report.error(
                 where,
@@ -5877,7 +6008,7 @@ def check_groups(docs: dict[Path, dict], scopes: dict, sites: set[str], imported
     return groups
 
 
-def check_services(docs: dict[Path, dict], imported: set[str], report: Report) -> dict[str, dict]:
+def check_services(docs: dict[Path, dict], sites: set[str], imported: set[str], report: Report) -> dict[str, dict]:
     schema = load_schema("service.schema.json")
     services: dict[str, dict] = {}
     origin: dict[str, str] = {}
@@ -5902,6 +6033,16 @@ def check_services(docs: dict[Path, dict], imported: set[str], report: Report) -
                 continue
             if not (service.get("l4_port_set") or service.get("icmp")):
                 report.error(where, f"service {name!r} has no entries — it would match nothing.")
+            service_sites = service.get("sites") or []
+            if service.get("owner", "gm") == "lm" and not service_sites:
+                report.error(
+                    where,
+                    f"service {name!r} is site-local but lists no sites, so it is created on EVERY Local "
+                    "Manager. List the sites, or sites: [\"*\"] if that is the intent.",
+                )
+            for site in service_sites:
+                if site != "*" and site not in sites:
+                    report.error(where, f"service {name!r}: site {site!r} is not in inventory/managers.yaml")
             services[name] = {"kind": "custom", "owner": service.get("owner", "gm")}
             origin[name] = where
             check_key_style(where, "service", name, imported, report)
@@ -6246,7 +6387,7 @@ def main() -> int:
 
     imported = imported_files()
     groups = check_groups(group_docs, scopes, sites, imported, report)
-    services = check_services(service_docs, imported, report)
+    services = check_services(service_docs, sites, imported, report)
     check_policies(policy_docs, groups, services, sites, imported, report)
     tagged_vms = check_vm_tags(scopes, sites, report)
     check_env_backends(report)
@@ -6726,13 +6867,24 @@ Two sources:
       --dump-only reports/lon1-raw.json
   scripts/import-estate.py --site lon1 --from-dump reports/lon1-raw.json
 
-What it writes (never over the top of anything):
+One piece at a time: --policy adopts only the named policies (repeat it) and
+what they need, the groups they reference (nested groups included) and their
+custom services. Anything already in data/ is skipped: it is managed already.
 
-  data/groups/imported-<site>.yaml     groups, criteria converted from expressions
-  data/policies/<policy-id>.yaml       one file per policy, so add-rule.py finds it
-  data/services/imported-<site>.yaml   custom services; predefined ones referenced
-  stacks/<stack>/import.tf             import blocks for terraform
-  data/.import-manifest.json           what was imported, and from where
+  scripts/import-estate.py --site lon1 --from-dump reports/lon1-raw.json \
+      --policy legacy-app --tranche legacy-app
+
+What it writes (never over the top of anything). <tranche> is --tranche, or
+"all" for a whole manager:
+
+  data/groups/imported-<site>-<tranche>.yaml     groups, criteria from expressions
+  data/policies/<policy-id>.yaml                 one file per policy, for add-rule.py
+  data/services/imported-<site>-<tranche>.yaml   custom services; predefined referenced
+  stacks/<stack>/import-<site>-<tranche>.tf      import blocks, for this site only
+  data/.import-manifest.json                     what was imported, and from where
+
+The import blocks are guarded by the site, so a tranche for one Local Manager
+never touches the plans of the others that share the stack.
 
 If a target file already exists it is written as <name>.new and reported. Your
 data is never overwritten by this tool, and bootstrap.sh refuses to overwrite
@@ -6750,6 +6902,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import ssl
 import sys
 import urllib.error
@@ -6801,7 +6954,16 @@ def api_get(host: str, path: str, user: str, password: str, insecure: bool) -> d
 
 def fetch_estate(host: str, user: str, password: str, base: str, domain: str, insecure: bool) -> dict:
     def results(path: str) -> list:
-        return api_get(host, path, user, password, insecure).get("results", [])
+        # The policy API pages lists (1000 per page by default). Follow the cursor,
+        # or a large estate is silently cut short.
+        out: list = []
+        cursor = None
+        while True:
+            page = api_get(host, path + (f"?cursor={urllib.parse.quote(cursor)}" if cursor else ""), user, password, insecure)
+            out.extend(page.get("results", []))
+            cursor = page.get("cursor")
+            if not cursor:
+                return out
 
     print(f"reading {host} ({base}, domain {domain})", file=sys.stderr)
     groups = results(f"{base}/domains/{domain}/groups")
@@ -6901,6 +7063,10 @@ def to_yaml(value) -> str:
 # Conversion
 # --------------------------------------------------------------------------
 
+def tags_of(obj: dict) -> list[dict]:
+    return [{"scope": t.get("scope", ""), "tag": t.get("tag", "")} for t in obj.get("tags") or []]
+
+
 def condition(expression: dict) -> dict:
     return {
         "key": expression.get("key", "Tag"),
@@ -6951,6 +7117,8 @@ def convert_group(group: dict, path_to_name: dict, owner: str, sites: list[str])
         out["conjunction"] = conjunction
     if criteria:
         out["criteria"] = criteria
+    if tags_of(group):
+        out["tags"] = tags_of(group)
     return out
 
 
@@ -6992,6 +7160,15 @@ def convert_rule(rule: dict, group_paths: dict, service_paths: dict) -> dict:
     if rule.get("disabled"):
         converted["disabled"] = True
     converted["logged"] = bool(rule.get("logged", False))
+    if rule.get("notes"):
+        converted["notes"] = rule["notes"]
+    if rule.get("tag"):
+        converted["log_label"] = rule["tag"]
+    profiles = [p for p in rule.get("profiles") or [] if p != "ANY"]
+    if profiles:
+        converted["profiles"] = profiles
+    if tags_of(rule):
+        converted["tags"] = tags_of(rule)
     converted["scope"] = scope
     return converted
 
@@ -7012,6 +7189,10 @@ def convert_policy(policy: dict, group_paths: dict, service_paths: dict, owner: 
         header["stateful"] = False
     if policy.get("locked"):
         header["locked"] = True
+    if policy.get("comments"):
+        header["comments"] = policy["comments"]
+    if tags_of(policy):
+        header["tags"] = tags_of(policy)
     header["rule_management"] = "standalone"
     header["scope"] = [
         group_paths.get(p, p) for p in policy.get("scope", []) if p != "ANY"
@@ -7037,11 +7218,15 @@ def convert_service(service: dict) -> dict:
                 "protocol": entry.get("l4_protocol", "TCP"),
                 "destination_ports": [str(p) for p in entry.get("destination_ports", [])],
             }
+            if entry.get("display_name"):
+                item["display_name"] = entry["display_name"]
             if entry.get("source_ports"):
                 item["source_ports"] = [str(p) for p in entry["source_ports"]]
             l4.append(item)
         elif kind == "ICMPTypeServiceEntry":
             item = {"protocol": entry.get("protocol", "ICMPv4")}
+            if entry.get("display_name"):
+                item["display_name"] = entry["display_name"]
             if entry.get("icmp_type") is not None:
                 item["icmp_type"] = str(entry["icmp_type"])
             if entry.get("icmp_code") is not None:
@@ -7052,6 +7237,69 @@ def convert_service(service: dict) -> dict:
     if icmp:
         out["icmp"] = icmp
     return out
+
+
+# What this converter and the modules represent exactly. Anything else would be
+# lost on the first apply (an unset attribute is cleared), so such objects are
+# never adopted: they stay in the UI and are reported.
+GROUP_EXPRESSIONS = {"Condition", "NestedExpression", "IPAddressExpression", "PathExpression", "ConjunctionOperator"}
+SERVICE_ENTRIES = {"L4PortSetServiceEntry", "ICMPTypeServiceEntry"}
+
+
+def group_unsupported(group: dict) -> str | None:
+    kinds = set()
+    for expression in group.get("expression", []):
+        kinds.add(expression.get("resource_type"))
+        if expression.get("resource_type") == "NestedExpression":
+            inner = {e.get("resource_type") for e in expression.get("expressions", [])}
+            if inner - {"Condition", "ConjunctionOperator"}:
+                return "nested expression containing " + ", ".join(sorted(str(k) for k in inner - {"Condition", "ConjunctionOperator"}))
+    if kinds - GROUP_EXPRESSIONS:
+        return "membership by " + ", ".join(sorted(str(k) for k in kinds - GROUP_EXPRESSIONS))
+    if group.get("extended_expression"):
+        return "extended criteria (identity firewall)"
+    if group.get("group_type"):
+        return "group_type " + ", ".join(group["group_type"])
+    return None
+
+
+def service_unsupported(service: dict) -> str | None:
+    kinds = {e.get("resource_type") for e in service.get("service_entries", [])} - SERVICE_ENTRIES
+    return ("service entries of type " + ", ".join(sorted(str(k) for k in kinds))) if kinds else None
+
+
+def unsupported_objects(groups: list[dict], services: list[dict]) -> dict[str, str]:
+    """path -> reason, for groups and custom services that cannot be adopted.
+    A group that nests an unsupported group is unsupported too."""
+    bad: dict[str, str] = {}
+    for g in groups:
+        if not is_system(g) and (why := group_unsupported(g)):
+            bad[g["path"]] = why
+    for s in services:
+        if not is_system(s) and (why := service_unsupported(s)):
+            bad[s["path"]] = why
+    changed = True
+    while changed:
+        changed = False
+        for g in groups:
+            if g.get("path") in bad or is_system(g):
+                continue
+            for expression in g.get("expression", []):
+                hit = [p for p in expression.get("paths", []) if p in bad] if expression.get("resource_type") == "PathExpression" else []
+                if hit:
+                    bad[g["path"]] = "nests " + ", ".join(h.rsplit("/", 1)[-1] for h in hit)
+                    changed = True
+                    break
+    return bad
+
+
+def rule_unsupported(rule: dict, bad: dict[str, str]) -> str | None:
+    if rule.get("service_entries"):
+        return "inline service entries"
+    used = [p for f in ("source_groups", "destination_groups", "scope", "services") for p in rule.get(f) or [] if p in bad]
+    if used:
+        return "uses " + ", ".join(sorted({u.rsplit("/", 1)[-1] for u in used})) + " (not adoptable)"
+    return None
 
 
 def is_system(obj: dict) -> bool:
@@ -7089,9 +7337,87 @@ def import_block(address: str, identifier: str) -> str:
 def object_id(kind: str, domain: str, path: str, nsx_id: str, fmt: str) -> str:
     if fmt == "path":
         return path
-    if fmt == "domain-id":
+    if fmt == "domain-id" and kind != "service":
         return f"{domain}/{nsx_id}"
     return nsx_id
+
+
+def hcl_string(value: str) -> str:
+    """A Terraform string literal: JSON escaping, plus HCL's own template markers."""
+    return json.dumps(value).replace("${", "$${").replace("%{", "%%{")
+
+
+def ident(text: str) -> str:
+    return re.sub(r"[^a-z0-9_]", "_", text.lower())
+
+
+def import_file(site: str, tranche: str, role: str, kinds: list[tuple[str, str, dict]], header: str) -> str:
+    """Import blocks for one tranche, one block per resource kind, each a for_each
+    over a map. On a Local Manager the map is empty unless var.site is this site,
+    so the file is inert in every other manager's plan of the same stack."""
+    name = f"import_{ident(site)}_{ident(tranche)}"
+    lines = [header, "locals {"]
+    for kind, _, entries in kinds:
+        lines.append(f"  {name}_{kind} = {{")
+        for key, value in entries.items():
+            if isinstance(value, dict):
+                inner = ", ".join(f"{k} = {hcl_string(v)}" for k, v in value.items())
+                lines.append(f"    {hcl_string(key)} = {{ {inner} }}")
+            else:
+                lines.append(f"    {hcl_string(key)} = {hcl_string(value)}")
+        lines.append("  }")
+    lines.append("}")
+    lines.append("")
+    for kind, to, entries in kinds:
+        if not entries:
+            continue
+        source = f"local.{name}_{kind}"
+        if role != "gm":
+            source = f"var.site == {hcl_string(site)} ? {source} : {{}}"
+        value = "each.value.id" if "each.value.policy" in to else "each.value"
+        lines += ["import {", f"  for_each = {source}", f"  to       = {to}", f"  id       = {value}", "}", ""]
+    return "\n".join(lines) + "\n"
+
+
+def existing_keys() -> dict[str, set[str]]:
+    """What data/ already declares: those objects are managed and never re-imported."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from yamlcompat import load_yaml  # noqa: PLC0415
+
+    found: dict[str, set[str]] = {"groups": set(), "services": set(), "policies": set()}
+    for f in sorted((DATA / "groups").glob("*.yaml")):
+        found["groups"].update(((load_yaml(f.read_text()) or {}).get("groups") or {}).keys())
+    for f in sorted((DATA / "services").glob("*.yaml")):
+        found["services"].update(((load_yaml(f.read_text()) or {}).get("custom") or {}).keys())
+    for f in sorted((DATA / "policies").glob("*.yaml")):
+        doc = load_yaml(f.read_text()) or {}
+        found["policies"].add(str((doc.get("policy") or {}).get("id") or f.stem))
+    return found
+
+
+def needed_by(policies: list[dict], groups: list[dict]) -> tuple[set[str], set[str]]:
+    """Group and service paths the policies use, nested groups followed to the end."""
+    group_paths: set[str] = set()
+    service_paths: set[str] = set()
+    for policy in policies:
+        group_paths.update(policy.get("scope") or [])
+        for rule in policy.get("rules", []):
+            for field in ("source_groups", "destination_groups", "scope"):
+                group_paths.update(rule.get(field) or [])
+            service_paths.update(rule.get("services") or [])
+    by_path = {g.get("path"): g for g in groups}
+    pending = list(group_paths)
+    while pending:
+        group = by_path.get(pending.pop())
+        for expression in (group or {}).get("expression", []):
+            if expression.get("resource_type") == "PathExpression":
+                for nested in expression.get("paths", []):
+                    if nested not in group_paths:
+                        group_paths.add(nested)
+                        pending.append(nested)
+    group_paths.discard("ANY")
+    service_paths.discard("ANY")
+    return group_paths, service_paths
 
 
 def main() -> int:
@@ -7106,7 +7432,14 @@ def main() -> int:
     ap.add_argument("--id-format", choices=["path", "domain-id", "id"], default="path")
     ap.add_argument("--insecure", action="store_true", help="skip TLS verification (lab only)")
     ap.add_argument("--dry-run", action="store_true", help="report what would be written")
+    ap.add_argument("--policy", action="append", default=[], metavar="ID",
+                    help="adopt only this policy and what it needs; repeat for more")
+    ap.add_argument("--tranche", default=None, metavar="NAME",
+                    help="name for this piece of work, used in the file names (default: the first --policy, or 'all')")
     args = ap.parse_args()
+    tranche = args.tranche or (args.policy[0] if args.policy else "all")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", tranche):
+        sys.exit(f"error: --tranche '{tranche}' must be letters, digits, '.', '_' or '-'")
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from yamlcompat import load_yaml  # noqa: PLC0415
@@ -7141,14 +7474,73 @@ def main() -> int:
         print(f"wrote {out}")
         return 0
 
-    groups = estate.get("groups", [])
-    services = estate.get("services", [])
-    policies = estate.get("policies", [])
+    all_groups = estate.get("groups", [])
+    all_services = estate.get("services", [])
+    all_policies = estate.get("policies", [])
     sites = [args.site]
     owner = "gm" if role == "gm" else "lm"
 
-    group_paths = {g["path"]: g["id"] for g in groups if g.get("path")}
-    service_paths = {s["path"]: s["id"] for s in services if s.get("path")}
+    # References are converted to names using everything that was read, so a
+    # rule can name a group this tranche does not adopt.
+    group_paths = {g["path"]: g["id"] for g in all_groups if g.get("path")}
+    service_paths = {s["path"]: s["id"] for s in all_services if s.get("path")}
+
+    groups, services, policies = all_groups, all_services, all_policies
+    skipped: list[str] = []
+    if args.policy:
+        by_id = {p["id"]: p for p in all_policies}
+        missing = [i for i in args.policy if i not in by_id]
+        if missing:
+            sys.exit(f"error: no policy with id {', '.join(missing)} in what was read from {args.site}")
+        system = [i for i in args.policy if is_system(by_id[i])]
+        if system:
+            sys.exit(f"error: {', '.join(system)} is system-owned; NSX manages it, not Terraform")
+        policies = [by_id[i] for i in dict.fromkeys(args.policy)]
+        need_groups, need_services = needed_by(policies, all_groups)
+        groups = [g for g in all_groups if g.get("path") in need_groups]
+        services = [s for s in all_services if s.get("path") in need_services]
+
+        # Already in data/ means already managed: never adopt it twice.
+        have = existing_keys()
+        skipped += [f"group {g['id']}" for g in groups if g["id"] in have["groups"]]
+        skipped += [f"service {s['id']}" for s in services if s["id"] in have["services"] and not is_system(s)]
+        skipped += [f"policy {p['id']}" for p in policies if p["id"] in have["policies"]]
+        groups = [g for g in groups if g["id"] not in have["groups"]]
+        services = [s for s in services if is_system(s) or s["id"] not in have["services"]]
+        policies = [p for p in policies if p["id"] not in have["policies"]]
+
+    # Never adopt what cannot be represented exactly; report it instead.
+    bad = unsupported_objects(all_groups, all_services)
+    kept_in_ui: list[str] = []
+    for g in groups:
+        if g.get("path") in bad:
+            kept_in_ui.append(f"group {g['id']}: {bad[g['path']]}")
+    for sv in services:
+        if sv.get("path") in bad:
+            kept_in_ui.append(f"service {sv['id']}: {bad[sv['path']]}")
+    groups = [g for g in groups if g.get("path") not in bad]
+    services = [sv for sv in services if sv.get("path") not in bad]
+    adoptable = []
+    for policy in policies:
+        if is_system(policy):
+            adoptable.append(policy)
+            continue
+        blocked = [p for p in policy.get("scope") or [] if p in bad]
+        if blocked:
+            reason = f"policy {policy['id']}: its Apply To uses {', '.join(b.rsplit('/', 1)[-1] for b in blocked)} (not adoptable)"
+            if policy["id"] in args.policy:
+                sys.exit(f"error: {reason}. Nothing was written.")
+            kept_in_ui.append(reason)
+            continue
+        rules = []
+        for rule in policy.get("rules", []):
+            why = rule_unsupported(rule, bad)
+            if why:
+                kept_in_ui.append(f"rule {policy['id']}/{rule['id']}: {why}; stays in the UI, the rest of the policy is adopted")
+            else:
+                rules.append(rule)
+        adoptable.append(dict(policy, rules=rules))
+    policies = adoptable
 
     writer = Writer(args.dry_run)
 
@@ -7163,7 +7555,7 @@ def main() -> int:
             "# Review before the first apply: check every 'why_static' note, and confirm\n"
             "# the tag scopes below are in data/schema/tag-scopes.yaml.\n\n"
         )
-        writer.write(DATA / "groups" / f"imported-{args.site}.yaml", header + to_yaml({"groups": converted_groups}))
+        writer.write(DATA / "groups" / f"imported-{args.site}-{tranche}.yaml", header + to_yaml({"groups": converted_groups}))
 
     # --- services -------------------------------------------------------
     custom = {s["id"]: convert_service(s) for s in services if not is_system(s)}
@@ -7179,9 +7571,11 @@ def main() -> int:
         if custom:
             for definition in custom.values():
                 definition["owner"] = owner
+                if owner == "lm":
+                    definition["sites"] = list(sites)
             document["custom"] = custom
         header = f"# Imported from {args.site} on {datetime.now(timezone.utc):%Y-%m-%d}.\n\n"
-        writer.write(DATA / "services" / f"imported-{args.site}.yaml", header + to_yaml(document))
+        writer.write(DATA / "services" / f"imported-{args.site}-{tranche}.yaml", header + to_yaml(document))
 
     # --- policies: one file each, so add-rule.py can find them ----------
     for policy in policies:
@@ -7198,49 +7592,55 @@ def main() -> int:
 
     # --- import blocks --------------------------------------------------
     security_stack = "global-security" if role == "gm" else "local-security"
-    blocks = [
-        "# Generated by scripts/import-estate.py. Adopt existing objects into state.\n"
-        "#\n"
-        "# Run one tranche at a time:\n"
-        "#   scripts/tf.sh plan " + security_stack + " " + args.site + "\n"
-        "# and confirm the plan is a pure import with NO resource changes before\n"
-        "# applying. A tranche is done when plan reports no changes.\n"
-        "#\n"
-        f"# id format: {args.id_format}. If every import fails with a not-found error,\n"
-        "# re-run import-estate.py with a different --id-format; nothing has been\n"
-        "# written to state at that point.\n"
-        "#\n"
-        "# Delete this file once the imports are applied — import blocks are one-shot.\n\n"
-    ]
+    base: dict = {}
+    composite: dict = {}
     for group_id, definition in converted_groups.items():
         nested = any("member_groups" in c for c in definition.get("criteria", []))
-        module = "composite_groups" if nested else "base_groups"
         path = next((g["path"] for g in groups if g["id"] == group_id), "")
-        blocks.append(
-            import_block(
-                f'module.{module}.nsxt_policy_group.this["{group_id}"]',
-                object_id("group", domain, path, group_id, args.id_format),
-            )
-        )
+        (composite if nested else base)[group_id] = object_id("group", domain, path, group_id, args.id_format)
+    service_ids = {
+        s["id"]: object_id("service", domain, s.get("path", ""), s["id"], args.id_format)
+        for s in services
+        if not is_system(s) and s["id"] in custom
+    }
+    policy_ids: dict = {}
+    rule_ids: dict = {}
     for policy in policies:
         if is_system(policy):
             continue
         key = policy["id"]
-        blocks.append(
-            import_block(
-                f'module.policies["{key}"].nsxt_policy_parent_security_policy.this',
-                object_id("policy", domain, policy.get("path", ""), key, args.id_format),
-            )
-        )
+        policy_ids[key] = object_id("policy", domain, policy.get("path", ""), key, args.id_format)
         for rule in policy.get("rules", []):
-            rule_path = rule.get("path", "")
-            blocks.append(
-                import_block(
-                    f'module.policies["{key}"].nsxt_policy_security_policy_rule.this["{rule["id"]}"]',
-                    object_id("rule", domain, rule_path, f"{key}/{rule['id']}", args.id_format),
-                )
-            )
-    writer.write(REPO_ROOT / "stacks" / security_stack / "import.tf", "".join(blocks))
+            rule_ids[f"{key}/{rule['id']}"] = {
+                "policy": key,
+                "rule": rule["id"],
+                "id": object_id("rule", domain, rule.get("path", ""), f"{key}/{rule['id']}", args.id_format),
+            }
+
+    kinds = [
+        ("base_groups", "module.base_groups.nsxt_policy_group.this[each.key]", base),
+        ("composite_groups", "module.composite_groups.nsxt_policy_group.this[each.key]", composite),
+        ("services", "module.services.nsxt_policy_service.this[each.key]", service_ids),
+        ("policies", "module.policies[each.key].nsxt_policy_parent_security_policy.this", policy_ids),
+        ("rules", "module.policies[each.value.policy].nsxt_policy_security_policy_rule.this[each.value.rule]", rule_ids),
+    ]
+    import_path = REPO_ROOT / "stacks" / security_stack / f"import-{args.site}-{tranche}.tf"
+    header = (
+        f"# Generated by scripts/import-estate.py: tranche '{tranche}' for {args.site}.\n"
+        "# Adopts existing objects into state; creates nothing.\n"
+        "#\n"
+        f"#   scripts/tf.sh plan {security_stack} {args.site}\n"
+        "#\n"
+        "# scripts/plan-guard.py refuses the plan unless it only imports. A tranche is\n"
+        "# done when, after the apply, the plan reports no changes. Then delete this\n"
+        "# file in its own merge request: import blocks are one-shot.\n"
+        "#\n"
+        f"# id format: {args.id_format}. If every import fails with a not-found error,\n"
+        "# re-run import-estate.py with a different --id-format; nothing has been\n"
+        "# written to state at that point.\n"
+    )
+    if any(entries for _, _, entries in kinds):
+        writer.write(import_path, import_file(args.site, tranche, role, kinds, header))
 
     # --- manifest -------------------------------------------------------
     manifest = {"version": 1, "imported": [], "sources": []}
@@ -7257,6 +7657,8 @@ def main() -> int:
             "site": args.site,
             "role": role,
             "domain": domain,
+            "tranche": tranche,
+            "policies": [p["id"] for p in policies if not is_system(p)],
             "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "counts": {
                 "groups": len(converted_groups),
@@ -7275,6 +7677,13 @@ def main() -> int:
         print(f"  wrote     {rel}")
     for note in writer.deferred:
         print(f"  EXISTS    {note}  (your file was not touched — diff and merge by hand)")
+    for note in skipped:
+        print(f"  MANAGED   {note}  (already in data/, so not adopted again)")
+    for note in kept_in_ui:
+        print(f"  NOT ADOPTED  {note}")
+    if kept_in_ui:
+        print("  (these cannot be represented exactly, so importing them would change them on")
+        print("   the first apply; they stay as they are, managed in the NSX UI)")
     print()
     print(f"{len(converted_groups)} group(s), {len([p for p in policies if not is_system(p)])} policy/policies, "
           f"{sum(len(p.get('rules', [])) for p in policies if not is_system(p))} rule(s), {len(custom)} custom service(s)")
@@ -7285,8 +7694,9 @@ def main() -> int:
     print("next:")
     print("  1. make validate")
     print(f"  2. scripts/tf.sh plan {security_stack} {args.site}")
-    print("  3. confirm the plan imports and changes NOTHING, then apply")
-    print(f"  4. delete stacks/{security_stack}/import.tf once applied")
+    print("  3. the plan must only import: scripts/plan-guard.py refuses anything else")
+    print("  4. apply, then confirm the next plan reports no changes")
+    print(f"  5. delete stacks/{security_stack}/import-{args.site}-{tranche}.tf in its own merge request")
     return 0
 
 
@@ -7303,6 +7713,253 @@ if __name__ == "__main__":
     raise SystemExit(main())
 SCAFFOLD_EOF
 mark_executable scripts/import-estate.py
+
+write_file scripts/plan-guard.py <<'SCAFFOLD_EOF'
+#!/usr/bin/env python3
+"""Refuse a Terraform plan that would destroy, or duplicate, a live NSX object.
+
+Run on every plan and again before every apply (scripts/tf.sh does both):
+
+  terraform show -json tfplan | scripts/plan-guard.py --site lon1 --stack local-security
+
+Two rules, both mechanical so that nobody has to spot the problem in review:
+
+1. Nothing is destroyed unless that exact resource is approved. A delete, and a
+   replace (which deletes the live object first or after), is refused unless
+   allow-destroy.txt at the repository root lists it:
+
+       # <site> <stack> <resource address>
+       lon1 local-security module.policies["legacy-app"].nsxt_policy_security_policy_rule.this["old-rule"]
+
+   The file is committed, so every approval is in a merge request diff. Remove
+   the line once the change is applied. A line that matches nothing in a plan is
+   reported as stale.
+
+2. An import tranche is pure. When the stack holds this site's tranche files
+   (import-<site>-*.tf, or a legacy import.tf) or the plan imports anything, the plan may only import, read and forget. A create means
+   Terraform did not recognise an object that already exists and would build a
+   second one; an update means the data does not yet match what is running.
+   Fix the data, re-plan. There is deliberately no override: accepting an
+   update during adoption can strip a live setting, for example a rule's
+   context profiles, which widens the rule.
+
+Handing an object back without deleting it (a removed block with
+destroy = false) shows as "forget" and is always allowed.
+
+Exit status: 0 the plan is allowed, 2 it is refused, 1 usage or input error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+ALLOW_FILE = REPO_ROOT / "allow-destroy.txt"
+
+
+def load_allowed(site: str, stack: str) -> set[str]:
+    allowed: set[str] = set()
+    if not ALLOW_FILE.exists():
+        return allowed
+    for number, raw in enumerate(ALLOW_FILE.read_text().splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 2)
+        if len(parts) != 3:
+            sys.exit(f"error: allow-destroy.txt line {number}: expected '<site> <stack> <address>', got: {raw}")
+        if parts[0] == site and parts[1] == stack:
+            allowed.add(parts[2])
+    return allowed
+
+
+def import_files(stack_dir: Path, site: str) -> list[Path]:
+    """This site's tranche files, and a legacy import.tf, which applies to every site."""
+    candidates = list(stack_dir.glob(f"import-{site}-*.tf")) + list(stack_dir.glob("import.tf"))
+    return sorted(f for f in candidates if "import {" in f.read_text())
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--site", required=True)
+    ap.add_argument("--stack", required=True)
+    ap.add_argument("plan_json", nargs="?", help="output of 'terraform show -json tfplan' (default: stdin)")
+    args = ap.parse_args()
+
+    text = Path(args.plan_json).read_text() if args.plan_json else sys.stdin.read()
+    try:
+        plan = json.loads(text)
+    except ValueError:
+        sys.exit("error: plan-guard needs the JSON from 'terraform show -json tfplan'")
+    if "resource_changes" not in plan and "planned_values" not in plan:
+        sys.exit("error: that is not a Terraform plan in JSON")
+
+    changes = [c for c in plan.get("resource_changes") or [] if c.get("mode", "managed") == "managed"]
+    allowed = load_allowed(args.site, args.stack)
+    leftover = import_files(REPO_ROOT / "stacks" / args.stack, args.site)
+    tranche = bool(leftover) or any(c["change"].get("importing") for c in changes)
+
+    refused: list[tuple[str, str]] = []
+    destroy_lines: list[str] = []
+    used: set[str] = set()
+    counts = {"import": 0, "create": 0, "update": 0, "destroy": 0, "forget": 0}
+
+    for c in changes:
+        address = c["address"]
+        actions = c["change"]["actions"]
+        importing = bool(c["change"].get("importing"))
+        if importing:
+            counts["import"] += 1
+        if "delete" in actions:
+            counts["destroy"] += 1
+            kind = "replace" if "create" in actions else "destroy"
+            if address in allowed:
+                used.add(address)
+            else:
+                refused.append((address, f"{kind} of a live object, not approved in allow-destroy.txt"))
+                destroy_lines.append(f"{args.site} {args.stack} {address}")
+            continue
+        if "forget" in actions:
+            counts["forget"] += 1
+            continue
+        if "create" in actions:
+            counts["create"] += 1
+            if tranche:
+                refused.append((address, "create during an import tranche: this object would be built a second time, or its import is missing or has the wrong id"))
+            continue
+        if "update" in actions:
+            counts["update"] += 1
+            if tranche:
+                why = "the data does not match the live object yet" if importing else "a change mixed into an import tranche; adopt first, change in a later merge request"
+                refused.append((address, f"update during an import tranche: {why}"))
+
+    mode = "import tranche (must be pure)" if tranche else "normal"
+    print(
+        f"plan-guard {args.site}/{args.stack}, {mode}: "
+        f"{counts['import']} import, {counts['create']} create, {counts['update']} update, "
+        f"{counts['destroy']} destroy/replace, {counts['forget']} hand back"
+    )
+    if leftover and not counts["import"]:
+        names = ", ".join(f"stacks/{args.stack}/{f.name}" for f in leftover)
+        print(f"  note: {names} imports nothing new, so that tranche is applied. Delete the file(s)")
+        print("        in their own merge request; until then this stack accepts imports only.")
+    for stale in sorted(allowed - used):
+        print(f"  note: allow-destroy.txt approves '{stale}', which this plan does not destroy; remove the line if it is done")
+
+    if not refused:
+        print("plan-guard: allowed.")
+        return 0
+
+    print()
+    print(f"plan-guard: REFUSED. {len(refused)} change(s) would not be safe to apply:")
+    for address, why in refused:
+        print(f"  x {address}")
+        print(f"      {why}")
+    if destroy_lines:
+        print()
+        print("If, and only if, deleting those objects in NSX is the intent, approve each one")
+        print("in allow-destroy.txt at the repository root, in the same merge request:")
+        for line in destroy_lines:
+            print(f"  {line}")
+        print("To stop managing an object WITHOUT deleting it, use a removed block instead")
+        print("(docs/IMPORT.md, 'Handing an object back').")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+SCAFFOLD_EOF
+mark_executable scripts/plan-guard.py
+
+write_file scripts/hand-back.py <<'SCAFFOLD_EOF'
+#!/usr/bin/env python3
+"""Stop managing one object with Terraform, without deleting it from NSX.
+
+The object goes back to being managed in the NSX UI, exactly as it is. Use it
+to undo an adoption, or to retire one rule from code while it keeps running.
+
+  scripts/hand-back.py --stack local-security \\
+      --address 'module.policies["legacy-app"].nsxt_policy_security_policy_rule.this["old-rule"]'
+
+In the same merge request, remove the object from data/ (here, the rule from
+data/policies/legacy-app.yaml). Terraform refuses the plan while the object is
+still declared, so the two cannot get out of step.
+
+How: Terraform's removed block cannot name one instance of a for_each, so the
+file first moves the instance to a stand-alone address and then forgets it:
+the plan shows "will no longer be managed by Terraform, but will not be
+destroyed", and scripts/plan-guard.py allows exactly that. The file is inert
+once applied; delete it whenever convenient.
+
+The stack directory is shared by every manager that runs it: a hand-back applies
+wherever that address is in state. For a site-local object that is only its own
+manager.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+ADDRESS = re.compile(r'^(?:module\.[a-z0-9_]+(?:\["[^"]+"\])?\.)*([a-z0-9_]+)\.[a-z0-9_]+(?:\["[^"]+"\])?$')
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--stack", required=True)
+    ap.add_argument("--address", required=True, help="resource address, as in the plan or 'terraform state list'")
+    ap.add_argument("--name", help="short name for the file (default: from the address)")
+    args = ap.parse_args()
+
+    stack_dir = REPO_ROOT / "stacks" / args.stack
+    if not stack_dir.is_dir():
+        sys.exit(f"error: no such stack: {args.stack}")
+    match = ADDRESS.match(args.address)
+    if not match:
+        sys.exit(f"error: not a resource address: {args.address}")
+    resource_type = match.group(1)
+    if not resource_type.startswith("nsxt_"):
+        sys.exit(f"error: {resource_type} is not an NSX resource")
+
+    keys = re.findall(r'\["([^"]+)"\]', args.address)
+    name = args.name or "_".join(keys) or resource_type
+    slug = re.sub(r"[^a-z0-9_]", "_", name.lower()).strip("_")
+    target = stack_dir / f"handback-{slug}.tf"
+    if target.exists():
+        sys.exit(f"error: {target.relative_to(REPO_ROOT)} exists already")
+
+    stand_alone = f"{resource_type}.handback_{slug}"
+    target.write_text(
+        f"# Hand back to the NSX UI, without deleting: {args.address}\n"
+        "# Generated by scripts/hand-back.py. Remove the object from data/ in the same\n"
+        "# merge request. Inert once applied; delete this file whenever convenient.\n\n"
+        "moved {\n"
+        f"  from = {args.address}\n"
+        f"  to   = {stand_alone}\n"
+        "}\n\n"
+        "removed {\n"
+        f"  from = {stand_alone}\n"
+        "  lifecycle {\n"
+        "    destroy = false\n"
+        "  }\n"
+        "}\n"
+    )
+    print(f"wrote {target.relative_to(REPO_ROOT)}")
+    print("next: remove the object from data/ in the same merge request, then plan.")
+    print("      The plan must say it will no longer be managed, and destroy nothing.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+SCAFFOLD_EOF
+mark_executable scripts/hand-back.py
 
 write_file scripts/drift.sh <<'SCAFFOLD_EOF'
 #!/usr/bin/env bash
@@ -9388,10 +10045,16 @@ else
 	bad "could not regenerate from a generated tree"
 fi
 
-# Re-running in place must change nothing.
-before="$(cd "$A" && find . -type f -newer "$A/Makefile" | wc -l | tr -d ' ')"
+# Re-running in place must change nothing: same files, same content.
+tree_sum() { (cd "$A" && find . -type f -not -path './.git/*' -exec cksum {} + | LC_ALL=C sort | cksum); }
+before="$(tree_sum)"
 if (cd "$A" && ./scripts/bootstrap.sh --dir . --quiet </dev/null >/dev/null 2>&1); then
 	ok "re-running in place succeeds"
+	if [ "$(tree_sum)" = "$before" ]; then
+		ok "re-running in place changes no file"
+	else
+		bad "re-running in place changed files"
+	fi
 else
 	bad "re-running in place failed"
 fi
@@ -10082,6 +10745,7 @@ def main() -> int:
         out.append("    name: \"plan-$STACK-$SITE\"")
         out.append("    paths:")
         out.append(f'      - stacks/{row["stack"]}/tfplan')
+        out.append(f'      - stacks/{row["stack"]}/tfplan.site')
         out.append('      - "plan-$STACK-$SITE.txt"')
         out.append("    expire_in: 1 week")
         out.append("    when: always")
@@ -10366,7 +11030,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tfplan-${{ matrix.stack }}-${{ matrix.site }}
-          path: stacks/${{ matrix.stack }}/tfplan
+          path: |
+            stacks/${{ matrix.stack }}/tfplan
+            stacks/${{ matrix.stack }}/tfplan.site
           retention-days: 7
           if-no-files-found: error
 SCAFFOLD_EOF
@@ -10445,7 +11111,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: tfplan-${{ matrix.stack }}-${{ matrix.site }}
-          path: stacks/${{ matrix.stack }}/tfplan
+          path: |
+            stacks/${{ matrix.stack }}/tfplan
+            stacks/${{ matrix.stack }}/tfplan.site
           retention-days: 7
           if-no-files-found: error
 
