@@ -13,6 +13,16 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.3.1
+
+**Pipelines on the default branch end "passed", not "blocked".** A manual apply job used to hold the whole pipeline "blocked" until someone ran or cancelled it, so every merge left a blocked pipeline behind. Manual apply jobs are now non-blocking: the pipeline finishes "passed" once its plans pass, and each apply stays available behind its ▶ button with the same gate as before (manual, the saved plan only, plan-guard again, the protected write credential). An apply that is run and fails shows as failed on the job and as a warning on the pipeline. With `NSX_APPLY_MODE=auto`, applies still fail the pipeline outright.
+
+**Fixed: with any manager in mirror mode, GitLab rejected the generated child pipeline (1.3.0).** A line of the `sync-state` job held `: ` unquoted, which YAML reads as a key, not a command: `script config should be a string`. Python's YAML parser accepts it silently, so the tests did not see it; GitLab's own CI lint did. The line is fixed, and `tests/ci-scripts.sh` now checks that every script line of the generated child pipeline, in every apply mode, is a plain string. Every generated pipeline was also checked with the CI lint API of a real GitLab CE 17.5.
+
+**Upgrading from 1.2.x with a mirror schedule already created:** until the tree is on 1.3.x its CI file does not know `MIRROR_SITE`, so a schedule runs an ordinary pipeline. Pause the schedule, update, then resume it.
+
+**Tests:** `tests/ci-scripts.sh` checks that a manual apply is non-blocking and an automatic one is not.
+
 ## 1.3.0
 
 **Mirror mode: the whole manager in the repository and in Terraform's state, following the UI, until you cut over.** For a manager engineers still run from the UI, while the other managers carry on as normal.

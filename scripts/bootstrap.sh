@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 
 ROOT="$PWD"
 FORCE=0
@@ -11872,7 +11872,7 @@ def main() -> int:
             out.append("    NSX_CRED_SCOPE: plan")
             out.append("    APPROVE: \"yes\"")
             out.append("  script:")
-            out.append('    - test -f "stacks/$STACK/tfplan" || { echo "no saved plan: its plan job failed; the next sync tries again" >&2; exit 1; }')
+            out.append('    - test -f "stacks/$STACK/tfplan" || { echo "no saved plan, as its plan job failed; the next sync tries again" >&2; exit 1; }')
             out.append('    - scripts/with-credentials.sh "$SITE" -- scripts/tf.sh apply "$STACK" "$SITE"')
             out.append("")
             continue
@@ -11887,9 +11887,14 @@ def main() -> int:
         # protected environment restricts who that human can be.
         if APPLY_MODE == "manual":
             out.append("  when: manual")
+            # Not blocking: the pipeline ends 'passed' with the apply waiting for
+            # its button, instead of sitting 'blocked' until someone runs or
+            # cancels it. The gate is the same; an apply that is run and fails
+            # shows as a warning on the pipeline and as failed on the job.
+            out.append("  allow_failure: true")
         else:
             out.append("  when: on_success")
-        out.append("  allow_failure: false")
+            out.append("  allow_failure: false")
         out.append("  environment:")
         out.append(f'    name: nsx/{row["site"]}/{row["stack"]}')
         out.append("  variables:")
