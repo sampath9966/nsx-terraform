@@ -662,6 +662,36 @@ json.dump(d, open("reports/gm1.json", "w"))
 PY
 out="$(mir gm1)"
 check "ids made in the UI ('_h-…', apostrophes, spaces) are adopted verbatim" bash -c '! grep -q "NOT ADOPTED  group _\|NOT ADOPTED  group WIN11" <<<"$1" && test -f "data/policies/_My Policy.yaml" && grep -q "_Exchange-GW_VM" data/groups/imported-gm1-mirror.yaml' _ "$out"
+python3 - <<'PY'
+import json
+GD = "/global-infra/domains/default"
+c = lambda v: [{"resource_type": "Condition", "key": "Tag", "member_type": "VirtualMachine", "operator": "EQUALS", "value": v}]
+odd = ["Azure-AD-IP's", "100", "-lead", "a,b [c]", 'say "hi"', "back\\slash", "#hash", "@at", "x: y"]
+groups = [{"id": i, "path": f"{GD}/groups/{i}", "display_name": i, "description": "line one\nline 'two'\ttab", "expression": c("app|x")} for i in odd]
+svc = [{"id": "gm_UDP_49152–65535", "path": "/global-infra/services/gm_UDP_49152–65535", "display_name": "gm UDP 49152–65535",
+        "service_entries": [{"resource_type": "L4PortSetServiceEntry", "l4_protocol": "UDP", "destination_ports": ["49152-65535"]}]}]
+def pol(i):
+    return {"id": i, "path": f"{GD}/security-policies/{i}", "display_name": "CSS", "category": "Application", "sequence_number": 7,
+            "scope": ["ANY"], "rules": [{"id": "r1", "path": f"{GD}/security-policies/{i}/rules/r1", "display_name": "r1", "sequence_number": 470,
+                                         "action": "ALLOW", "direction": "IN_OUT", "logged": True, "source_groups": [g["path"] for g in groups],
+                                         "destination_groups": ["ANY"], "services": [svc[0]["path"]], "scope": ["ANY"], "profiles": ["ANY"]}]}
+d = json.load(open("reports/gm1.json"))
+d["groups"] += groups; d["services"] += svc; d["policies"] += [pol("CSS"), pol("CSS-LbTAAIz-d")]
+json.dump(d, open("reports/gm1.json", "w"))
+PY
+out="$(mir gm1)"
+check "names NSX allows (quotes, commas, a leading '-', a number, ': ') are written as YAML both parsers read the same" python3 - <<'PY'
+import glob, os, sys, yaml
+sys.path.insert(0, "scripts")
+os.environ["NSX_YAML_FALLBACK"] = "1"
+from yamlcompat import load_yaml
+bad = [f for f in glob.glob("data/*/*.yaml") if yaml.safe_load(open(f)) != load_yaml(open(f).read())]
+print(bad, file=sys.stderr)
+sys.exit(1 if bad else 0)
+PY
+check "...the odd names reach the copy intact" python3 -c "import yaml,sys;g=yaml.safe_load(open('data/groups/imported-gm1-mirror.yaml'))['groups'];sys.exit(0 if {\"Azure-AD-IP's\",'100','-lead','a,b [c]','say \"hi\"','back\\\\slash','#hash','@at','x: y'} <= set(g) and g['100']['description']=='line one\nline \'two\'\ttab' else 1)"
+check "two policies NSX holds under one display name are both taken, and validate without PyYAML too" bash -c 'test -f data/policies/CSS.yaml && test -f data/policies/CSS-LbTAAIz-d.yaml && ! NSX_YAML_FALLBACK=1 python3 scripts/validate-data.py 2>&1 | grep -q "^ERROR"'
+check "imported rules' sequence numbers are taken as they are, without a warning each" bash -c '! python3 scripts/validate-data.py 2>&1 | grep -q "CSS.yaml.*not a multiple of 100"'
 check "...and validate: an adopted object keeps its own id" bash -c '! python3 scripts/validate-data.py 2>&1 | grep -q "^ERROR"'
 printf 'groups:\n  _new one:\n    display_name: x\n    owner: gm\n    criteria:\n      - conditions:\n          - {key: Tag, member_type: VirtualMachine, operator: EQUALS, value: "app|x"}\n' >data/groups/authored.yaml
 check "a new object written here is still held to letters, digits, '.', '_' and '-'" bash -c 'python3 scripts/validate-data.py 2>&1 | grep -q "a new object.s id is letters, digits"'

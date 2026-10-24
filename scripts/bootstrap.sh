@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 
 ROOT="$PWD"
 FORCE=0
@@ -5748,6 +5748,7 @@ to agree on the subset we write.
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any
 
@@ -5758,7 +5759,9 @@ except ImportError:  # pragma: no cover
 
 
 def load_yaml(text: str) -> Any:
-    if _pyyaml is not None:
+    # NSX_YAML_FALLBACK=1 uses the built-in parser even where PyYAML exists, as
+    # on a CI image without it: tests hold the two to the same answers.
+    if _pyyaml is not None and os.environ.get("NSX_YAML_FALLBACK") != "1":
         return _pyyaml.safe_load(text)
     return _Parser(text).parse()
 
@@ -5918,40 +5921,60 @@ def _indent(raw: str) -> int:
     return len(raw) - len(raw.lstrip(" "))
 
 
-def _strip_comment(text: str) -> str:
-    out = []
+def _outside_quotes(text: str) -> list[bool]:
+    """For each character: True when it is outside a quoted scalar.
+
+    As in YAML, a quote opens a quoted scalar only where a scalar starts: at the
+    beginning, or after a space, '[', '{' or ','. Mid-word it is an ordinary
+    character, so a name like Azure-AD-IP's is a plain scalar. Inside '...' a
+    doubled '' is a quote; inside "..." a backslash escapes the next character.
+    """
+    out: list[bool] = []
     quote = None
     i = 0
     while i < len(text):
         ch = text[i]
-        if quote:
-            out.append(ch)
-            if ch == quote:
+        if quote == "'":
+            out.append(False)
+            if ch == "'":
+                if i + 1 < len(text) and text[i + 1] == "'":
+                    out.append(False)
+                    i += 2
+                    continue
                 quote = None
-        elif ch in "'\"":
+        elif quote == '"':
+            out.append(False)
+            if ch == "\\" and i + 1 < len(text):
+                out.append(False)
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+        elif ch in "'\"" and (i == 0 or text[i - 1] in " \t[{,"):
             quote = ch
-            out.append(ch)
-        elif ch == "#" and (i == 0 or text[i - 1] == " "):
-            break
+            out.append(False)
         else:
-            out.append(ch)
+            out.append(True)
         i += 1
-    return "".join(out).rstrip()
+    return out
+
+
+def _strip_comment(text: str) -> str:
+    outside = _outside_quotes(text)
+    for i, ch in enumerate(text):
+        if ch == "#" and outside[i] and (i == 0 or text[i - 1] in " \t"):
+            return text[:i].rstrip()
+    return text.rstrip()
 
 
 def _split_key(text: str) -> tuple[str, bool, str]:
     # A colon only separates a key when it is outside quotes and outside any
     # [...] or {...}: '- { scope: workload, tag: x }' is one flow mapping, not
     # a mapping whose first key is '{ scope'.
-    quote = None
+    outside = _outside_quotes(text)
     depth = 0
     for i, ch in enumerate(text):
-        if quote:
-            if ch == quote:
-                quote = None
-            continue
-        if ch in "'\"":
-            quote = ch
+        if not outside[i]:
             continue
         if ch in "[{":
             depth += 1
@@ -5963,8 +5986,28 @@ def _split_key(text: str) -> tuple[str, bool, str]:
 
 
 def _unquote(text: str) -> str:
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
-        return text[1:-1]
+    """A quoted scalar's value: '' is ' in single quotes; escapes in double quotes."""
+    if len(text) >= 2 and text[0] == text[-1] == "'":
+        return text[1:-1].replace("''", "'")
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        body, out, i = text[1:-1], [], 0
+        simple = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", "\\": "\\", '"': '"', "/": "/", " ": " "}
+        while i < len(body):
+            ch = body[i]
+            if ch == "\\" and i + 1 < len(body):
+                nxt = body[i + 1]
+                if nxt in simple:
+                    out.append(simple[nxt])
+                    i += 2
+                    continue
+                if nxt in "xuU":
+                    width = {"x": 2, "u": 4, "U": 8}[nxt]
+                    out.append(chr(int(body[i + 2 : i + 2 + width], 16)))
+                    i += 2 + width
+                    continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
     return text
 
 
@@ -5987,7 +6030,7 @@ def _scalar(text: str) -> Any:
             out[key] = _scalar(value)
         return out
     if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
-        return text[1:-1]
+        return _unquote(text)
     lowered = text.lower()
     if lowered in ("true", "yes", "on"):
         return True
@@ -6003,30 +6046,20 @@ def _scalar(text: str) -> Any:
 
 
 def _split_flow(text: str) -> list[str]:
+    outside = _outside_quotes(text)
     parts: list[str] = []
     depth = 0
-    quote = None
     current: list[str] = []
-    for ch in text:
-        if quote:
-            current.append(ch)
-            if ch == quote:
-                quote = None
-            continue
-        if ch in "'\"":
-            quote = ch
-            current.append(ch)
-        elif ch in "[{":
+    for i, ch in enumerate(text):
+        if outside[i] and ch in "[{":
             depth += 1
-            current.append(ch)
-        elif ch in "]}":
+        elif outside[i] and ch in "]}":
             depth -= 1
-            current.append(ch)
-        elif ch == "," and depth == 0:
+        elif outside[i] and ch == "," and depth == 0:
             parts.append("".join(current).strip())
             current = []
-        else:
-            current.append(ch)
+            continue
+        current.append(ch)
     if current:
         parts.append("".join(current).strip())
     return [p for p in parts if p]
@@ -6598,8 +6631,10 @@ def check_policies(
         # name, same category, same span, different nsx_id. Adding a rule to an
         # existing policy means editing its file — scripts/add-rule.py does the
         # lookup for you.
+        # NSX itself allows two policies with one display name (different ids):
+        # two such policies adopted from a manager are both real, and both stay.
         name_key = (policy.get("name"), policy.get("category"), owner, tuple(sorted(policy_sites)))
-        if policy.get("name") and name_key in seen_names:
+        if policy.get("name") and name_key in seen_names and not (where in imported and seen_names[name_key] in imported):
             report.error(
                 where,
                 f"policy {policy.get('name')!r} ({policy.get('category')}) is already defined in "
@@ -6672,7 +6707,7 @@ def check_policies(
                 if seq in sequence_numbers:
                     report.error(where, f"{label}: sequence_number {seq} already used by {sequence_numbers[seq]}. Sequence numbers are allocated, not guessed.")
                 sequence_numbers[seq] = label
-                if seq % 100 != 0:
+                if seq % 100 != 0 and where not in imported:
                     report.warn(where, f"{label}: sequence_number {seq} is not a multiple of 100. Gaps are what let a rule be inserted later without renumbering.")
 
             for field in ("source_groups", "destination_groups", "scope"):
@@ -7597,11 +7632,23 @@ def scalar(value) -> str:
         or text[0] in NEEDS_QUOTE
         or text.strip() != text
         or text.lower() in ("true", "false", "null", "yes", "no", "on", "off", "~")
-        or any(c in text for c in ":#")
+        or any(c in text for c in ":#'\"\\,[]{}")  # also safe inside a [flow, list]
+        or any(ord(c) < 32 or ord(c) == 127 for c in text)
         or _looks_numeric(text)
     ):
-        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        return '"' + "".join(_ESCAPES.get(c) or (f"\\x{ord(c):02x}" if ord(c) < 32 or ord(c) == 127 else c)
+                             for c in text) + '"'
     return text
+
+
+# Double-quoted YAML: these characters are written escaped, anything else as is.
+_ESCAPES = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\t": "\\t", "\r": "\\r"}
+
+
+def key(value) -> str:
+    """A mapping key, quoted like any value when it needs to be: NSX ids can be
+    anything but '/' (Azure-AD-IP's, 'WIN11 IC', 100, -x, @y)."""
+    return scalar(str(value))
 
 
 def _looks_numeric(text: str) -> bool:
@@ -7616,20 +7663,20 @@ def emit(value, indent: int = 0) -> list[str]:
     pad = "  " * indent
     lines: list[str] = []
     if isinstance(value, dict):
-        for key, item in value.items():
+        for name, item in value.items():
             if isinstance(item, dict) and item:
-                lines.append(f"{pad}{key}:")
+                lines.append(f"{pad}{key(name)}:")
                 lines.extend(emit(item, indent + 1))
             elif isinstance(item, list) and item:
                 if all(not isinstance(x, (dict, list)) for x in item):
-                    lines.append(f"{pad}{key}: [{', '.join(scalar(x) for x in item)}]")
+                    lines.append(f"{pad}{key(name)}: [{', '.join(scalar(x) for x in item)}]")
                 else:
-                    lines.append(f"{pad}{key}:")
+                    lines.append(f"{pad}{key(name)}:")
                     lines.extend(emit(item, indent + 1))
             elif isinstance(item, (dict, list)):
-                lines.append(f"{pad}{key}: {{}}" if isinstance(item, dict) else f"{pad}{key}: []")
+                lines.append(f"{pad}{key(name)}: {{}}" if isinstance(item, dict) else f"{pad}{key(name)}: []")
             else:
-                lines.append(f"{pad}{key}: {scalar(item)}")
+                lines.append(f"{pad}{key(name)}: {scalar(item)}")
     elif isinstance(value, list):
         for item in value:
             if isinstance(item, dict):

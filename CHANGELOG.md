@@ -13,6 +13,14 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.5.1
+
+**Names NSX allows no longer break the copy.** The first real mirror of hyd-gm01 failed validation with 229 errors from one cause: a group named `Azure-AD-IP's`. Where PyYAML is not installed (the CI image), the built-in YAML reader took the apostrophe for the start of a quoted string and rejected the whole groups file, so every rule referring to a group reported it undefined. The reader now treats a quote as YAML does, only where a value starts, and decodes quoted values in full. The writer quotes mapping keys as it quotes values, and escapes quotes, backslashes, line breaks, commas and brackets. Every file the mirror writes is now tested to read the same with PyYAML and without it, and with Terraform.
+
+**Two policies with one display name are both kept.** NSX allows it (`CSS` twice, different ids); the validator refused the second. It still refuses a hand-written policy that duplicates another.
+
+**Imported sequence numbers are taken as they are.** The "not a multiple of 100" advice is for rules written here; it is no longer printed for every imported rule.
+
 ## 1.5.0
 
 **Drift is raised as a GitLab issue, to investigate.** During the observation period, every sync that finds the manager changed in the UI raises an issue labelled `nsx-drift` and `site:<site>`: each object added, changed or deleted, what changed in it, who last changed it and when (from NSX), and a checklist (who and why, keep or revert, should it have been a merge request). A change is raised once, not on every sync. The first copy is the baseline, and objects nobody touched since the last copy (taken over by a newer importer) are not raised. After cutover the new `drift` job (schedule with `DRIFT_SITE`) does the same for managed managers from a refresh-only plan. `scripts/drift.sh` now plans through `tf.sh drift`, so the plan has the manager's variables, state and trust; before, it ran Terraform without them.
