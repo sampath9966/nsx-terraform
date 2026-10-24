@@ -157,6 +157,8 @@ check "the shared NSX_CA_FILE works too" grep -q "wrote" <<<"$(capture NSX_CA_FI
 out="$(capture)"
 check "without the CA it refuses, and says which variable to set" bash -c 'grep -q "does not trust" <<<"$1" && grep -q "NSX_CA_FILE_LON1" <<<"$1"' _ "$out"
 check "another CA is not accepted" bash -c '! grep -q "wrote" <<<"$1"' _ "$(capture NSX_CA_FILE_LON1="$SCRATCH/other-ca.pem")"
+out="$(capture NSXT_ALLOW_UNVERIFIED_SSL=true)"
+check "with NSXT_ALLOW_UNVERIFIED_SSL, as for the provider, the read goes through, with a warning" bash -c 'grep -q "wrote" <<<"$1" && grep -q "TLS verification of 127.0.0.1:[0-9]* is OFF" <<<"$1"' _ "$out"
 
 echo "adopting from the pipeline (scripts/adopt.sh)"
 git init -q -b main && git_quiet add -A && git_quiet commit -m baseline
@@ -318,8 +320,11 @@ check "a manager in mode: managed is refused, and the job fails" bash -c '[ "$2"
 out="$(mirror MIRROR_SITE=all)"
 check "MIRROR_SITE=all takes every manager in mode: mirror, and only those" bash -c 'grep -q "=== lon1" <<<"$1" && ! grep -q "=== nyc1" <<<"$1" && ! grep -q "=== gm1" <<<"$1"' _ "$out"
 check "without MIRROR_SITE it refuses" grep -q "MIRROR_SITE is not set" <<<"$(mirror MIRROR_SITE=)"
-out="$(mirror MIRROR_SITE=all NSX_MODE_LON1=managed)"
-check "MIRROR_SITE=all with no mirror manager says what it saw for each, and which variable to set" bash -c 'grep -q "lon1: managed (from NSX_MODE_LON1)" <<<"$1" && grep -q "nyc1: managed (NSX_MODE_NYC1 is not set in this job, and the inventory gives no mode)" <<<"$1" && grep -q "environment scope All" <<<"$1"' _ "$out"
+sed -i '/^    mode: mirror$/d' inventory/managers.yaml
+out="$(mirror MIRROR_SITE=all)"
+check "MIRROR_SITE=all with no mirror manager lists each manager's mode, and points at the inventory" bash -c 'grep -q "  lon1: managed" <<<"$1" && grep -q "  nyc1: managed" <<<"$1" && grep -q "add .mode: mirror. to each manager to copy, in inventory/managers.yaml" <<<"$1"' _ "$out"
+check "a leftover NSX_MODE_ variable stops the job: the mode comes from the inventory only" grep -q "comes from inventory/managers.yaml only" <<<"$(mirror MIRROR_SITE=all NSX_MODE_LON1=mirror)"
+git_quiet checkout -q -- inventory/managers.yaml
 writes="$(grep WRITE "$SCRATCH/req.log" | grep -vc "/api/session/create" || true)"
 check "mirroring only reads NSX" test "$writes" -eq 0
 kill "$gl" 2>/dev/null
@@ -416,8 +421,11 @@ check "a plan with no record of its manager is refused" grep -q "was made for 'a
 sed -i '/^  nyc1:$/a\    mode: mirror' inventory/managers.yaml
 check "a manager in mode: mirror is refused the write credential, whatever the plan" grep -q "nyc1 is in mirror mode: only its state is updated, and only with the read-only credential" <<<"$(APPROVE=yes NSX_CRED_SCOPE=apply tf apply local-security nyc1)"
 check "...and refused without a scope at all" grep -q "only with the read-only credential" <<<"$(APPROVE=yes tf apply local-security nyc1)"
-check "NSX_MODE_<SITE> puts a manager in mirror mode without a commit" grep -q "lon1 is in mirror mode" <<<"$(APPROVE=yes NSX_MODE_LON1=mirror tf apply local-security lon1)"
-check "...and an unknown value is an error naming the variable" grep -q "NSX_MODE_LON1 must be one of: managed, mirror" <<<"$(APPROVE=yes NSX_MODE_LON1=observe tf apply local-security lon1)"
+out="$(APPROVE=yes NSX_MODE_LON1=managed tf apply local-security lon1)"
+check "a leftover NSX_MODE_ variable stops tf.sh, and nothing is applied" bash -c 'grep -q "comes from inventory/managers.yaml only" <<<"$1" && grep -q "cannot read manager .lon1." <<<"$1" && ! grep -q "Apply complete" <<<"$1"' _ "$out"
+sed -i '/^  lon1:$/a\    mode: sideways' inventory/managers.yaml
+check "an unknown mode in the inventory is an error, and nothing is applied" grep -q "mode 'sideways' in inventory/managers.yaml must be one of: managed, mirror" <<<"$(APPROVE=yes tf apply local-security lon1)"
+sed -i '/^    mode: sideways$/d' inventory/managers.yaml
 sed -i '/^    mode: mirror$/d' inventory/managers.yaml
 tf plan local-security nyc1 >/dev/null
 # The test tree is on the placeholder local backend, which tf.sh only applies to

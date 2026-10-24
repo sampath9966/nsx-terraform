@@ -388,7 +388,6 @@ check "...while an automatic apply that fails still fails the pipeline" python3 
 own_mr="$(cd "$T" && CI_MERGE_REQUEST_SOURCE_BRANCH_NAME=mirror/hyd-gm01 python3 scripts/gitlab-child-pipeline.py)"
 check "in its own mirror merge request, a mirror manager's plan must pass" python3 -c "import json,sys;sys.exit(0 if json.loads(sys.argv[1])['allow_failure'] is False else 1)" "$(job "plan global-security @ hyd-gm01" <<<"$own_mr")"
 check "...and no merge request pipeline has sync-state or apply jobs" bash -c '! grep -qE "^\"(sync-state|apply) " <<<"$1"' _ "$own_mr"
-var_child="$(cd "$T" && NSX_MODE_HYD_NP01=mirror NSX_MODE_HYD_GM01=managed CI_COMMIT_BRANCH=main CI_DEFAULT_BRANCH=main python3 scripts/gitlab-child-pipeline.py)"
 # GitLab rejects a script line YAML reads as anything but a string (": " in an
 # unquoted line makes it a mapping). Python's parser accepts that silently, so
 # check every job's script, in every mode, for strings only.
@@ -397,10 +396,10 @@ import sys, yaml
 d = yaml.safe_load(sys.stdin)
 bad = [(n, l) for n, j in d.items() if isinstance(j, dict) for l in j.get(\"script\", []) if not isinstance(l, str)]
 sys.exit(1 if bad else 0)" || exit 1; done' _ "$T"
-check "a variable named in the wrong case stops the pipeline, naming the right name" bash -c 'cd "$1" && ! out="$(env NSX_MODE_hyd_np01=mirror CI_COMMIT_BRANCH=main CI_DEFAULT_BRANCH=main python3 scripts/gitlab-child-pipeline.py 2>&1)" && grep -q "NSX_MODE_hyd_np01  ->  rename it to NSX_MODE_HYD_NP01" <<<"$out"' _ "$T"
+check "a variable named in the wrong case stops the pipeline, naming the right name" bash -c 'cd "$1" && ! out="$(env NSX_CA_FILE_hyd_np01=/x CI_COMMIT_BRANCH=main CI_DEFAULT_BRANCH=main python3 scripts/gitlab-child-pipeline.py 2>&1)" && grep -q "NSX_CA_FILE_hyd_np01  ->  rename it to NSX_CA_FILE_HYD_NP01" <<<"$out"' _ "$T"
 check "...and so does any NSX job that talks to the manager" bash -c 'cd "$1" && out="$(env -i PATH="$PATH" NSX_USERNAME=u NSX_PASSWORD=p NSX_CA_FILE_hyd_gm01=/x scripts/with-credentials.sh hyd-gm01 -- true 2>&1)"; grep -q "NSX_CA_FILE_hyd_gm01->NSX_CA_FILE_HYD_GM01" <<<"$out"' _ "$T"
-check "NSX_MODE_<SITE> overrides the inventory, both ways, without a commit" bash -c 'grep -q "^\"sync-state local-security @ hyd-np01\":" <<<"$1" && ! grep -q "^\"apply local-security @ hyd-np01\":" <<<"$1" && grep -q "^\"apply global-security @ hyd-gm01\":" <<<"$1"' _ "$var_child"
-check "...and an unknown value stops the pipeline, naming the variable" bash -c 'cd "$1" && ! out="$(NSX_MODE_HYD_NP01=Mirror python3 scripts/gitlab-child-pipeline.py 2>&1)" && grep -q "NSX_MODE_HYD_NP01 must be one of: managed, mirror" <<<"$out"' _ "$T"
+check "a mode set as a CI/CD variable stops the pipeline: the mode comes from the inventory only" bash -c 'cd "$1" && ! out="$(NSX_MODE_HYD_NP01=mirror CI_COMMIT_BRANCH=main CI_DEFAULT_BRANCH=main python3 scripts/gitlab-child-pipeline.py 2>&1)" && grep -q "comes from inventory/managers.yaml only" <<<"$out" && grep -q "NSX_MODE_HYD_NP01" <<<"$out"' _ "$T"
+check "every job that talks to NSX warns while TLS verification is off" bash -c 'cd "$1" && env -i PATH="$PATH" NSX_USERNAME=u NSX_PASSWORD=p NSXT_ALLOW_UNVERIFIED_SSL=true scripts/with-credentials.sh hyd-gm01 -- true 2>&1 | grep -q "TLS verification of gm.example.net is OFF"' _ "$T"
 check "the inventory schema accepts mode" bash -c 'cd "$1" && ! python3 scripts/validate-data.py 2>&1 | grep -q "\.mode:"' _ "$T"
 check "...and rejects anything but managed or mirror" bash -c 'cd "$1" && sed -i "s/mode: mirror/mode: mirrored/" inventory/managers.yaml && python3 scripts/validate-data.py 2>&1 | grep -q "hyd-gm01.mode: .mirrored. is not one of managed, mirror"; rc=$?; sed -i "s/mode: mirrored/mode: mirror/" inventory/managers.yaml; exit $rc' _ "$T"
 appr="$(cd "$T" && NSX_APPLY_MODE=approval CI_COMMIT_BRANCH=main CI_DEFAULT_BRANCH=main python3 scripts/gitlab-child-pipeline.py)"
