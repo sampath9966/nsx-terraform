@@ -257,6 +257,13 @@ verified, offline:
 - `scripts/validate-data.py` passes on the example data and was tested against
   deliberately planted defects.
 - The generator reproduces itself byte-for-byte.
+- With the real provider against a mock manager that accepts writes
+  (`tests/apply-provider.sh`): applies, renames, UI changes, interrupted applies
+  and transient errors behave as described. A 3,600-object local-security stack
+  planned in under a minute and applied in about eight against that mock, which
+  answers instantly: a real manager is slower, so size job timeouts from your
+  own first apply. An apply stopped part-way left state and NSX agreeing, and
+  the next plan finished it.
 
 What that does **not** cover:
 

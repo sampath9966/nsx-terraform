@@ -476,6 +476,24 @@ check "the right plan for the right manager applies" grep -q "^apply" "$FAKE_LOG
 check "the plan and its record are removed after apply" bash -c '! test -e stacks/local-security/tfplan && ! test -e stacks/local-security/tfplan.site'
 check "the child pipeline carries the record with the plan" grep -q "tfplan.site" <<<"$(python3 scripts/gitlab-child-pipeline.py)"
 
+echo "tf.sh: in a pipeline, the write credential applies only the newest commit"
+git init -q --bare "$SCRATCH/head.git"
+git_quiet push "$SCRATCH/head.git" HEAD:refs/heads/main
+now="$(git rev-parse HEAD)"
+ci_apply() { # ci_apply <origin> <pipeline commit>
+	env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.url GIT_CONFIG_VALUE_0="$1" CI_DEFAULT_BRANCH=main \
+		CI_COMMIT_SHA="$2" NSX_CRED_SCOPE=apply APPROVE=yes ALLOW_LOCAL_STATE=1 PATH="$SCRATCH/fake:$PATH" \
+		scripts/tf.sh apply local-security nyc1 2>&1
+}
+tf plan local-security nyc1 >/dev/null
+: >"$FAKE_LOG"
+out="$(ci_apply "$SCRATCH/head.git" 0123456789abcdef0123456789abcdef01234567)"
+check "an older pipeline's plan is refused once the default branch has moved on" bash -c 'grep -q "main has moved on to ${2:0:8}" <<<"$1" && ! grep -q "^apply" "$3"' _ "$out" "$now" "$FAKE_LOG"
+out="$(ci_apply "$SCRATCH/no-such-remote.git" "$now")"
+check "...and if the head cannot be read, nothing is applied" bash -c 'grep -q "cannot read the head of main" <<<"$1" && ! grep -q "^apply" "$2"' _ "$out" "$FAKE_LOG"
+ci_apply "$SCRATCH/head.git" "$now" >/dev/null
+check "the newest commit's plan applies" grep -q "^apply" "$FAKE_LOG"
+
 echo "hand-back"
 A2='module.policies["legacy-app"].nsxt_policy_security_policy_rule.this["web-to-db"]'
 python3 scripts/hand-back.py --stack local-security --address "$A2" >/dev/null 2>&1
@@ -502,6 +520,42 @@ sed -i 's#rules:#rules:#' "$SCRATCH/v/data/policies/legacy-app.yaml"
 check "context profiles may be referenced by path" bash -c '! (cd "$1" && python3 scripts/validate-data.py 2>&1) | grep -q "context-profiles"' _ "$SCRATCH/v"
 sed -i 's#scope: \[App-All\]#scope: [/infra/domains/default/groups/App-All]#' "$SCRATCH/v/data/policies/legacy-app.yaml"
 check "any other raw path is still an error" grep -q "raw policy path" <<<"$(cd "$SCRATCH/v" && python3 scripts/validate-data.py 2>&1)"
+mkdir -p "$SCRATCH/v2" && cp -r data inventory scripts "$SCRATCH/v2/" 2>/dev/null
+newpol() { # newpol <file> <id> <name> <sites> <policy scope> <rule fields...>: a policy written by hand
+	{
+		printf 'policy:\n  id: %s\n  name: %s\n  category: Application\n  owner: lm\n  sites: %s\n' "$2" "$3" "$4"
+		printf '  rule_management: standalone\n  scope: %s\nrules:\n  r1:\n    sequence_number: 100\n' "$5"
+		printf '    action: ALLOW\n    direction: IN\n    destination_groups: [App-DB]\n'
+		shift 5
+		printf '    %s\n' "$@"
+	} >"$SCRATCH/v2/data/policies/$1.yaml"
+}
+v2() { (cd "$SCRATCH/v2" && python3 scripts/validate-data.py 2>&1); }
+newpol any-scope new-a new-a "[lon1]" "[ANY]" "source_groups: [App-Web]" "scope: [ANY]"
+out="$(v2)"
+check "a hand-written Apply To of ANY is an error, for the policy and for a rule" bash -c '[ "$(grep -c "any-scope.yaml: .*ANY is not an Apply To" <<<"$1")" = 2 ]' _ "$out"
+newpol any-scope new-a new-a "[lon1]" "[App-DB]" "source_groups: [ANY, App-Web]" "services: [ANY, HTTPS]" "scope: [App-DB]"
+out="$(v2)"
+check "ANY next to a name is an error: the name alone is what it would mean" bash -c 'grep -q "r1.source_groups: ANY next to App-Web" <<<"$1" && grep -q "r1.services: ANY next to HTTPS" <<<"$1"' _ "$out"
+rm "$SCRATCH/v2/data/policies/any-scope.yaml"
+newpol inline new-i new-i "[lon1]" "[App-DB]" "scope: [App-DB]"
+sed -i 's/rule_management: standalone/rule_management: inline/' "$SCRATCH/v2/data/policies/inline.yaml"
+check "an inline policy, which no stack deploys, is an error" grep -q "inline.yaml: rule_management: inline. No stack deploys" <<<"$(v2)"
+rm "$SCRATCH/v2/data/policies/inline.yaml"
+newpol second legacy-app-2 legacy-app "[lon1, nyc1]" "[App-DB]" "scope: [App-DB]"
+check "a second policy of one name is an error at the sites the two share" grep -q "second.yaml: policy 'legacy-app' (Application) is already defined in .*legacy-app.yaml for site lon1" <<<"$(v2)"
+rm "$SCRATCH/v2/data/policies/second.yaml"
+newpol twice new-t new-t "[lon1]" "[App-DB]" "scope: [App-DB]"
+printf '  r1:\n    sequence_number: 200\n    action: ALLOW\n    direction: IN\n    source_groups: [ANY]\n    destination_groups: [ANY]\n    scope: [App-DB]\n' >>"$SCRATCH/v2/data/policies/twice.yaml"
+check "a key written twice in one file is an error, not the last one silently winning" grep -q "twice.yaml: unparseable YAML: line 16: duplicate key 'r1' (first at line 10)" <<<"$(v2)"
+check "...with the fallback parser too" grep -q "duplicate key 'r1'" <<<"$(cd "$SCRATCH/v2" && python3 -c 'import sys; sys.path.insert(0, "scripts"); import yamlcompat; yamlcompat._pyyaml = None; import runpy; sys.argv = ["validate-data.py"]; runpy.run_path("scripts/validate-data.py", run_name="__main__")' 2>&1)"
+rm "$SCRATCH/v2/data/policies/twice.yaml"
+mkdir -p "$SCRATCH/v2/data/vm-tags"
+printf 'site: lon1\nsole_tagger: test\nvms:\n  multi:\n    display_name: multi\n    tags:\n      - { scope: workload, tag: a }\n    ports:\n      - segment: seg-a\n        tags:\n          - { scope: workload, tag: a }\n      - segment: seg-b\n        tags:\n          - { scope: workload, tag: b }\n' >"$SCRATCH/v2/data/vm-tags/lon1.yaml"
+(cd "$SCRATCH/v2" && python3 scripts/tag-vm.py --site lon1 --vm other --display-name other --set workload=c >/dev/null 2>&1)
+check "tag-vm.py keeps every port of a VM with two (one ports: key, both entries)" bash -c 'python3 -c "import sys; sys.path.insert(0, \"$1/scripts\"); import yamlcompat; d = yamlcompat.load_yaml(open(\"$1/data/vm-tags/lon1.yaml\").read()); sys.exit(0 if [p[\"segment\"] for p in d[\"vms\"][\"multi\"][\"ports\"]] == [\"seg-a\", \"seg-b\"] else 1)"' _ "$SCRATCH/v2"
+sed -i '0,/display_name:/s/display_name: .*/&\n    description: Owner: payments team/' "$SCRATCH/v2/data/groups/"*.yaml
+check "the fallback parser refuses what Terraform's parser refuses" grep -q "must be quoted" <<<"$(cd "$SCRATCH/v2" && python3 -c 'import sys; sys.path.insert(0, "scripts"); import yamlcompat; yamlcompat._pyyaml = None; import runpy; sys.argv = ["validate-data.py"]; runpy.run_path("scripts/validate-data.py", run_name="__main__")' 2>&1)"
 
 echo "federation: a Global Manager and a Local Manager, side by side"
 F="$SCRATCH/fed"
@@ -685,6 +739,65 @@ ok = ok and e["domains"] == ["default"] and not any(c.endswith("/domains") for c
 sys.exit(0 if ok else 1)
 PY
 check "a Global Manager is read in every domain, its own first; a Local Manager in default only" test $? -eq 0
+cd "$T" || exit 1
+
+echo "adoption takes only what it can copy exactly"
+X="$SCRATCH/exact"
+generate "$X" --no-examples
+cd "$X" || exit 1
+mkdir -p reports
+printf 'managers:\n  lon1:\n    role: lm\n    host: lon1.example.net\n    site: lon1\n    vcf_instance: v\n    vault_path: secret/lon1\n    tier: prod\n' >inventory/managers.yaml
+python3 - <<'PY'
+import json
+D = "/infra/domains/default"
+def cond(v, **kw): return dict({"resource_type": "Condition", "key": "Tag", "member_type": "VirtualMachine", "operator": "EQUALS", "value": v}, **kw)
+def conj(op): return {"resource_type": "ConjunctionOperator", "conjunction_operator": op}
+def grp(i, expr, **kw): return dict({"id": i, "path": f"{D}/groups/{i}", "display_name": i, "expression": expr}, **kw)
+def rule(p, i, src, **kw):
+    return dict({"id": i, "path": f"{D}/security-policies/{p}/rules/{i}", "display_name": i, "sequence_number": 10, "action": "ALLOW",
+                 "direction": "IN_OUT", "ip_protocol": "IPV4_IPV6", "logged": True, "source_groups": [f"{D}/groups/{src}"],
+                 "destination_groups": [f"{D}/groups/Ok"], "services": ["ANY"], "scope": [f"{D}/groups/Ok"], "profiles": ["ANY"]}, **kw)
+def pol(i, rules, **kw): return dict({"id": i, "path": f"{D}/security-policies/{i}", "display_name": i, "category": "Application",
+                                      "sequence_number": 10, "stateful": True, "scope": [f"{D}/groups/Ok"], "rules": rules}, **kw)
+groups = [grp("Ok", [cond("app|ok")]),
+          grp("ScopeOp", [cond("env|prod", scope_operator="NOTEQUALS")]),
+          grp("NestOr", [{"resource_type": "NestedExpression", "expressions": [cond("a|1"), conj("OR"), cond("b|2")]}]),
+          grp("Mixed", [cond("a|1"), conj("AND"), cond("b|2"), conj("OR"), {"resource_type": "IPAddressExpression", "ip_addresses": ["10.0.0.1"]}]),
+          grp("ByNcp", [cond("ncp|x")], _create_user="wcp-cluster-user-1", _protection="REQUIRE_OVERRIDE")]
+policies = [pol("p-ok", [rule("p-ok", "r-ok", "Ok"), rule("p-ok", "r-scope", "ScopeOp"), rule("p-ok", "r-sys", "Ok", _system_owned=True)]),
+            pol("p-timed", [rule("p-timed", "t1", "Ok")], scheduler_path="/infra/firewall-schedulers/office-hours"),
+            pol("default-layer3-section", [rule("default-layer3-section", "default-layer3-rule", "Ok", action="DROP", is_default=True)],
+                is_default=True, _create_user="nsx_policy", category="Application", sequence_number=2147483647)]
+json.dump({"domain": "default", "groups": groups, "services": [], "policies": policies}, open("reports/lon1.json", "w"))
+PY
+out="$(python3 scripts/import-estate.py --site lon1 --from-dump reports/lon1.json --mirror 2>&1)"
+G="$(cat data/groups/imported-lon1-mirror.yaml 2>/dev/null)"
+check "a tag condition with a scope operator is not adopted, and the rule using it stays in the UI" bash -c 'grep -q "group ScopeOp: a tag condition whose scope is matched with NOTEQUALS" <<<"$1" && grep -q "rule p-ok/r-scope: uses ScopeOp" <<<"$1" && ! grep -q "^  ScopeOp:" <<<"$2"' _ "$out" "$G"
+check "nor conditions joined by OR in one criterion, nor criteria joined by both AND and OR" bash -c 'grep -q "group NestOr: conditions joined by OR inside one criterion" <<<"$1" && grep -q "group Mixed: criteria joined by both AND and OR" <<<"$1"' _ "$out"
+check "nor an object a principal identity made and protects" grep -q "group ByNcp: made and protected by wcp-cluster-user-1" <<<"$out"
+check "nor a rule NSX owns inside a policy that is adopted" bash -c 'grep -q "rule p-ok/r-sys: a rule NSX owns" <<<"$1" && grep -q "^  r-ok:" data/policies/p-ok.yaml && ! grep -q "r-sys" data/policies/p-ok.yaml' _ "$out"
+check "nor a policy with a time window" bash -c 'grep -q "policy p-timed: a time window" <<<"$1" && ! test -e data/policies/p-timed.yaml' _ "$out"
+check "the default section is never adopted, whoever NSX says made it" bash -c '! test -e data/policies/default-layer3-section.yaml && ! grep -rq "default-layer3" data/policies stacks/local-security/import-*.tf'
+check "what was adopted validates" python3 scripts/validate-data.py
+
+echo "rules in a managed policy that data/ does not hold"
+python3 - <<'PY'
+import json
+d = json.load(open("reports/lon1.json"))
+pol = next(p for p in d["policies"] if p["id"] == "p-ok")
+base = dict(pol["rules"][0], _system_owned=False)
+pol["rules"].append(dict(base, id="backdoor", path=pol["path"] + "/rules/backdoor", display_name="backdoor", sequence_number=1,
+                         source_groups=["ANY"], destination_groups=["ANY"], services=["ANY"],
+                         _last_modified_user="admin", _last_modified_time=1700000000000))
+pol["rules"].append(dict(base, id="handed", path=pol["path"] + "/rules/handed", display_name="handed", sequence_number=5))
+json.dump(d, open("reports/lon1-live.json", "w"))
+PY
+printf 'removed {\n  from = module.policies["p-ok"].nsxt_policy_security_policy_rule.this["handed"]\n  lifecycle {\n    destroy = false\n  }\n}\n' >stacks/local-security/handback-p_ok_handed.tf
+out="$(python3 scripts/drift-issue.py unmanaged --site lon1 --dump reports/lon1-live.json --report-only 2>&1)"; rc=$?
+check "a rule added in the UI inside a managed policy is reported, with what it allows and who added it" bash -c '[ "$2" = 2 ] && grep -q "UNMANAGED RULE p-ok/backdoor: ALLOW ANY -> ANY on ANY, applied to Ok, sequence 1 (last changed by admin 2023-11-14" <<<"$1"' _ "$out" "$rc"
+check "...so is a rule adoption left in the UI, which no plan shows either" grep -q "UNMANAGED RULE p-ok/r-scope" <<<"$out"
+check "...but not a rule handed back on purpose, nor one NSX owns, nor one data/ declares" bash -c '! grep -qE "p-ok/(handed|r-sys|r-ok):" <<<"$1"' _ "$out"
+rm stacks/local-security/handback-p_ok_handed.tf
 cd "$T" || exit 1
 
 finish brownfield

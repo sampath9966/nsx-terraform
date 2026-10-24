@@ -70,6 +70,28 @@ sleep 1
 st() { curl -s "http://127.0.0.1:$port/__state"; }
 q() { st | python3 -c "import json,sys; s=json.load(sys.stdin); print($1)"; }
 emoji() { curl -s -X POST "http://127.0.0.1:$port/__emoji/$1/$2" >/dev/null; }
+# base_with <delegations.yaml, printf escapes>: a last applied change (issue 99)
+# whose commit holds that file. A sibling of the head, not an ancestor, so the
+# merges under review stay the same.
+base_with() {
+	local blob tree sha
+	blob="$(printf '%b' "$1" | git hash-object -w --stdin)"
+	GIT_INDEX_FILE="$SCRATCH/base.idx" git read-tree "$A"
+	GIT_INDEX_FILE="$SCRATCH/base.idx" git update-index --add --cacheinfo "100644,$blob,inventory/delegations.yaml"
+	tree="$(GIT_INDEX_FILE="$SCRATCH/base.idx" git write-tree)"
+	sha="$(git -c user.name=test -c user.email=test@test commit-tree "$tree" -p "$A" -m "applied base")"
+	set_base "$sha"
+}
+set_base() { # set_base <sha>, or nothing to remove the seeded applied change
+	st | python3 -c "
+import json, sys
+s = json.load(sys.stdin)
+issues = [i for i in s['issues'] if i['iid'] != 99]
+if sys.argv[1]:
+    issues.append({'iid': 99, 'title': 'applied', 'description': '<!-- nsx-change pipeline=1 sha=%s -->' % sys.argv[1],
+                   'labels': ['nsx-change', 'nsx-applied'], 'state': 'closed', 'updated': 0})
+print(json.dumps({'issues': issues}))" "${1:-}" | curl -s -X POST "http://127.0.0.1:$port/__set" -d @- >/dev/null
+}
 export CI_API_V4_URL="http://127.0.0.1:$port/api/v4" CI_PROJECT_ID=7 NSX_BOT_TOKEN=SECRET-BOT-TOKEN \
 	CI_DEFAULT_BRANCH=main CI_PIPELINE_URL=http://gitlab.test/pipelines/100 CI_JOB_URL=http://gitlab.test/jobs/900
 cc() { CI_PIPELINE_ID="${PIPE:-100}" CI_COMMIT_SHA="${HEAD_SHA:-$B}" python3 scripts/change-control.py "$@" 2>&1; }
@@ -120,16 +142,19 @@ check "...nor a bot's, nor a Developer's without a standby approval" bash -c 'gr
 emoji 1 bob
 out="$(cc gate)"; rc=$?
 check "one Maintainer of two required: still refused" bash -c '[ "$2" = 2 ] && grep -q "counted      @bob (Maintainer)" <<<"$1" && grep -q "1 of 2" <<<"$1"' _ "$out" "$rc"
-printf 'delegations:\n  - from: alice\n    to: carol\n    until: 2020-01-31\n    reason: leave\n' >inventory/delegations.yaml
-check "a standby approval that has ended does not count" grep -q "1 of 2" <<<"$(cc gate)"
-printf 'delegations:\n  - from: erin\n    to: carol\n    until: 2999-01-31\n    reason: leave\n' >inventory/delegations.yaml
-check "nor one handed over by someone who is not a Maintainer" grep -q "1 of 2" <<<"$(cc gate)"
 printf 'delegations:\n  - from: alice\n    to: carol\n    until: 2999-01-31\n    reason: leave\n' >inventory/delegations.yaml
+check "a standby approval the change itself adds does not count" grep -q "1 of 2" <<<"$(cc gate)"
+base_with 'delegations:\n  - from: alice\n    to: carol\n    until: 2020-01-31\n    reason: leave\n'
+check "a standby approval that has ended does not count" grep -q "1 of 2" <<<"$(cc gate)"
+base_with 'delegations:\n  - from: erin\n    to: carol\n    until: 2999-01-31\n    reason: leave\n'
+check "nor one handed over by someone who is not a Maintainer" grep -q "1 of 2" <<<"$(cc gate)"
+base_with 'delegations:\n  - from: alice\n    to: carol\n    until: 2999-01-31\n    reason: leave\n'
 emoji 1 alice
 out="$(cc gate)"; rc=$?
 check "a Maintainer and their stand-in count once between them" bash -c '[ "$2" = 0 ] && grep -q "counted      @carol (standing in for alice" <<<"$1" && grep -q "not counted  @alice: counts as alice, who is counted already" <<<"$1"' _ "$out" "$rc"
 check "approved: the change request moves to applying, saying who approved" bash -c 'python3 -c "import json,sys;s=json.load(sys.stdin);sys.exit(0 if s[\"issues\"][0][\"labels\"]==[\"nsx-change\",\"nsx-applying\"] and \"Approved by @carol, @bob\" in s[\"notes\"][\"1\"][-1] else 1)" <<<"$1"' _ "$(st)"
 check "the gate refuses a change request that is not this pipeline's" grep -q "is the change request of pipeline 100, not this one" <<<"$(PIPE=999 cc gate)"
+check "...or whose commit is not this pipeline's" grep -q "names commit ${B:0:8}, but this pipeline is ${A:0:8}" <<<"$(HEAD_SHA="$A" cc gate)"
 
 echo "apply and record"
 stubs() { # stand-ins for the credential wrapper and Terraform
@@ -158,6 +183,7 @@ check "...skipping what changes nothing, and never a mirror manager" bash -c 'gr
 check "the change request is closed as applied, with each result" bash -c 'python3 -c "import json,sys;s=json.load(sys.stdin);i=s[\"issues\"][0];n=s[\"notes\"][\"1\"][-1];sys.exit(0 if i[\"state\"]==\"closed\" and i[\"labels\"]==[\"nsx-change\",\"nsx-applied\"] and \"| par1/local-security | Apply complete!\" in n and \"@carol (for @alice)\" in n else 1)" <<<"$1"' _ "$(st)"
 W="$(q 's["wiki"]["NSX-Change-Log"]')"
 check "the wiki change log is created with a line for it" bash -c 'grep -q "^# NSX Change Log" <<<"$1" && grep -q "| \[#1\](http://gitlab.test/issues/1) | !12 | @erin | @bob | @carol (for @alice), @bob | applied |" <<<"$1"' _ "$W"
+set_base ""
 
 echo "the next change: every merge since the last applied one is checked"
 git_quiet commit --allow-empty -m "merge !13" && C="$(git rev-parse HEAD)"
@@ -173,6 +199,9 @@ git_quiet commit --allow-empty -m "direct push" && F="$(git rev-parse HEAD)"
 out="$(PIPE=102 HEAD_SHA="$F" cc open)"
 check "a commit that reached the branch without a merge request blocks it too" grep -q "commit ${F:0:8} reached main without a merge request" <<<"$out"
 check "a newer change request supersedes an older one still open" bash -c 'python3 -c "import json,sys;s=json.load(sys.stdin);i=s[\"issues\"][1];sys.exit(0 if i[\"state\"]==\"closed\" and \"nsx-superseded\" in i[\"labels\"] and \"Superseded\" in s[\"notes\"][\"2\"][-1] else 1)" <<<"$1"' _ "$(st)"
+plans none none none none
+PIPE=104 HEAD_SHA="$F" cc open >/dev/null
+check "a newer commit that leaves nothing to apply (a revert) supersedes those still open too" bash -c 'python3 -c "import json,sys;s=json.load(sys.stdin);i=s[\"issues\"][2];sys.exit(0 if i[\"state\"]==\"closed\" and \"nsx-superseded\" in i[\"labels\"] and \"nothing is left to apply\" in s[\"notes\"][\"3\"][-1] else 1)" <<<"$1"' _ "$(st)"
 
 echo "the approvals schedule"
 git_quiet reset -q --hard "$B"

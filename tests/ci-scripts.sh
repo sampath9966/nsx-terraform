@@ -493,4 +493,31 @@ out="$(fd_run)"
 check "...and the next run tries again and bakes it" bash -c 'grep -q "trying again" <<<"$1" && grep -q "inside)" <<<"$1"' _ "$out"
 check "the pinned provider satisfies the stacks' constraint (~> 3.9)" bash -c 'v="$(sed -n "s/.*version = \"\(.*\)\"/\1/p" "$1/deploy/ci-image/providers.tf")"; grep -rq "\"~> 3.9\"" "$1/stacks" && [ "${v%%.*}" = 3 ] && [ "$(echo "$v" | cut -d. -f2)" -ge 9 ]' _ "$T"
 
+echo "gitlab-setup.sh: the token anyone's branch can read is never a Maintainer's"
+G="$SCRATCH/gs-tree"
+generate "$G"
+(cd "$G" && git init -q -b main && git_quiet add -A && git_quiet commit -m base)
+setup_run() { # setup_run <state.json or ""> -> the requests it made, in $SCRATCH/gs.log
+	local port=$((20000 + RANDOM % 20000))
+	: >"$SCRATCH/gs.log"
+	python3 "$REPO/tests/fake_gitlab_setup.py" "$port" "$SCRATCH/gs.log" ${1:+"$1"} &
+	local fake=$!
+	sleep 0.7
+	(cd "$G" && env -u CI_API_TOKEN GITLAB_TOKEN=glpat-ADMIN-TOKEN timeout 60 scripts/gitlab-setup.sh \
+		--url "http://127.0.0.1:$port" --project grp/nsx 2>&1)
+	kill "$fake" 2>/dev/null
+}
+out="$(setup_run "")"
+check "a new project gets a Reporter project access token for plan comments" bash -c 'grep -q "POST /projects/7/access_tokens .*\"access_level\": \"20\"" "$1" && grep -q "POST /projects/7/variables {\"key\": \"CI_API_TOKEN\", \"value\": \"glpat-REPORT" "$1"' _ "$SCRATCH/gs.log"
+check "...never the token setup runs with" bash -c '! grep -q "glpat-ADMIN" "$1"' _ "$SCRATCH/gs.log"
+echo '{"variables": {"CI_API_TOKEN": {"key": "CI_API_TOKEN", "value": "glpat-ADMIN-TOKEN"}}}' >"$SCRATCH/gs-old.json"
+out="$(setup_run "$SCRATCH/gs-old.json")"
+check "a project set up by an older release, holding that token, has it replaced" bash -c 'grep -q "replacing it" <<<"$2" && grep -q "PUT /projects/7/variables/CI_API_TOKEN {\"value\": \"glpat-REPORT" "$1"' _ "$SCRATCH/gs.log" "$out"
+echo '{"no_tokens": true, "variables": {"CI_API_TOKEN": {"key": "CI_API_TOKEN", "value": "glpat-ADMIN-TOKEN"}}}' >"$SCRATCH/gs-old.json"
+out="$(setup_run "$SCRATCH/gs-old.json")"
+check "...or removed, saying what to set, where project tokens are unavailable" bash -c 'grep -q "DELETE /projects/7/variables/CI_API_TOKEN" "$1" && grep -q "role Reporter, scope api" <<<"$2"' _ "$SCRATCH/gs.log" "$out"
+echo '{"variables": {"CI_API_TOKEN": {"key": "CI_API_TOKEN", "value": "glpat-SOMEONE-ELSES"}}}' >"$SCRATCH/gs-own.json"
+out="$(setup_run "$SCRATCH/gs-own.json")"
+check "a token someone set themselves is left alone" bash -c 'grep -q "already set; left as it is" <<<"$2" && ! grep -qE "access_tokens|PUT .*CI_API_TOKEN" "$1"' _ "$SCRATCH/gs.log" "$out"
+
 finish ci-scripts

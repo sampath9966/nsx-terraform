@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 
 ROOT="$PWD"
 FORCE=0
@@ -1500,7 +1500,10 @@ From then on, for that manager:
   refresh-only plan per manager and stack with the read-only credential,
   changes nothing, and raises each change as an `nsx-drift` issue, with who made
   it and when, as in mirror mode. Either bring the change into `data/` in a
-  merge request, or the next apply puts NSX back to the repository.
+  merge request, or the next apply puts NSX back to the repository. That holds
+  for the objects Terraform manages; a rule added in the UI inside a managed
+  policy is not one of them, and no apply removes it. The drift job and
+  `make drift` look for those too.
 
 ## 1. Capture, read-only
 
@@ -2170,7 +2173,7 @@ rather than a trap.
 | `VAULT_ADDR` | Vault endpoint | masked |
 | `VAULT_PLAN_TOKEN` | **read-only** token | masked |
 | `VAULT_APPLY_TOKEN` | write token | masked, **protected** |
-| `CI_API_TOKEN` | project token, `api` scope, so plans can be posted to the MR | masked |
+| `CI_API_TOKEN` | project access token, role **Reporter**, `api` scope, so plans can be posted to the MR. Never a Maintainer's or administrator's token: merge request pipelines can read it | masked, not protected |
 | `NSX_APPLY_MODE` | `manual` (default), `auto`, or `approval` (change control, below) | optional |
 | `NSX_BOT_TOKEN` | change control only: project access token, role **Maintainer**, `api` scope | masked, **protected** |
 | `NSX_REQUIRED_APPROVALS` | change control only: approvals per change (default `2`) | optional |
@@ -3390,6 +3393,13 @@ resource "nsxt_policy_group" "this" {
   }
 
   lifecycle {
+    # NSX refuses to delete a group a rule still uses. Without this, Terraform
+    # deletes a renamed or retired group before it moves the rules off it, the
+    # apply fails half-way, and every retry fails the same way. With it, the
+    # replacement is created and the rules updated first; the old group goes
+    # last. Every group has its own nsx_id, so no two copies ever collide.
+    create_before_destroy = true
+
     precondition {
       condition     = length(try(each.value.criteria, [])) > 0
       error_message = "Group ${each.key} has no criteria. A group with no membership matches nothing and silently drops traffic."
@@ -3500,6 +3510,12 @@ resource "nsxt_policy_service" "this" {
       icmp_type    = try(icmp_entry.value.icmp_type, null)
       icmp_code    = try(icmp_entry.value.icmp_code, null)
     }
+  }
+
+  lifecycle {
+    # As for groups: NSX refuses to delete a service a rule still uses, so the
+    # rules are moved off it before it is deleted, never after.
+    create_before_destroy = true
   }
 }
 SCAFFOLD_EOF
@@ -4384,9 +4400,10 @@ locals {
   # --- groups -------------------------------------------------------------
   group_files = fileset("${local.data_root}/groups", "*.yaml")
 
-  groups_all = merge([
-    for f in local.group_files : try(yamldecode(file("${local.data_root}/groups/${f}")).groups, {})
-  ]...)
+  # Decoded outside try(): a file Terraform cannot parse must fail the plan,
+  # not quietly contribute no groups.
+  group_docs = [for f in local.group_files : yamldecode(file("${local.data_root}/groups/${f}"))]
+  groups_all = merge([for d in local.group_docs : try(d.groups, {})]...)
 
   groups = { for k, g in local.groups_all : k => g if try(g.owner, "lm") == "gm" }
 
@@ -4563,9 +4580,10 @@ locals {
   # --- groups -------------------------------------------------------------
   group_files = fileset("${local.data_root}/groups", "*.yaml")
 
-  groups_all = merge([
-    for f in local.group_files : try(yamldecode(file("${local.data_root}/groups/${f}")).groups, {})
-  ]...)
+  # Decoded outside try(): a file Terraform cannot parse must fail the plan,
+  # not quietly contribute no groups.
+  group_docs = [for f in local.group_files : yamldecode(file("${local.data_root}/groups/${f}"))]
+  groups_all = merge([for d in local.group_docs : try(d.groups, {})]...)
 
   groups = {
     for k, g in local.groups_all : k => g
@@ -5266,7 +5284,14 @@ show)
 	}
 	require_plan_for_site
 	ensure_init
-	run show tfplan
+	# Terraform colours its output even into a pipe. A rendered plan saved to a
+	# file is read by scripts (change control looks for the "Plan:" line) and
+	# posted to merge requests, so colour only reaches a terminal.
+	if [ -t 1 ]; then
+		run show tfplan
+	else
+		run show -no-color tfplan
+	fi
 	;;
 apply)
 	[ -f "$plan_file" ] || {
@@ -5287,6 +5312,23 @@ apply)
 			exit 1
 		fi
 		observe=(--observe)
+	fi
+	# In a pipeline, only the newest commit on the default branch is applied with
+	# the write credential. Every pipeline's plan holds everything merged before
+	# it, so the newest one is always the one to apply. An older pipeline's plan
+	# applied after a newer one would put back what the newer one removed (a
+	# reverted allow rule, say), and Terraform cannot see it when the newer
+	# pipeline changed nothing in state. Fails closed: no head, no apply.
+	if [ -n "${CI_COMMIT_SHA:-}" ] && [ -n "${CI_DEFAULT_BRANCH:-}" ] && [ "${NSX_CRED_SCOPE:-}" = apply ]; then
+		head="$(git -C "$REPO_ROOT" ls-remote origin "refs/heads/$CI_DEFAULT_BRANCH" 2>/dev/null | cut -f1 || true)"
+		if [ -z "$head" ]; then
+			echo "error: cannot read the head of $CI_DEFAULT_BRANCH from origin, so cannot tell whether this pipeline is the newest. Nothing applied; retry the job." >&2
+			exit 1
+		fi
+		if [ "$head" != "$CI_COMMIT_SHA" ]; then
+			echo "error: $CI_DEFAULT_BRANCH has moved on to ${head:0:8} since this pipeline's commit ${CI_COMMIT_SHA:0:8}. Nothing applied: apply the newest pipeline's plan instead, which holds this change too." >&2
+			exit 1
+		fi
 	fi
 	require_plan_for_site
 	ensure_init
@@ -5757,14 +5799,40 @@ except ImportError:  # pragma: no cover
     _pyyaml = None
 
 
-def load_yaml(text: str) -> Any:
-    if _pyyaml is not None:
-        return _pyyaml.safe_load(text)
-    return _Parser(text).parse()
-
-
 class YamlError(ValueError):
     pass
+
+
+def _duplicate(key: Any, line: int, first: int) -> YamlError:
+    # YAML parsers, Terraform's yamldecode among them, keep the last of two equal
+    # keys and drop the first without a word. A rule pasted twice under one key
+    # would silently replace the reviewed one, so two equal keys are an error.
+    return YamlError(f"line {line}: duplicate key {key!r} (first at line {first}); "
+                     "only the last would be used")
+
+
+if _pyyaml is not None:  # pragma: no cover - environment dependent
+    class _StrictLoader(_pyyaml.SafeLoader):
+        def construct_mapping(self, node, deep=False):
+            seen: dict[Any, int] = {}
+            for key_node, _ in node.value:
+                if key_node.tag == "tag:yaml.org,2002:merge":
+                    continue  # '<<:' merges are meant to be overridden
+                key = self.construct_object(key_node, deep=True)
+                try:
+                    first = seen.get(key)
+                except TypeError:
+                    continue
+                if first is not None:
+                    raise _duplicate(key, key_node.start_mark.line + 1, first)
+                seen[key] = key_node.start_mark.line + 1
+            return super().construct_mapping(node, deep)
+
+
+def load_yaml(text: str) -> Any:
+    if _pyyaml is not None:
+        return _pyyaml.load(text, Loader=_StrictLoader)
+    return _Parser(text).parse()
 
 
 _INT = re.compile(r"^[+-]?\d+$")
@@ -5818,6 +5886,7 @@ class _Parser:
 
     def _parse_mapping(self, indent: int) -> dict:
         result: dict[str, Any] = {}
+        lines: dict[str, int] = {}
         while True:
             entry = self._peek()
             if entry is None:
@@ -5833,6 +5902,9 @@ class _Parser:
             key, sep, rest = _split_key(content)
             if not sep:
                 raise YamlError(f"line {lineno}: expected 'key: value', got {content!r}")
+            if key in lines:
+                raise _duplicate(key, lineno, lines[key])
+            lines[key] = lineno
             self.pos += 1
             result[key] = self._parse_value(rest.strip(), indent, lineno)
         return result
@@ -5988,6 +6060,10 @@ def _scalar(text: str) -> Any:
         return out
     if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
         return text[1:-1]
+    if ": " in text or text.endswith(":"):
+        # A full YAML parser refuses this ("mapping values are not allowed here"),
+        # Terraform's yamldecode included, so the file would not load in a plan.
+        raise YamlError(f"{text!r}: a value with ': ' in it must be quoted")
     lowered = text.lower()
     if lowered in ("true", "yes", "on"):
         return True
@@ -6598,15 +6674,20 @@ def check_policies(
         # name, same category, same span, different nsx_id. Adding a rule to an
         # existing policy means editing its file — scripts/add-rule.py does the
         # lookup for you.
-        name_key = (policy.get("name"), policy.get("category"), owner, tuple(sorted(policy_sites)))
-        if policy.get("name") and name_key in seen_names:
-            report.error(
-                where,
-                f"policy {policy.get('name')!r} ({policy.get('category')}) is already defined in "
-                f"{seen_names[name_key]}. Add the rule to that policy instead of declaring a "
-                f"second one: scripts/add-rule.py --policy {policy_id or policy.get('name')} ...",
-            )
-        seen_names[name_key] = where
+        # Compared site by site: two policies of one name whose site lists differ
+        # but overlap are still two policies at the sites they share.
+        for span in (policy_sites or ["(global)"]):
+            name_key = (policy.get("name"), policy.get("category"), owner, span)
+            if policy.get("name") and name_key in seen_names and seen_names[name_key] != where:
+                report.error(
+                    where,
+                    f"policy {policy.get('name')!r} ({policy.get('category')}) is already defined in "
+                    f"{seen_names[name_key]}{'' if span == '(global)' else f' for site {span}'}. Add the "
+                    f"rule to that policy instead of declaring a second one: "
+                    f"scripts/add-rule.py --policy {policy_id or policy.get('name')} ...",
+                )
+                break
+            seen_names[name_key] = where
 
         if owner == "lm" and not policy_sites:
             report.error(where, "a site-local policy must list the sites it applies to.")
@@ -6623,12 +6704,29 @@ def check_policies(
                 "named approver, rollback plan, out-of-hours.",
             )
 
-        if policy.get("rule_management") == "inline" and len(rules) > 8:
-            report.warn(
+        if policy.get("rule_management") == "inline":
+            report.error(
                 where,
-                f"{len(rules)} rules managed inline. Inline blocks rewrite the whole policy on "
-                "every change; use rule_management: standalone for anything with churn.",
+                "rule_management: inline. No stack deploys an inline policy: the stacks build one "
+                "resource per rule, so this policy would pass review and never reach NSX. "
+                "Use rule_management: standalone.",
             )
+
+        def check_any(names: list, label: str, apply_to: bool) -> None:
+            names = [str(n) for n in names or []]
+            if "ANY" not in names:
+                return
+            others = [n for n in names if n != "ANY"]
+            if others:
+                report.error(where, f"{label}: ANY next to {', '.join(others)}. ANY is dropped, so this "
+                                    f"means only {', '.join(others)}. Write one or the other.")
+            elif apply_to and where in imported:
+                report.warn(where, f"{label}: Apply To ANY, as adopted from NSX: pushed to every "
+                                   "hypervisor in the span. Narrow it to the group it protects when you can.")
+            elif apply_to:
+                report.error(where, f"{label}: ANY is not an Apply To. It pushes the rule to every "
+                                    "hypervisor in the span (docs/ARCHITECTURE.md section 2, item 10). "
+                                    "Name the group it protects.")
 
         def resolve_group(name: str, label: str, literal_ok: bool = False) -> None:
             if name == "ANY":
@@ -6659,6 +6757,7 @@ def check_policies(
 
         for name in policy.get("scope") or []:
             resolve_group(name, "policy.scope")
+        check_any(policy.get("scope"), "policy.scope", apply_to=True)
 
         sequence_numbers: dict[int, str] = {}
         for key, rule in rules.items():
@@ -6678,6 +6777,8 @@ def check_policies(
             for field in ("source_groups", "destination_groups", "scope"):
                 for name in rule.get(field) or []:
                     resolve_group(name, f"{label}.{field}", literal_ok=field != "scope")
+                check_any(rule.get(field), f"{label}.{field}", apply_to=field == "scope")
+            check_any(rule.get("services"), f"{label}.services", apply_to=False)
 
             for name in rule.get("services") or []:
                 if name == "ANY":
@@ -6963,7 +7064,9 @@ So this tool looks the policy up first, and only creates one when told to:
 The policy is found by id, then by display name, across every file in
 data/policies/. The rule is appended to that file, in place, preserving the
 comments around it. Sequence numbers are allocated, not guessed: the next free
-multiple of 100 after the highest existing rule, so there is room to insert.
+multiple of 100 after the highest existing rule, so there is room to insert. A
+policy that ends in a catch-all deny (DROP or REJECT from ANY on ANY) gets the
+new rule before that deny, never after it, where it could never match.
 
 Nothing here talks to NSX. Run 'make validate' and open a PR as usual.
 """
@@ -6995,12 +7098,35 @@ def find_policy(name: str) -> tuple[Path, dict] | None:
     return by_name
 
 
-def next_sequence(rules: dict) -> int:
-    highest = 0
-    for rule in rules.values():
-        if isinstance(rule, dict) and isinstance(rule.get("sequence_number"), int):
-            highest = max(highest, rule["sequence_number"])
-    return highest + 100 if highest else 100
+def catch_all(rule: dict) -> bool:
+    """A deny of everything that reaches it: any source, any service."""
+    return (rule.get("action") in ("DROP", "REJECT")
+            and set(rule.get("source_groups") or ["ANY"]) == {"ANY"}
+            and set(rule.get("services") or ["ANY"]) == {"ANY"})
+
+
+def next_sequence(rules: dict) -> tuple[int, str | None]:
+    """(sequence number, the catch-all deny it was placed before, if any)."""
+    ordered = sorted(((k, r) for k, r in rules.items()
+                      if isinstance(r, dict) and isinstance(r.get("sequence_number"), int)),
+                     key=lambda kr: kr[1]["sequence_number"])
+    if not ordered:
+        return 100, None
+    tail = len(ordered)
+    while tail > 0 and catch_all(ordered[tail - 1][1]):
+        tail -= 1
+    if tail == len(ordered):
+        return ordered[-1][1]["sequence_number"] + 100, None
+    deny_key, deny = ordered[tail]
+    floor = ordered[tail - 1][1]["sequence_number"] if tail else 0
+    ceiling = deny["sequence_number"]
+    candidate = (floor // 100 + 1) * 100
+    if candidate >= ceiling:
+        candidate = (floor + ceiling) // 2
+    if candidate <= floor:
+        sys.exit(f"error: no free sequence number between {floor} and the catch-all deny {deny_key!r} at "
+                 f"{ceiling}; a rule after it would never match. Pass --sequence, or renumber.")
+    return candidate, deny_key
 
 
 def yaml_list(values: list[str]) -> str:
@@ -7120,7 +7246,11 @@ def main() -> int:
             "Edit it there; renaming a rule key destroys and recreates the rule."
         )
 
-    sequence = args.sequence if args.sequence else next_sequence(rules)
+    before_deny = None
+    if args.sequence:
+        sequence = args.sequence
+    else:
+        sequence, before_deny = next_sequence(rules)
     if any(
         isinstance(r, dict) and r.get("sequence_number") == sequence for r in rules.values()
     ):
@@ -7139,6 +7269,8 @@ def main() -> int:
     path.write_text(text + block)
 
     print(f"added rule {args.rule!r} at sequence {sequence}")
+    if before_deny:
+        print(f"  before the catch-all deny {before_deny!r}, which would otherwise drop its traffic first")
     print("next: make validate, then open a PR")
     return 0
 
@@ -7250,8 +7382,11 @@ def dump(doc: dict) -> str:
         out.append("    tags:")
         for tag in vm.get("tags") or []:
             out.append(f"      - {{ scope: {_scalar(tag['scope'])}, tag: {_scalar(tag['tag'])} }}")
-        for port in vm.get("ports") or []:
+        # One 'ports:' key holding every port. Written once per port, YAML would
+        # keep only the last port and the others would lose their tags on apply.
+        if vm.get("ports"):
             out.append("    ports:")
+        for port in vm.get("ports") or []:
             out.append(f"      - segment: {_scalar(port['segment'])}")
             out.append("        tags:")
             for tag in port.get("tags") or []:
@@ -7841,16 +7976,44 @@ EXTERNAL_ID_TYPES = {"VirtualMachine", "VirtualNetworkInterface", "CloudNativeSe
 SERVICE_ENTRIES = {"L4PortSetServiceEntry", "ICMPTypeServiceEntry"}
 
 
+def principal(obj: dict) -> str | None:
+    """Objects a principal identity made (NCP, Tanzu, a load balancer) belong to
+    it: Terraform managing one would fight that controller for it."""
+    if obj.get("_protection") in ("PROTECTED", "REQUIRE_OVERRIDE"):
+        return f"made and protected by {obj.get('_create_user') or 'a principal identity'}, which manages it"
+    return None
+
+
 def group_unsupported(group: dict) -> str | None:
+    if why := principal(group):
+        return why
     kinds = set()
+    conditions = []
     for expression in group.get("expression", []):
         kinds.add(expression.get("resource_type"))
+        if expression.get("resource_type") == "Condition":
+            conditions.append(expression)
         if expression.get("resource_type") == "NestedExpression":
             inner = {e.get("resource_type") for e in expression.get("expressions", [])}
             if inner - {"Condition", "ConjunctionOperator"}:
                 return "nested expression containing " + ", ".join(sorted(str(k) for k in inner - {"Condition", "ConjunctionOperator"}))
+            # The module joins a criterion's conditions with AND, always.
+            if {e.get("conjunction_operator") for e in expression.get("expressions", [])
+                    if e.get("resource_type") == "ConjunctionOperator"} - {"AND"}:
+                return "conditions joined by OR inside one criterion"
+            conditions += [e for e in expression.get("expressions", []) if e.get("resource_type") == "Condition"]
     if kinds - GROUP_EXPRESSIONS:
         return "membership by " + ", ".join(sorted(str(k) for k in kinds - GROUP_EXPRESSIONS))
+    # Neither the provider nor the module carries a tag condition's scope
+    # operator, and NSX takes EQUALS when it is not sent: the first apply that
+    # touched the group would change who is in it.
+    for c in conditions:
+        if c.get("scope_operator", "EQUALS") != "EQUALS":
+            return f"a tag condition whose scope is matched with {c['scope_operator']}"
+    # One conjunction joins every criterion in the module.
+    if len({e.get("conjunction_operator") for e in group.get("expression", [])
+            if e.get("resource_type") == "ConjunctionOperator"}) > 1:
+        return "criteria joined by both AND and OR"
     for expression in group.get("expression", []):
         if expression.get("resource_type") == "ExternalIDExpression" and expression.get("member_type", "VirtualMachine") not in EXTERNAL_ID_TYPES:
             return f"external ids of {expression.get('member_type')}"
@@ -7862,6 +8025,8 @@ def group_unsupported(group: dict) -> str | None:
 
 
 def service_unsupported(service: dict) -> str | None:
+    if why := principal(service):
+        return why
     kinds = {e.get("resource_type") for e in service.get("service_entries", [])} - SERVICE_ENTRIES
     return ("service entries of type " + ", ".join(sorted(str(k) for k in kinds))) if kinds else None
 
@@ -7893,6 +8058,10 @@ def unsupported_objects(groups: list[dict], services: list[dict], start: dict[st
 
 
 def rule_unsupported(rule: dict, bad: dict[str, str]) -> str | None:
+    if is_system(rule):
+        return "a rule NSX owns"
+    if why := principal(rule):
+        return why
     if rule.get("service_entries"):
         return "inline service entries"
     used = sorted({p for f in ("source_groups", "destination_groups", "scope", "services") for p in rule.get(f) or [] if p in bad})
@@ -7901,8 +8070,22 @@ def rule_unsupported(rule: dict, bad: dict[str, str]) -> str | None:
     return None
 
 
+def policy_unsupported(policy: dict) -> str | None:
+    """Policy settings the stacks do not carry, which an apply would drop."""
+    if why := principal(policy):
+        return why
+    if policy.get("scheduler_path"):
+        return "a time window (scheduler); the stacks would make the policy permanent"
+    if policy.get("connectivity_strategy") not in (None, "", "NONE"):
+        return f"connectivity strategy {policy['connectivity_strategy']}"
+    return None
+
+
 def is_system(obj: dict) -> bool:
-    return bool(obj.get("_system_owned")) or obj.get("_create_user") == "system"
+    # The default section and its default rule are marked is_default; whoever
+    # NSX says created them, they are never adopted as an ordinary policy, where
+    # a routine edit could flip the default rule.
+    return bool(obj.get("_system_owned")) or obj.get("_create_user") == "system" or obj.get("is_default") is True
 
 
 # --------------------------------------------------------------------------
@@ -8302,6 +8485,12 @@ def main() -> int:
         blocked = [p for p in policy.get("scope") or [] if p in bad]
         if blocked:
             reason = f"policy {policy['id']}: its Apply To uses {', '.join(b.rsplit('/', 1)[-1] for b in blocked)} (not adoptable)"
+            if policy["id"] in args.policy:
+                sys.exit(f"error: {reason}. Nothing was written.")
+            kept_in_ui.append(reason)
+            continue
+        if why := policy_unsupported(policy):
+            reason = f"policy {policy['id']}: {why}"
             if policy["id"] in args.policy:
                 sys.exit(f"error: {reason}. Nothing was written.")
             kept_in_ui.append(reason)
@@ -9256,6 +9445,11 @@ each one is investigated: who made it, why, and whether it stays.
   scripts/drift-issue.py plan --site S --stack STACK --plan-json FILE [--link URL]
       Run by scripts/drift-job.sh for a manager in mode: managed: the drift
       a refresh-only plan found (NSX no longer matches Terraform's state).
+  scripts/drift-issue.py unmanaged --site S --dump FILE [--link URL] [--report-only]
+      Rules inside a policy this repository manages that data/ does not
+      declare: added in the UI, or by another tool. Terraform only knows the
+      rules it was given, so a plan never shows these, and no apply removes
+      them. --report-only prints them and exits 2 if there are any (drift.sh).
 
 One issue per run that found something new, labelled nsx-drift and
 site:<site>. It lists each object, what changed, and who last changed it and
@@ -9524,6 +9718,64 @@ def plan_changes(plan: dict) -> list[dict]:
     return items
 
 
+def managed_policies(site: str) -> tuple[str, dict[tuple[str, str], dict]]:
+    """(role, {(domain, policy id): its data file's stem and rule keys}) for the
+    policies the security stack manages at site: the stacks' own filters."""
+    managers = (load_yaml((REPO_ROOT / "inventory" / "managers.yaml").read_text()) or {}).get("managers") or {}
+    manager = managers.get(site) or {}
+    role = manager.get("role", "lm")
+    domain = manager.get("domain") or "default"
+    out: dict[tuple[str, str], dict] = {}
+    for f in sorted((REPO_ROOT / "data" / "policies").glob("*.yaml")):
+        doc = load_yaml(f.read_text()) or {}
+        policy = doc.get("policy") or {}
+        if policy.get("rule_management", "standalone") != "standalone":
+            continue
+        owner = policy.get("owner", "lm")
+        sites = policy.get("sites") or []
+        if (role == "gm" and owner != "gm") or (role != "gm" and (owner != "lm" or not (site in sites or "*" in sites))):
+            continue
+        out[(str(policy.get("domain") or domain), str(policy.get("id")))] = {
+            "file": f.stem, "rules": {str(k) for k in doc.get("rules") or {}}}
+    return role, out
+
+
+HANDED_BACK = re.compile(r'from\s*=\s*module\.policies\["((?:[^"\\]|\\.)*)"\]\.nsxt_policy_security_policy_rule\.this\["((?:[^"\\]|\\.)*)"\]')
+
+
+def handed_back(stack: str) -> set[tuple[str, str]]:
+    """(data file stem, rule key) of every rule handed back to the UI on purpose."""
+    found: set[tuple[str, str]] = set()
+    for f in (REPO_ROOT / "stacks" / stack).glob("handback-*.tf"):
+        for m in HANDED_BACK.finditer(f.read_text()):
+            found.add((m.group(1).replace("\\\\", "\\"), m.group(2).replace("\\\\", "\\")))
+    return found
+
+
+def unmanaged_changes(site: str, dump: dict) -> list[dict]:
+    """Rules live in a managed policy that data/ does not declare."""
+    role, managed = managed_policies(site)
+    handed = handed_back("global-security" if role == "gm" else "local-security")
+    leaf = lambda paths: ", ".join(str(p).rsplit("/", 1)[-1] for p in paths or ["ANY"]) or "ANY"  # noqa: E731
+    items = []
+    for policy in dump.get("policies", []):
+        found = re.match(r"^/(?:global-)?infra/domains/([^/]+)/", policy.get("path") or "")
+        mine = managed.get((found.group(1) if found else "default", str(policy.get("id"))))
+        if not mine:
+            continue
+        for rule in policy.get("rules") or []:
+            rid = str(rule.get("id"))
+            if rid in mine["rules"] or (mine["file"], rid) in handed or rule.get("_system_owned") or rule.get("is_default"):
+                continue
+            who, at, _ = when(rule)
+            detail = (f"{rule.get('action', '?')} {leaf(rule.get('source_groups'))} -> {leaf(rule.get('destination_groups'))}"
+                      f" on {leaf(rule.get('services'))}, applied to {leaf(rule.get('scope'))},"
+                      f" sequence {rule.get('sequence_number', '?')}{', disabled' if rule.get('disabled') else ''}")
+            items.append({"key": f"{policy.get('id')}/{rid}", "kind": "rule", "id": rid, "change": "not in repo",
+                          "detail": detail, "who": who, "at": at, "version": digest(rule), "path": rule.get("path", "")})
+    return items
+
+
 def lookup_owners(site: str, items: list[dict]) -> None:
     """Who last changed each drifted object, from NSX (read-only credential)."""
     import importlib.util  # noqa: PLC0415
@@ -9554,7 +9806,8 @@ def cell(text: str) -> str:
 
 
 def issue_body(site: str, items: list[dict], mode: str, link: str) -> str:
-    source = "the mirror sync" if mode == "mirror" else "a drift check (refresh-only plan)"
+    source = {"mirror": "the mirror sync", "unmanaged": "a scan of the policies this repository manages"}.get(
+        mode, "a drift check (refresh-only plan)")
     rows = [f"| {i['change']} | `{cell(i['key'])}` | {cell(i['detail'])} | {cell(i['who']) or '?'} | {i['at'] or '?'} |"
             for i in items[:MAX_ROWS]]
     if len(items) > MAX_ROWS:
@@ -9565,6 +9818,13 @@ def issue_body(site: str, items: list[dict], mode: str, link: str) -> str:
         undo = "Not intended: revert it in NSX; the next sync takes it out of the repository again."
         after = ("After cutover to `mode: managed` a change like this must come through a merge request: "
                  "the drift check raises it the same way, and the next apply would undo it.")
+    elif mode == "unmanaged":
+        keep = ("Intended: add the rule to its policy's file in `data/`, with an `import` block for it "
+                "(docs/IMPORT.md), in a merge request, so it is reviewed and managed from now on.")
+        undo = ("Not intended: delete it in NSX. **No apply removes it**: Terraform manages only the rules in "
+                "`data/`, and does not know this one exists.")
+        after = ("Until then the rule is invisible to review: no plan shows it. This manager is in "
+                 "`mode: managed`: rules are added through merge requests, not the UI.")
     else:
         keep = "Intended: bring it into `data/` in a merge request, so the next apply keeps it."
         undo = "Not intended: the next apply of this manager reverts it to the repository, or revert it in NSX."
@@ -9591,20 +9851,22 @@ def issue_body(site: str, items: list[dict], mode: str, link: str) -> str:
         "",
         "Close this issue once every change in it is explained.",
         "",
-        *[f"<!-- nsx-drift object={digest(i['key'])} version={i['version']} -->" for i in items],
+        *[f"<!-- nsx-drift object={digest(i['key'])} version={i['version']} -->" for i in items[:MAX_ROWS]],
     ]
     return "\n".join(lines)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("mode", choices=["mirror", "plan"])
+    ap.add_argument("mode", choices=["mirror", "plan", "unmanaged"])
     ap.add_argument("--site", required=True)
     ap.add_argument("--base", help="mirror: the ref the copy is compared with (the default branch)")
     ap.add_argument("--dump", help="mirror: the capture the sync read")
     ap.add_argument("--stack", help="plan: the stack the plan is for")
     ap.add_argument("--plan-json", help="plan: terraform show -json of the refresh-only plan")
     ap.add_argument("--link", default="", help="where it was found (a merge request or job URL)")
+    ap.add_argument("--report-only", action="store_true",
+                    help="unmanaged: print what was found and exit 2 if anything, raise no issue")
     args = ap.parse_args()
 
     if args.mode == "mirror":
@@ -9614,6 +9876,17 @@ def main() -> int:
         if items is None:
             print(f"drift: first copy of {args.site}, the baseline: no drift issue.")
             return 0
+    elif args.mode == "unmanaged":
+        if not args.dump:
+            die("unmanaged needs --dump")
+        items = unmanaged_changes(args.site, json.loads(Path(args.dump).read_text()))
+        if args.report_only:
+            for i in items:
+                print(f"UNMANAGED RULE {i['key']}: {i['detail']} (last changed by {i['who'] or '?'} {i['at']})".rstrip())
+            if items:
+                print(f"{len(items)} rule(s) in policies this repository manages are not in data/. No plan shows "
+                      "them and no apply removes them: bring each into data/, or delete it in NSX.")
+            return 2 if items else 0
     else:
         if not (args.stack and args.plan_json):
             die("plan needs --stack and --plan-json")
@@ -9632,8 +9905,10 @@ def main() -> int:
         return 0
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     where = f" ({args.stack})" if args.stack else ""
+    what = (f"{len(new)} rule(s) in managed policies that the repository does not hold"
+            if args.mode == "unmanaged" else f"{len(new)} change(s) made outside the repository")
     issue, _ = gitlab.call("POST", "/issues", {
-        "title": f"NSX drift on {args.site}{where}: {len(new)} change(s) made outside the repository, {stamp}",
+        "title": f"NSX drift on {args.site}{where}: {what}, {stamp}",
         "description": issue_body(args.site, new, args.mode, args.link),
         "labels": f"{LABEL},site:{args.site}",
     })
@@ -9694,7 +9969,6 @@ case "$status" in
 0)
 	echo "no drift: $stack @ $site"
 	rm -f "$report"
-	exit 0
 	;;
 2)
 	echo "DRIFT DETECTED: $stack @ $site"
@@ -9704,13 +9978,32 @@ case "$status" in
 	echo
 	echo "This is a ticket, not an auto-fix. Either bring the change into data/ or"
 	echo "revert it deliberately. Nothing in data/ has been modified."
-	exit 2
 	;;
 *)
 	echo "error running the refresh-only plan; see ${report#"$REPO_ROOT"/}" >&2
 	exit 1
 	;;
 esac
+
+# A refresh-only plan sees only what Terraform manages. A rule added in the UI
+# inside a managed policy is not in state, so it needs its own look: read the
+# manager's policies and list every rule data/ does not declare. (The drift job
+# sets DRIFT_STATE_ONLY and does this itself, to raise an issue.)
+if [ -z "${DRIFT_STATE_ONLY:-}" ] && { [ "$stack" = global-security ] || [ "$stack" = local-security ]; }; then
+	capture="$report_dir/unmanaged-${site}-${stamp}.json"
+	if ! python3 "$REPO_ROOT/scripts/import-estate.py" --site "$site" --dump-only "$capture" >/dev/null; then
+		echo "error: could not read $site's policies to look for rules outside this repository" >&2
+		exit 1
+	fi
+	python3 "$REPO_ROOT/scripts/drift-issue.py" unmanaged --site "$site" --dump "$capture" --report-only
+	case $? in
+	0) echo "no unmanaged rules: every rule in the policies $stack manages at $site is in data/" ;;
+	2) status=2 ;;
+	*) exit 1 ;;
+	esac
+	rm -f "$capture"
+fi
+exit "$status"
 SCAFFOLD_EOF
 mark_executable scripts/drift.sh
 
@@ -9740,14 +10033,26 @@ if [ "${1:-}" = --one ]; then # --one SITE STACK, inside with-credentials.sh
 	site="$2"
 	stack="$3"
 	json="$(mktemp)"
-	trap 'rm -f "$json"' EXIT
-	DRIFT_JSON="$json" scripts/drift.sh "$stack" "$site"
+	capture="$(mktemp)"
+	trap 'rm -f "$json" "$capture"' EXIT
+	rc=0
+	DRIFT_STATE_ONLY=1 DRIFT_JSON="$json" scripts/drift.sh "$stack" "$site"
 	case $? in
-	0) exit 0 ;;
-	2) python3 scripts/drift-issue.py plan --site "$site" --stack "$stack" --plan-json "$json" --link "${CI_JOB_URL:-}" ;;
-	*) exit 1 ;;
+	0) ;;
+	2) python3 scripts/drift-issue.py plan --site "$site" --stack "$stack" --plan-json "$json" --link "${CI_JOB_URL:-}" || rc=1 ;;
+	*) rc=1 ;;
 	esac
-	exit $?
+	# What a refresh-only plan cannot see: rules in the policies this stack
+	# manages that data/ does not hold, added in the UI or by another tool.
+	if [ "$stack" = global-security ] || [ "$stack" = local-security ]; then
+		if python3 scripts/import-estate.py --site "$site" --dump-only "$capture" >/dev/null; then
+			python3 scripts/drift-issue.py unmanaged --site "$site" --dump "$capture" --link "${CI_JOB_URL:-}" || rc=1
+		else
+			echo "error: could not read $site's policies to look for rules outside this repository" >&2
+			rc=1
+		fi
+	fi
+	exit "$rc"
 fi
 
 [ -n "${DRIFT_SITE:-}" ] || {
@@ -10226,7 +10531,7 @@ Set these in the project, under Settings → CI/CD → Variables:
 | `VAULT_ADDR` | your Vault endpoint | masked |
 | `VAULT_PLAN_TOKEN` | a **read-only** token | masked |
 | `VAULT_APPLY_TOKEN` | a write token | masked, **protected** |
-| `CI_API_TOKEN` | project token, `api` scope — lets the pipeline post plans to the MR | masked |
+| `CI_API_TOKEN` | project access token, role Reporter, `api` scope — lets the pipeline post plans to the MR. Any branch can read it, so never a Maintainer's token | masked |
 
 `VAULT_APPLY_TOKEN` must be protected, so it is only available on protected
 branches. That is what stops a feature branch from applying anything.
@@ -10429,7 +10734,38 @@ set_var VAULT_ADDR "${VAULT_ADDR:-}" false false
 set_var VAULT_PLAN_TOKEN "${VAULT_PLAN_TOKEN:-}" false true
 # Protected, so a feature branch can never reach the write credential.
 set_var VAULT_APPLY_TOKEN "${VAULT_APPLY_TOKEN:-}" true true
-set_var CI_API_TOKEN "${CI_API_TOKEN:-$TOKEN}" false true
+# CI_API_TOKEN posts plans onto merge requests. Merge request pipelines need it,
+# so it cannot be protected, and anyone who can push a branch can read it. So it
+# is never the token this script runs with (Maintainer, Owner, or an
+# administrator's): that would hand every developer the CI/CD variables, the
+# write credential among them. It is a project access token with the Reporter
+# role, which can comment and cannot read variables or change settings.
+if [ -n "${CI_API_TOKEN:-}" ]; then
+	set_var CI_API_TOKEN "$CI_API_TOKEN" false true
+elif [ "$DRY" = 1 ]; then
+	say "  would create a Reporter project access token for plan comments, as CI_API_TOKEN"
+else
+	current="$(api GET "/projects/$pid/variables/CI_API_TOKEN" | jget value)"
+	if [ -n "$current" ] && [ "$current" != "$TOKEN" ]; then
+		say "  CI_API_TOKEN already set; left as it is"
+	else
+		[ -z "$current" ] || say "  CI_API_TOKEN holds the token this script runs with, which any branch can read: replacing it"
+		expires="$(date -u -d '+365 days' +%Y-%m-%d 2>/dev/null || date -u -v+365d +%Y-%m-%d)"
+		comment_token="$(api POST "/projects/$pid/access_tokens" \
+			--data-urlencode "name=nsx-plan-comments" \
+			--data "scopes[]=api" --data "access_level=20" \
+			--data "expires_at=$expires" | jget token)"
+		if [ -n "$comment_token" ]; then
+			set_var CI_API_TOKEN "$comment_token" false true
+			say "  (a project access token, role Reporter, expiring $expires: it can comment, nothing more)"
+		else
+			[ -z "$current" ] || api DELETE "/projects/$pid/variables/CI_API_TOKEN" >/dev/null
+			say "  could not create a project access token for plan comments, so CI_API_TOKEN is not set"
+			say "  and plans are not posted to merge requests. Create one (role Reporter, scope api) and"
+			say "  set it as CI_API_TOKEN: masked, not protected."
+		fi
+	fi
+fi
 
 if [ -z "${VAULT_ADDR:-}${VAULT_PLAN_TOKEN:-}${VAULT_APPLY_TOKEN:-}" ]; then
 	say ""
@@ -10711,7 +11047,7 @@ or the credentials themselves, held in GitLab:
 
 and, for plan comments on merge requests:
 
-  CI_API_TOKEN        project token, 'api' scope     masked
+  CI_API_TOKEN        project access token, role Reporter, 'api' scope   masked (never a Maintainer's: any branch can read it)
 
 Then protect the default branch (Settings -> Repository -> Protected branches)
 so only the pipeline can apply. docs/GITOPS.md explains the whole flow.
@@ -13061,6 +13397,9 @@ def main() -> int:
             out.append("  allow_failure: false")
         out.append("  environment:")
         out.append(f'    name: nsx/{row["site"]}/{row["stack"]}')
+        # One apply per state at a time, across pipelines: the same group the
+        # mirror's sync-state uses. tf.sh refuses any but the newest commit.
+        out.append(f"  resource_group: nsx-state-{row['site']}-{row['stack']}")
         out.append("  variables:")
         out.append(f'    SITE: "{row["site"]}"')
         out.append(f'    STACK: "{row["stack"]}"')
@@ -13279,12 +13618,21 @@ def members(gl: GitLab) -> dict[str, int]:
             if not BOT.match(m.get("username", ""))}
 
 
-def delegations(today: date) -> list[dict]:
+def delegations(today: date, base: str | None) -> list[dict]:
     """The standby approvals in force today: a Maintainer's approval handed to
-    another engineer until a date (inclusive, UTC)."""
-    if not DELEGATIONS.exists():
+    another engineer until a date (inclusive, UTC).
+
+    Read as the file stood at the last applied change, never from the change
+    being approved: otherwise a merge request could add the standby approvals
+    it needs to count itself approved. A new one counts once a change has been
+    applied after it; before the first applied change, none do."""
+    if not base:
         return []
-    doc = load_yaml(DELEGATIONS.read_text()) or {}
+    rel = DELEGATIONS.relative_to(REPO_ROOT).as_posix()
+    shown = subprocess.run(["git", "show", f"{base}:{rel}"], cwd=REPO_ROOT, capture_output=True, text=True)
+    if shown.returncode != 0:
+        return []
+    doc = load_yaml(shown.stdout) or {}
     active = []
     for d in doc.get("delegations") or []:
         try:
@@ -13312,12 +13660,12 @@ def principal(user: str, authors: set[str], levels: dict[str, int], standby: lis
     return None, "not a Maintainer, and no standby approval in force"
 
 
-def approvals(gl: GitLab, iid: int, authors: set[str]) -> tuple[list[tuple[str, str, str]], list[tuple[str, str]]]:
+def approvals(gl: GitLab, iid: int, authors: set[str], base: str | None) -> tuple[list[tuple[str, str, str]], list[tuple[str, str]]]:
     """(accepted: user, counts as, why), (not counted: user, why). Each person
     counts once, and a stand-in and the Maintainer they stand in for count once
     between them."""
     levels = members(gl)
-    standby = delegations(datetime.now(timezone.utc).date())
+    standby = delegations(datetime.now(timezone.utc).date(), base)
     accepted: list[tuple[str, str, str]] = []
     rejected: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -13403,16 +13751,25 @@ def review(gl: GitLab, head: str) -> tuple[list[dict], list[str]]:
 
 # --- the plans ---------------------------------------------------------------
 
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
 def plan_summary(text: str | None) -> tuple[str, bool]:
-    """(what the plan says, whether applying it changes anything)."""
+    """(what the plan says, whether applying it changes anything).
+
+    A plan this cannot read counts as a change, so it is shown to the approvers
+    in full rather than silently left unapplied."""
     if text is None:
         return "no plan (its job did not produce one)", False
+    text = ANSI.sub("", text)
     for line in text.splitlines():
         if line.startswith("Plan:"):
             return line.strip(), True
         if line.startswith("No changes"):
             return "No changes.", False
-    return "only output values change", False
+    if "Changes to Outputs:" in text:
+        return "only output values change", False
+    return "could not find the plan's summary line: read the plan in full", True
 
 
 def targets() -> list[dict]:
@@ -13442,18 +13799,24 @@ def cmd_open(gl: GitLab) -> int:
     head = os.environ.get("CI_COMMIT_SHA") or git("rev-parse", "HEAD")
     dotenv = REPO_ROOT / "change.env"
     found = plans()
-    if not any(changes for _, _, changes, _ in found):
-        dotenv.write_text("CHANGE_ISSUE=\n")
-        print("Nothing to approve: no plan changes anything in NSX.")
-        return 0
+    pending = any(changes for _, _, changes, _ in found)
 
-    # A newer change holds every older one still waiting: close those.
+    # A newer change holds every older one still waiting: close those. Done
+    # before deciding whether there is anything to approve, because a newer
+    # commit that leaves nothing to apply (a revert) supersedes them too; left
+    # open, an older one could still be approved and put back what was reverted.
     for issue in gl.get_all("/issues", {"labels": LABEL, "state": "opened"}):
         mark = MARK.search(issue.get("description") or "")
         if mark and mark.group(1) != pipeline and APPLYING not in issue.get("labels", []):
-            gl.note(issue["iid"], f"Superseded: the default branch has moved on, and the change request for "
-                                   f"pipeline {pipeline} holds this change too. Approve that one instead.")
+            why = (f"the change request for pipeline {pipeline} holds this change too. Approve that one instead."
+                   if pending else f"at pipeline {pipeline} nothing is left to apply.")
+            gl.note(issue["iid"], f"Superseded: the default branch has moved on, and {why}")
             gl.labels(issue["iid"], SUPERSEDED, close=True)
+
+    if not pending:
+        dotenv.write_text("CHANGE_ISSUE=\n")
+        print("Nothing to approve: no plan changes anything in NSX.")
+        return 0
 
     changes, problems = review(gl, head)
     authors = sorted({c["author"] for c in changes})
@@ -13514,13 +13877,20 @@ def check(gl: GitLab, iid: int, pipeline: str | None) -> tuple[dict, list[dict],
         die(f"issue #{iid} is not a change request")
     if pipeline and mark.group(1) != str(pipeline):
         refusals.append(f"issue #{iid} is the change request of pipeline {mark.group(1)}, not this one")
+    # The commit reviewed is this pipeline's own, never one read back from the
+    # issue, whose description anyone who can edit issues can change.
+    head = mark.group(2)
+    if pipeline and os.environ.get("CI_COMMIT_SHA"):
+        head = os.environ["CI_COMMIT_SHA"]
+        if mark.group(2) != head:
+            refusals.append(f"issue #{iid} names commit {mark.group(2)[:8]}, but this pipeline is {head[:8]}")
     labels = set(issue.get("labels") or [])
     if issue.get("state") != "opened" or labels & {SUPERSEDED, BLOCKED, APPLIED}:
         refusals.append(f"change request #{iid} is {issue.get('state')} ({', '.join(sorted(labels)) or 'no labels'})")
-    changes, problems = review(gl, mark.group(2))
+    changes, problems = review(gl, head)
     refusals += problems
     authors = {c["author"] for c in changes}
-    accepted, rejected = approvals(gl, iid, authors)
+    accepted, rejected = approvals(gl, iid, authors, last_applied(gl))
     need = required()
     if len(accepted) < need:
         refusals.append(f"{len(accepted)} of {need} approval(s)")
@@ -13693,6 +14063,13 @@ rc=$?
 log="$REPO_ROOT/apply.log"
 : >"$log"
 status=ok
+# Read first: a failure inside <(...) goes unnoticed, and an empty list would be
+# recorded as applied with nothing applied.
+if ! targets="$(python3 scripts/ci-matrix.py --format lines --managed-only)"; then
+	echo "error: cannot read the managers from inventory/managers.yaml" | tee -a "$log"
+	status=failed
+	targets=""
+fi
 while read -r site stack _; do
 	[ -n "$site" ] || continue
 	text="plan-$stack-$site.txt"
@@ -13710,7 +14087,7 @@ while read -r site stack _; do
 		status=failed
 		break
 	fi
-done < <(python3 scripts/ci-matrix.py --format lines --managed-only)
+done <<<"$targets"
 
 if ! python3 scripts/change-control.py record --result "$status" --log "$log"; then
 	echo "error: the result could not be recorded on the change request; record it by hand." >&2
@@ -13749,6 +14126,8 @@ plan_file="${3:?rendered plan file}"
 	echo "no rendered plan at $plan_file; nothing to post."
 	exit 0
 }
+# Colour codes would hide the summary line and litter the comment.
+python3 -c 'import re, sys; p = sys.argv[1]; t = open(p).read(); open(p, "w").write(re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", t))' "$plan_file"
 
 # GitLab rejects very large notes, and nobody reads 4000 lines of plan anyway.
 max_lines="${PLAN_COMMENT_MAX_LINES:-300}"

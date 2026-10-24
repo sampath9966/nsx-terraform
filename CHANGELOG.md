@@ -13,6 +13,76 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.6.0
+
+A stress test of the whole path, with the real NSX provider against a manager that accepts writes, found gaps that only show once a change is applied. This release closes them.
+
+**Before you upgrade:**
+- **If GitLab was set up by `gitlab-setup.sh` or `gitlab-up.sh` without `CI_API_TOKEN`,** that variable holds the token setup ran with (a Maintainer's, Owner's or the instance root's), unprotected, so any merge request pipeline can read it, and through it every CI/CD variable, the write credential included. Run `scripts/gitlab-setup.sh` again: it now replaces it with a project access token of role Reporter, which can comment and nothing more. Then **revoke the old token**, and treat what it could reach as exposed.
+- **`make validate` is stricter** (below). Run it on your tree before merging the update; each error names the file and what to change.
+- **The first change after upgrading should not delete or rename a group or service.** The fix for those (below) is recorded in Terraform's state by the first apply of each stack on this release. Apply anything else first, or split the rename into two changes: one that moves the rules, then one that deletes the old group.
+
+**A renamed or retired group or service no longer leaves the apply stuck.** NSX refuses to delete a group or service that a rule still uses, and Terraform deleted the old one before moving the rules off it: the apply failed half-way, and every retry failed the same way. Groups and services are now created before they are destroyed, so the rules move first and the old object goes last.
+
+**Approval mode applied nothing.** Terraform colours its output even into a pipe, so the saved plan text began `ESC[1mPlan:`, change control never found a `Plan:` line, and every change was reported as "Nothing to approve" while the pipeline passed. `tf.sh show` now renders without colour when its output is not a terminal; change control and the plan comment strip colour codes too; and a plan whose summary cannot be read now counts as a change, shown to the approvers, rather than as nothing.
+
+**An older pipeline can no longer undo a newer one.** In a pipeline, `tf.sh apply` with the write credential refuses any commit but the newest on the default branch, and says to apply the newest pipeline's plan, which holds the older change too. Before, an older manual apply (or a sweep of an older change request) could put back what a newer commit reverted. Apply jobs are also serialised per manager and stack (`resource_group`). In approval mode, a newer commit that leaves nothing to apply (a revert) now supersedes the change requests still waiting.
+
+**Change control:**
+- Standby approvals are read from `inventory/delegations.yaml` as it was at the last applied change, never from the change being approved, which could otherwise hand itself the approvals it needs.
+- The gate reviews the pipeline's own commit, not the one written in the change request, which anyone who can edit issues can change.
+- The approve job notices when it cannot read the managers, instead of recording "applied" with nothing applied.
+
+**Rules added in the UI inside a managed policy are found.** Terraform only knows the rules in `data/`, so such a rule (an allow-any at sequence 1, say) appeared in no plan, the drift check reported "no drift", and no apply removed it. The `drift` job now also reads each policy the repository manages and raises every rule in it that `data/` does not hold, with who added it and when; `make drift` prints them and exits 2. The issue says plainly that no apply removes such a rule. Rules handed back on purpose are not reported.
+
+**`make validate` refuses more of what would fail, or widen a rule, later:**
+- A key written twice in one file. YAML keeps the last and drops the first silently, so a rule pasted twice could replace the reviewed one.
+- `scope: [ANY]` written by hand, on a policy or a rule: it is no Apply To, and pushes the rule to every hypervisor. Adopted from NSX, it is a warning.
+- `ANY` next to a group or service (`[ANY, web]`), which means only `web`.
+- `rule_management: inline`: no stack deploys it, so such a policy passed review and never reached NSX.
+- Two policies of one name sharing a site, where their site lists differ.
+- An unquoted value with `: ` in it, which Terraform cannot parse. CI's parser accepted it, and the stack then read that groups file as empty.
+
+The stacks now fail the plan on a groups file Terraform cannot parse, instead of reading no groups from it.
+
+**`add-rule.py` places a new rule before a catch-all deny** (DROP or REJECT from ANY on ANY) that ends the policy, not after it, where it could never match.
+
+**`tag-vm.py`** wrote `ports:` once per port, so a VM with two ports kept only the last, and the others lost their tags on apply.
+
+**Adoption takes only what it can copy exactly.** These now stay in the UI, with the reason:
+- A tag condition with a scope operator. Neither the provider nor the modules carry it, so the first apply touching the group changed who is in it.
+- Conditions joined by OR in one criterion, and criteria joined by both AND and OR.
+- Objects a principal identity (NCP, Tanzu, a load balancer) made and protects.
+- Rules NSX owns, and policies with a time window or a connectivity strategy.
+
+The default section is recognised by `is_default` too, so it is never adopted, whoever NSX says made it.
+
+**Drift issues no longer lose rows.** An issue lists at most 300 changes. The rest were marked as reported anyway, so they were never shown. They are now raised by the next run.
+
+**Tests:**
+- New `tests/apply-provider.sh`, with the real provider against `tests/mock_nsx_rw.py`, a mock manager that accepts writes and refuses to delete a group or service in use, as NSX does. It covers:
+  - a new estate;
+  - a rule inserted before a catch-all deny;
+  - group and service renames, in the order NSX needs;
+  - a UI edit put back;
+  - a UI-added rule found by the drift check;
+  - an interrupted apply leaving state and NSX agreeing and finishing on the next run;
+  - transient 503s retried;
+  - plan text without colour.
+
+  Against 1.5.0 it fails 17 of its checks. `tests/run.sh --provider` runs it, and CI now runs the provider tests on every push.
+- `tests/brownfield.sh`:
+  - the stricter validator;
+  - `tag-vm.py` with two ports;
+  - each object adoption now refuses;
+  - the unmanaged-rule check;
+  - `tf.sh` refusing an older pipeline's apply, and an unreadable branch head.
+- `tests/change-control.sh`:
+  - a standby approval added in the change itself;
+  - a gate bound to its pipeline's commit;
+  - a revert superseding older change requests.
+- `tests/ci-scripts.sh`: `gitlab-setup.sh` never storing its own token, against a stand-in API (`tests/fake_gitlab_setup.py`).
+
 ## 1.5.0
 
 **Drift is raised as a GitLab issue, to investigate.** During the observation period, every sync that finds the manager changed in the UI raises an issue labelled `nsx-drift` and `site:<site>`: each object added, changed or deleted, what changed in it, who last changed it and when (from NSX), and a checklist (who and why, keep or revert, should it have been a merge request). A change is raised once, not on every sync. The first copy is the baseline, and objects nobody touched since the last copy (taken over by a newer importer) are not raised. After cutover the new `drift` job (schedule with `DRIFT_SITE`) does the same for managed managers from a refresh-only plan. `scripts/drift.sh` now plans through `tf.sh drift`, so the plan has the manager's variables, state and trust; before, it ran Terraform without them.

@@ -2,7 +2,7 @@
 # Run the generator's tests.
 #
 #   tests/run.sh            offline tests: no Docker, no network, ~1 minute
-#   tests/run.sh --provider also adopt into a mock NSX with the real nsxt provider (a few minutes)
+#   tests/run.sh --provider also adopt into, and apply to, a mock NSX with the real nsxt provider (a few minutes)
 #   tests/run.sh --e2e      also boot a real GitLab in Docker (15-25 minutes)
 #
 # Run it before every merge. The offline set is what CI runs on every push; the
@@ -55,6 +55,8 @@ tests/change-control.sh || rc=1
 if [ "${1:-}" = "--provider" ]; then
 	echo "== brownfield adoption with the real NSX provider (needs Terraform and registry access)"
 	tests/brownfield-provider.sh || rc=1
+	echo "== applies with the real NSX provider: renames, UI changes, interruptions, transient errors"
+	tests/apply-provider.sh || rc=1
 fi
 
 if [ "${1:-}" = "--e2e" ]; then
