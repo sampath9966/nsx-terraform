@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 
 ROOT="$PWD"
 FORCE=0
@@ -8817,20 +8817,32 @@ project="${CI_PROJECT_ID:?CI_PROJECT_ID is not set}"
 target="${CI_DEFAULT_BRANCH:-main}"
 base="$(git rev-parse HEAD)"
 
-# Managers, with their mode, from the inventory.
+# Managers, their mode, and where the mode came from (the CI/CD variable, the
+# inventory, or neither: the default).
 inventory="$(python3 - <<'PY'
-import sys
+import os, re, sys
 sys.path.insert(0, "scripts")
 from ci_matrix_lib import managers, mode_of
 for name, m in sorted(managers().items()):
     if m.get("enabled") is not False:
-        print(name, mode_of(name, m))
+        variable = "NSX_MODE_" + re.sub(r"[^A-Z0-9]", "_", name.upper())
+        source = variable if os.environ.get(variable, "").strip() else ("inventory" if m.get("mode") else f"default:{variable}")
+        print(name, mode_of(name, m), source)
 PY
 )" || die "cannot read the managers' modes (above)"
 mode_of() { awk -v s="$1" '$1 == s { print $2 }' <<<"$inventory"; }
 if [ "$MIRROR_SITE" = all ]; then
 	sites="$(awk '$2 == "mirror" { print $1 }' <<<"$inventory")"
-	[ -n "$sites" ] || die "no manager in inventory/managers.yaml has mode: mirror"
+	if [ -z "$sites" ]; then
+		echo "error: no manager is in mirror mode. What this job sees:" >&2
+		while read -r name mode source; do
+			case "$source" in
+			default:*) echo "  $name: $mode (${source#default:} is not set in this job, and the inventory gives no mode)" >&2 ;;
+			*) echo "  $name: $mode (from $source)" >&2 ;;
+			esac
+		done <<<"$inventory"
+		die "set the CI/CD variable NSX_MODE_<SITE> = mirror for each manager to copy (environment scope All, value exactly 'mirror'), or mode: mirror in inventory/managers.yaml"
+	fi
 else
 	sites="$MIRROR_SITE"
 fi

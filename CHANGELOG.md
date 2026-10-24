@@ -13,6 +13,10 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.4.1
+
+**The mirror job says why no manager is in mirror mode.** With `MIRROR_SITE=all` and none found, it failed with only "no manager in inventory/managers.yaml has mode: mirror", which pointed at the inventory even when the setting was meant to come from the CI/CD variables. It now lists every manager with the mode it saw and where that came from (`NSX_MODE_<SITE>`, the inventory, or neither), names the variable it looked for, and says what to set: value exactly `mirror`, environment scope *All*, since the job has no environment and never sees a variable scoped to one.
+
 ## 1.4.0
 
 **Change control: two approvals, enforced by the pipeline, and a change log.** GitLab Community Edition has no enforced approval rules or deployment approvals, so `NSX_APPLY_MODE=approval` enforces them in the pipeline (`scripts/change-control.py`, `scripts/approve-apply.sh`; `docs/GITOPS.md`, "Change control"):

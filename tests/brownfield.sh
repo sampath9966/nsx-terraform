@@ -318,6 +318,8 @@ check "a manager in mode: managed is refused, and the job fails" bash -c '[ "$2"
 out="$(mirror MIRROR_SITE=all)"
 check "MIRROR_SITE=all takes every manager in mode: mirror, and only those" bash -c 'grep -q "=== lon1" <<<"$1" && ! grep -q "=== nyc1" <<<"$1" && ! grep -q "=== gm1" <<<"$1"' _ "$out"
 check "without MIRROR_SITE it refuses" grep -q "MIRROR_SITE is not set" <<<"$(mirror MIRROR_SITE=)"
+out="$(mirror MIRROR_SITE=all NSX_MODE_LON1=managed)"
+check "MIRROR_SITE=all with no mirror manager says what it saw for each, and which variable to set" bash -c 'grep -q "lon1: managed (from NSX_MODE_LON1)" <<<"$1" && grep -q "nyc1: managed (NSX_MODE_NYC1 is not set in this job, and the inventory gives no mode)" <<<"$1" && grep -q "environment scope All" <<<"$1"' _ "$out"
 writes="$(grep WRITE "$SCRATCH/req.log" | grep -vc "/api/session/create" || true)"
 check "mirroring only reads NSX" test "$writes" -eq 0
 kill "$gl" 2>/dev/null
