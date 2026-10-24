@@ -272,8 +272,9 @@ check "a policy deleted in the UI: nothing to do in NSX" grep -q "0 import, 0 cr
 observe >/dev/null
 check "...and it is gone from state" bash -c '! grep -q "new-app" <<<"$1" && grep -q "legacy-app" <<<"$1"' _ "$(in_state)"
 
-out="$(NSX_MODE_LON1=managed tf plan local-security lon1)"
-check "cutover (NSX_MODE_LON1=managed, or mode: managed): Terraform already holds it all" grep -q "No changes" <<<"$out"
+sed -i 's/^    mode: mirror$/    mode: managed/' inventory/managers.yaml
+out="$(tf plan local-security lon1)"
+check "cutover (mode: managed): Terraform already holds it all" grep -q "No changes" <<<"$out"
 cp "$SCRATCH/ui.orig" "$UI"
 cd "$T" || exit 1
 

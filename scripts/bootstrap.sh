@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 
 ROOT="$PWD"
 FORCE=0
@@ -1376,13 +1376,10 @@ state follows it. Nothing is applied to NSX for that manager until you switch
 it to managed. The other managers carry on as normal: their merge requests are
 planned, merged and applied as usual.
 
-**Turn it on, per manager.** Either way works; the variable wins:
-
-- the CI/CD variable `NSX_MODE_<SITE>` = `mirror` (*Settings → CI/CD →
-  Variables*; `hyd-gm01` is `NSX_MODE_HYD_GM01`): no commit, takes effect at the
-  next pipeline;
-- or `mode: mirror` for the manager in `inventory/managers.yaml`, in a merge
-  request.
+**Turn it on, per manager**, with `mode: mirror` for that manager in
+`inventory/managers.yaml`, in a merge request: entering and leaving mirror mode
+is a reviewed change like any other. (There is no CI/CD variable for it; one
+named `NSX_MODE_...` stops the pipeline and says so.)
 
 From then on, for that manager:
 
@@ -1454,9 +1451,9 @@ state, so its plan shows a destroy and is refused every time: hand it back
 1. Agree a short freeze on UI changes for that manager.
 2. Run the sync (*Run pipeline*, `MIRROR_SITE` = the manager), merge its merge
    request, and let `sync-state` finish. The plan must report no changes.
-3. Set the manager to managed: `NSX_MODE_<SITE>` = `managed` (or delete the
-   variable and set `mode: managed` in the inventory, in a merge request). State
-   already holds everything, so there is nothing to apply.
+3. In a merge request, change the manager's `mode: mirror` to `mode: managed`
+   (or remove the line). State already holds everything, so there is nothing
+   to apply.
 4. In a merge request, delete `stacks/<stack>/import-<site>-mirror.tf`. The data
    files stay; they are now the source of truth. Their first line may stay or
    go: the mirror job refuses managers in managed mode.
@@ -2704,7 +2701,7 @@ write_file data/schema/managers.schema.json <<'SCAFFOLD_EOF'
           "enabled": { "type": "boolean" },
           "mode": {
             "enum": ["managed", "mirror"],
-            "description": "managed (the default): the pipeline plans and applies. mirror: scripts/mirror.sh keeps data/ a copy of the manager, and only its state is updated (imports and refreshes, read-only); nothing is applied to NSX. The CI/CD variable NSX_MODE_<SITE> overrides this. docs/IMPORT.md."
+            "description": "managed (the default): the pipeline plans and applies. mirror: scripts/mirror.sh keeps data/ a copy of the manager, and only its state is updated (imports and refreshes, read-only); nothing is applied to NSX. docs/IMPORT.md."
           },
           "stacks": {
             "type": "array",
@@ -5033,7 +5030,13 @@ plan_file="$stack_dir/tfplan"
 }
 
 # Site and domain come from the inventory, so a manager is added by editing data.
-eval "$(python3 "$REPO_ROOT/scripts/ci-matrix.py" --export "$site")"
+# Captured first: a failure inside eval "$(...)" would go unnoticed, and this
+# carries the manager's mode, which decides whether anything may be applied.
+exports="$(python3 "$REPO_ROOT/scripts/ci-matrix.py" --export "$site")" || {
+	echo "error: cannot read manager '$site' from inventory/managers.yaml (above)" >&2
+	exit 1
+}
+eval "$exports"
 
 export TF_VAR_site="$site"
 export TF_VAR_domain="${TF_VAR_domain:-${NSX_DOMAIN:-default}}"
@@ -5309,8 +5312,17 @@ done
 
 command -v curl >/dev/null 2>&1 || die "curl is required"
 
+# Every NSX_* variable read here is upper-case, and names are case-sensitive:
+# NSX_CA_FILE_hyd_gm01 would be silently ignored. Say so instead.
+misnamed=""
+while read -r v; do
+	case "$v" in [Nn][Ss][Xx]_*) [ "$v" = "${v^^}" ] || misnamed="$misnamed $v->${v^^}" ;; esac
+done < <(compgen -e)
+[ -z "$misnamed" ] || die "CI/CD variable names are case-sensitive, so these are never read; rename them:$(printf '\n  %s' $misnamed)"
+
 # Inventory lookup: host and vault path for this site. Never the secret.
-eval "$(python3 "$REPO_ROOT/scripts/ci-matrix.py" --export "$SITE")"
+exports="$(python3 "$REPO_ROOT/scripts/ci-matrix.py" --export "$SITE")" || die "cannot read manager '$SITE' from inventory/managers.yaml (above)"
+eval "$exports"
 [ -n "${NSX_HOST:-}" ] || die "site '$SITE' is not in inventory/managers.yaml"
 
 export NSXT_MANAGER_HOST="$NSX_HOST"
@@ -5349,6 +5361,13 @@ fi
 
 # Keep the session alive across requests — materially faster on large plans.
 export NSXT_SESSION_AUTH="${NSXT_SESSION_AUTH:-true}"
+
+# A deliberate choice, but never a silent one: every job that uses it says so.
+case "${NSXT_ALLOW_UNVERIFIED_SSL:-}" in
+true | TRUE | True | 1 | yes)
+	echo "warning: TLS verification of $NSX_HOST is OFF (NSXT_ALLOW_UNVERIFIED_SSL): the manager's identity is not checked, and whoever answers at that address receives the credentials." >&2
+	;;
+esac
 
 json_get() { python3 -c 'import json,sys; d=json.load(sys.stdin)
 for k in sys.argv[1:]:
@@ -5489,15 +5508,11 @@ MODES = ("managed", "mirror")
 
 
 def mode_of(name: str, manager: dict) -> str:
-    """managed or mirror. The CI/CD variable NSX_MODE_<SITE> (hyd-gm01 is
-    NSX_MODE_HYD_GM01) wins over the inventory's mode, so one manager can be put
-    into, or taken out of, mirror mode without a commit."""
-    variable = "NSX_MODE_" + re.sub(r"[^A-Z0-9]", "_", name.upper())
-    override = os.environ.get(variable, "").strip()
-    mode = override or manager.get("mode", "managed")
+    """managed or mirror, from the manager's mode in inventory/managers.yaml
+    only: changing it is a reviewed merge request, like any other change."""
+    mode = manager.get("mode", "managed")
     if mode not in MODES:
-        source = variable if override else "inventory/managers.yaml"
-        sys.exit(f"error: {name}: mode {mode!r} from {source} must be one of: {', '.join(MODES)}")
+        sys.exit(f"error: {name}: mode {mode!r} in inventory/managers.yaml must be one of: {', '.join(MODES)}")
     return mode
 
 # A Global Manager has no VM inventory and no local networking, so local-tags,
@@ -5506,7 +5521,25 @@ GM_STACKS = ["global-security"]
 LM_STACKS = ["local-security", "local-tags", "local-network", "platform"]
 
 
+def misnamed_variables() -> list[tuple[str, str]]:
+    """NSX_* variables set with lower-case letters, and the name they should
+    have. Variable names are case-sensitive and every one these scripts read
+    is upper-case, so NSX_CA_FILE_hyd_gm01 is simply never seen."""
+    return sorted((k, k.upper()) for k in os.environ if k[:4].upper() == "NSX_" and k != k.upper())
+
+
 def managers(strict: bool = True) -> dict:
+    # A manager's mode once had a CI/CD variable too (1.3.0). It is read from
+    # the inventory only now; a leftover variable must not look like it works.
+    stale = sorted(k for k in os.environ if k.upper().startswith("NSX_MODE_"))
+    if stale:
+        sys.exit("error: a manager's mode comes from inventory/managers.yaml only (mode: mirror), not from "
+                 "CI/CD variables. Delete these variables and set the mode there, in a merge request:\n"
+                 + "\n".join(f"  {k}" for k in stale))
+    wrong = misnamed_variables()
+    if wrong:
+        sys.exit("error: these CI/CD variables are never read, because names are case-sensitive:\n"
+                 + "\n".join(f"  {k}  ->  rename it to {u}" for k, u in wrong))
     if not INVENTORY.exists():
         if strict:
             sys.exit(f"error: {INVENTORY} does not exist")
@@ -7993,7 +8026,13 @@ def main() -> int:
                 "error: no credentials in the environment. Wrap the call:\n"
                 f"       scripts/with-credentials.sh {args.site} -- scripts/import-estate.py --site {args.site}"
             )
-        estate = fetch_estate(host, user, password, base, domain, args.insecure)
+        # The flag the NSX provider reads, so the capture and the plan agree:
+        # where verification is switched off for Terraform, it is off here too.
+        insecure = args.insecure or os.environ.get("NSXT_ALLOW_UNVERIFIED_SSL", "").strip().lower() in ("true", "1", "yes")
+        if insecure:
+            print(f"warning: TLS verification of {host} is OFF (NSXT_ALLOW_UNVERIFIED_SSL or --insecure): "
+                  "whoever answers at that address receives the credentials.", file=sys.stderr)
+        estate = fetch_estate(host, user, password, base, domain, insecure)
 
     if args.dump_only:
         out = Path(args.dump_only)
@@ -8830,7 +8869,13 @@ PY
 mode_of() { awk -v s="$1" '$1 == s { print $2 }' <<<"$inventory"; }
 if [ "$MIRROR_SITE" = all ]; then
 	sites="$(awk '$2 == "mirror" { print $1 }' <<<"$inventory")"
-	[ -n "$sites" ] || die "no manager in inventory/managers.yaml has mode: mirror"
+	if [ -z "$sites" ]; then
+		echo "error: no manager in inventory/managers.yaml has mode: mirror. On the branch this ran on:" >&2
+		while read -r name mode; do
+			echo "  $name: $mode" >&2
+		done <<<"$inventory"
+		die "add 'mode: mirror' to each manager to copy, in inventory/managers.yaml, through a merge request"
+	fi
 else
 	sites="$MIRROR_SITE"
 fi
@@ -11881,8 +11926,7 @@ On a merge request it emits plan jobs only. On the default branch it emits plan
 jobs plus a MANUAL apply job per manager, each applying the plan artifact its
 own plan job produced — never a fresh one.
 
-A manager in mirror mode (inventory mode, or the CI/CD variable NSX_MODE_<SITE>)
-gets no apply job. On the default branch it gets an automatic sync-state job
+A manager in mirror mode (mode: mirror in the inventory) gets no apply job. On the default branch it gets an automatic sync-state job
 instead, which applies its plan only if that plan just imports and refreshes,
 with the read-only credential. Its plans do not hold up other managers' work:
 they may fail (shown as a warning) except in its own mirror merge request.

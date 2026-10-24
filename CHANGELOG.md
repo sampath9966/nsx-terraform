@@ -13,6 +13,22 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.4.1
+
+**A manager's mode comes from `inventory/managers.yaml` only.** The CI/CD variable `NSX_MODE_<SITE>` added in 1.3.0 is gone. Entering and leaving mirror mode is now always a reviewed merge request, and the mode can no longer differ between a merge request's pipeline and the default branch's, as it could with a protected variable. A leftover `NSX_MODE_*` variable stops the pipeline, `tf.sh`, the mirror job and change control, and says to set `mode:` in the inventory instead, so it never looks as if it works.
+
+**With `MIRROR_SITE=all` and no manager in mirror mode,** the mirror job lists every manager with its mode and says to add `mode: mirror` in the inventory.
+
+**A CI/CD variable named in the wrong case stops the job and says so.** Variable names are case-sensitive and every `NSX_*` variable these scripts read is upper-case, so `NSX_CA_FILE_hyd_gm01` was silently ignored and the manager's CA never trusted. The inventory reader and `with-credentials.sh` now stop with the variable's name and the name to rename it to.
+
+**`NSXT_ALLOW_UNVERIFIED_SSL` reaches the capture too, and is never silent.** The flag switches off TLS verification in the NSX provider. The importer, used by the mirror and adopt jobs, ignored it, so a manager without a trusted certificate could be planned but not read. It now honours the flag. Every job that talks to NSX prints a warning while it is set: the manager's identity is not checked, and whoever answers receives the credentials.
+
+**Fixed:** `tf.sh` and `with-credentials.sh` read the manager through `eval "$(...)"`, and a failure inside it went unnoticed (`set -e` does not see it), leaving the manager's mode unset. Both now stop if the inventory cannot be read, so an error there can never let a mirror-mode manager be applied.
+
+**Tests:**
+- `tests/brownfield.sh`: a leftover `NSX_MODE_` variable stops the mirror job and `tf.sh` (nothing applied); an unknown mode in the inventory is an error; the mirror job's message; a capture with the flag and no CA succeeds with the warning.
+- `tests/ci-scripts.sh`: a mode variable stops the child pipeline; a wrong-case CA variable stops the pipeline and `with-credentials.sh`; the warning is printed while verification is off.
+
 ## 1.4.0
 
 **Change control: two approvals, enforced by the pipeline, and a change log.** GitLab Community Edition has no enforced approval rules or deployment approvals, so `NSX_APPLY_MODE=approval` enforces them in the pipeline (`scripts/change-control.py`, `scripts/approve-apply.sh`; `docs/GITOPS.md`, "Change control"):
