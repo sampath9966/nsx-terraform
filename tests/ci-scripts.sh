@@ -479,6 +479,73 @@ PY
 check "drift-job.sh without DRIFT_SITE says what to set" bash -c 'cd "$1" && ! out="$(scripts/drift-job.sh 2>&1)" && grep -q "DRIFT_SITE is not set" <<<"$out"' _ "$T"
 check "cutover.sh without CUTOVER_SITE says what to set" bash -c 'cd "$1" && ! out="$(scripts/cutover.sh 2>&1)" && grep -q "CUTOVER_SITE is not set" <<<"$out"' _ "$T"
 
+# GitLab state (http backend): one state per stack per manager.
+H="$SCRATCH/httptree"
+generate "$H" --backend http
+cat >"$H/inventory/managers.yaml" <<'INV'
+managers:
+  hyd-np01:
+    role: lm
+    host: lm.example.net
+    site: hyd-np01
+    vcf_instance: v.example.net
+    vault_path: secret/nsx/hyd-np01
+    tier: nonprod
+  lab-platform:
+    role: lm
+    host: lab.example.net
+    site: lab-platform
+    vcf_instance: v.example.net
+    vault_path: secret/nsx/lab
+    tier: lab
+INV
+sp=$((20000 + RANDOM % 20000))
+mkdir -p "$SCRATCH/states"
+python3 - "$sp" "$SCRATCH/states" <<'PY' &
+import http.server, os, sys
+port, root = int(sys.argv[1]), sys.argv[2]
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        f = os.path.join(root, self.path.rsplit("/", 1)[-1])
+        if not os.path.exists(f):
+            # Some GitLab versions answer a missing state with an empty 204.
+            self.send_response(204 if "local-network" in f else 404); self.end_headers(); return
+        data = open(f, "rb").read()
+        self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+PY
+statesrv=$!
+sleep 1
+cat >"$SCRATCH/faketf/terraform" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@" | grep -- '-backend-config=' >>"$TF_ARGS_LOG"
+exit 0
+STUB
+chmod +x "$SCRATCH/faketf/terraform"
+tfinit() { : >"$SCRATCH/tfargs"; (cd "$H" && env -u SSL_CERT_FILE TF_ARGS_LOG="$SCRATCH/tfargs" PATH="$SCRATCH/faketf:$PATH" scripts/tf.sh init "$1" "$2" 2>&1); }
+base="http://127.0.0.1:$sp/api/v4/projects/2/terraform/state"
+printf 'address = "%s/hyd-np01-local-security"\nlock_address = "%s/hyd-np01-local-security/lock"\n' "$base" "$base" >"$H/envs/hyd-np01.backend.hcl"
+tfinit local-network hyd-np01 >/dev/null
+check "each stack of a manager gets its own GitLab state" grep -qx -- "-backend-config=address=$base/hyd-np01-local-network" "$SCRATCH/tfargs"
+check "...with its own lock" grep -qx -- "-backend-config=lock_address=$base/hyd-np01-local-network/lock" "$SCRATCH/tfargs"
+tfinit local-security hyd-np01 >/dev/null
+check "a state named after one stack stays that stack's own" grep -qx -- "-backend-config=address=$base/hyd-np01-local-security" "$SCRATCH/tfargs"
+printf 'address = "%s/lab-platform"\n' "$base" >"$H/envs/lab-platform.backend.hcl"
+tfinit platform lab-platform >/dev/null
+check "a site whose name ends like a stack is not mistaken for one" grep -qx -- "-backend-config=address=$base/lab-platform-platform" "$SCRATCH/tfargs"
+printf 'address = "%s/hyd-np01"\n' "$base" >"$H/envs/hyd-np01.backend.hcl"
+echo '{"version":4,"resources":[]}' >"$SCRATCH/states/hyd-np01"
+check "a state once shared by every stack, but empty, is left behind: each stack starts its own" bash -c 'out="$('"$(declare -f tfinit)"'; SCRATCH="$1" H="$2" PATH="$PATH" tfinit local-security hyd-np01)"; ! grep -q "^error" <<<"$out" && grep -qx -- "-backend-config=address=$3/hyd-np01-local-security" "$1/tfargs"' _ "$SCRATCH" "$H" "$base"
+echo '{"version":4,"resources":[{"mode":"managed","type":"nsxt_policy_group"},{"mode":"data","type":"nsxt_policy_service"}]}' >"$SCRATCH/states/hyd-np01"
+out="$(tfinit local-network hyd-np01)"
+check "...one that still holds objects stops every stack, says how many and how to move them, and runs nothing" bash -c 'grep -q "holds 1 object(s)" <<<"$1" && grep -q "Nothing was planned or applied" <<<"$1" && [ ! -s "$2" ]' _ "$out" "$SCRATCH/tfargs"
+echo '{"version":4,"resources":[]}' >"$SCRATCH/states/hyd-np01-local-network"
+check "...until that stack's own state exists" bash -c 'out="$('"$(declare -f tfinit)"'; SCRATCH="$1" H="$2" PATH="$PATH" tfinit local-network hyd-np01)"; ! grep -q "^error" <<<"$out"' _ "$SCRATCH" "$H"
+kill "$statesrv" 2>/dev/null
+mchild="$(cd "$H" && sed -i 's/^    tier: nonprod$/    tier: nonprod\n    mode: mirror/' inventory/managers.yaml && CI_COMMIT_BRANCH=main CI_DEFAULT_BRANCH=main python3 scripts/gitlab-child-pipeline.py)"
+check "sync-state plans afresh in its own job, never from a plan an earlier stage made" python3 -c "import json,sys;j=json.loads(sys.argv[1]);sys.exit(0 if j['script']==['scripts/with-credentials.sh \"\$SITE\" -- scripts/sync-state.sh \"\$SITE\" \"\$STACK\"'] and j['needs'][0]['artifacts'] is False and j['resource_group'].startswith('nsx-state-') else 1)" "$(job "sync-state local-security @ hyd-np01" <<<"$mchild")"
+
 # The NSX provider in the image.
 : >"$FD/local"
 rm -f "$FD"/label.*

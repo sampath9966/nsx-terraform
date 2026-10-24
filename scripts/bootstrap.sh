@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.5.1"
+VERSION="1.5.2"
 
 ROOT="$PWD"
 FORCE=0
@@ -5352,6 +5352,59 @@ if uses_local_backend; then
 	backend_args+=(-backend-config="path=$REPO_ROOT/.local-state/${site}-${stack}.tfstate")
 fi
 
+# The same on GitLab (http backend): envs/<site>.backend.hcl names one state
+# for the manager, and each stack gets its own beside it, <site-state>-<stack>.
+# A name that already ends in a stack's name (lon1-local-security, as in the
+# example) is that stack's own, unchanged. Stacks sharing one state would each
+# see the others' objects as their own, to destroy, and make each other's saved
+# plans stale.
+STACKS_ALL="global-security local-security local-network local-tags platform"
+gitlab_state() { # GET a GitLab state: prints the body; fails when there is none
+	curl --silent --fail --max-time 30 ${SSL_CERT_FILE:+--cacert "$SSL_CERT_FILE"} \
+		${TF_HTTP_PASSWORD:+--user "${TF_HTTP_USERNAME:-gitlab-ci-token}:$TF_HTTP_PASSWORD"} "$1"
+}
+if grep -q 'backend "http"' "$stack_dir/backend.tf" 2>/dev/null; then
+	address="$(sed -n 's/^[[:space:]]*address[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$backend_file" | head -1)"
+	if [[ "$address" =~ ^(.*/terraform/state/)([^/]+)$ ]]; then
+		state_base="${BASH_REMATCH[1]}"
+		state_name="${BASH_REMATCH[2]}"
+		shared=1
+		# A state named after the site itself is the site's, even when the
+		# site's name happens to end like a stack (lab-platform).
+		[ "$state_name" = "$site" ] || for s in $STACKS_ALL; do
+			if [ "${state_name%-"$s"}" != "$state_name" ]; then
+				state_name="${state_name%-"$s"}"
+				shared=0
+			fi
+		done
+		per_stack="${state_base}${state_name}-${stack}"
+		backend_args+=(-backend-config="address=$per_stack" -backend-config="lock_address=$per_stack/lock"
+			-backend-config="unlock_address=$per_stack/lock")
+		# A state the file's name gave every stack (no stack in its name) may hold
+		# objects from before each stack had its own. Never leave them behind:
+		# untracked, the next apply would create them again over the live ones.
+		# Exists means a state document came back: GitLab answers a missing state
+		# with 404 or an empty 204, depending on the version.
+		has_state() { gitlab_state "$1" 2>/dev/null | python3 -c 'import json,sys
+try: sys.exit(0 if "version" in json.load(sys.stdin) else 1)
+except ValueError: sys.exit(1)'; }
+		if [ "$shared" = 1 ] && [ "$cmd" != show ] && ! has_state "$per_stack"; then
+			held="$(gitlab_state "$address" 2>/dev/null | python3 -c 'import json,sys
+try: print(sum(1 for r in json.load(sys.stdin).get("resources", []) if r.get("mode") == "managed"))
+except ValueError: print(0)' 2>/dev/null || echo 0)"
+			if [ "${held:-0}" -gt 0 ]; then
+				echo "error: the GitLab state '${address##*/}' (envs/${site}.backend.hcl) holds $held object(s) from the time" >&2
+				echo "       every stack of $site shared it. Each stack now has its own state, '${state_name}-<stack>'." >&2
+				echo "       Copy it to the stack whose objects these are (usually ${site}'s security stack), then retry:" >&2
+				echo "         curl -u <user>:<token> ${address} -o shared.tfstate" >&2
+				echo "         curl -u <user>:<token> -X POST -H 'Content-Type: application/json' --data @shared.tfstate ${state_base}${state_name}-<stack>" >&2
+				echo "       Nothing was planned or applied." >&2
+				exit 1
+			fi
+		fi
+	fi
+fi
+
 # Every manager has its own state, but they share the stack directory. So the
 # working directory records which manager it was initialised for, and is
 # initialised again whenever that changes. Without this, planning a second
@@ -9679,6 +9732,36 @@ fi
 SCAFFOLD_EOF
 mark_executable scripts/mirror.sh
 
+write_file scripts/sync-state.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# The 'sync-state' job of a manager in mode: mirror: bring its Terraform state
+# up to date with NSX, read-only.
+#
+#   scripts/with-credentials.sh <site> -- scripts/sync-state.sh <site> <stack>
+#
+# Plans and applies in the same job, so the plan cannot have gone stale in
+# between (another pipeline's sync, or another write to the state). The apply
+# takes the plan only if it just imports and refreshes (plan-guard --observe in
+# scripts/tf.sh), and runs with the read-only credential: nothing reaches NSX.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT" || exit 1
+site="${1:?usage: sync-state.sh <site> <stack>}"
+stack="${2:?usage: sync-state.sh <site> <stack>}"
+
+scripts/tf.sh plan "$stack" "$site"
+rc=$?
+# 2: the plan is not one a normal apply could take as it stands; the observe-
+# only guard of the apply below decides what a sync may take. Anything else is
+# a failure to plan.
+[ "$rc" -eq 0 ] || [ "$rc" -eq 2 ] || exit "$rc"
+exec scripts/tf.sh apply "$stack" "$site"
+SCAFFOLD_EOF
+mark_executable scripts/sync-state.sh
+
 write_file scripts/drift-issue.py <<'SCAFFOLD_EOF'
 #!/usr/bin/env python3
 """Raise a GitLab issue for changes made in NSX outside this repository, so
@@ -10483,8 +10566,10 @@ write_file envs/example.backend.hcl.example <<'SCAFFOLD_EOF'
 
 # --- example: http — GitLab-managed Terraform state ------------------------
 # Locking, encryption at rest and version history come from GitLab, with no
-# object store to run. One state per stack per manager, so the state NAME at the
-# end of the address must be unique per pair.
+# object store to run. One state per stack per manager: name the manager's state
+# here, and scripts/tf.sh gives each stack its own beside it, <name>-<stack>
+# (lon1-local-security, lon1-local-network, ...). A name that already ends in a
+# stack, as below, is that stack's state.
 #
 # address        = "https://gitlab.example.com/api/v4/projects/1234/terraform/state/lon1-local-security"
 # lock_address   = "https://gitlab.example.com/api/v4/projects/1234/terraform/state/lon1-local-security/lock"
@@ -13537,7 +13622,7 @@ def main() -> int:
             out.append("  stage: apply")
             out.append("  needs:")
             out.append(f'    - job: "{plan}"')
-            out.append("      artifacts: true")
+            out.append("      artifacts: false")
             out.append("  allow_failure: true")
             out.append(f"  resource_group: nsx-state-{row['site']}-{row['stack']}")
             out.append("  variables:")
@@ -13547,8 +13632,10 @@ def main() -> int:
             out.append("    NSX_CRED_SCOPE: plan")
             out.append("    APPROVE: \"yes\"")
             out.append("  script:")
-            out.append('    - test -f "stacks/$STACK/tfplan" || { echo "no saved plan, as its plan job failed; the next sync tries again" >&2; exit 1; }')
-            out.append('    - scripts/with-credentials.sh "$SITE" -- scripts/tf.sh apply "$STACK" "$SITE"')
+            # Plans afresh, in this job: it changes nothing anyone reviews, and
+            # a plan from earlier in the pipeline can be stale by the time
+            # another pipeline's sync has run (resource_group orders them).
+            out.append('    - scripts/with-credentials.sh "$SITE" -- scripts/sync-state.sh "$SITE" "$STACK"')
             out.append("")
             continue
         if APPLY_MODE == "approval":
