@@ -452,4 +452,87 @@ check "context profiles may be referenced by path" bash -c '! (cd "$1" && python
 sed -i 's#scope: \[App-All\]#scope: [/infra/domains/default/groups/App-All]#' "$SCRATCH/v/data/policies/legacy-app.yaml"
 check "any other raw path is still an error" grep -q "raw policy path" <<<"$(cd "$SCRATCH/v" && python3 scripts/validate-data.py 2>&1)"
 
+echo "federation: a Global Manager and a Local Manager, side by side"
+F="$SCRATCH/fed"
+generate "$F" --no-examples
+cd "$F" || exit 1
+mkdir -p reports
+printf 'managers:\n  gm1:\n    role: gm\n    host: gm.example.net\n    site: global\n    vcf_instance: v\n    vault_path: secret/gm1\n    tier: prod\n  lon1:\n    role: lm\n    host: lon1.example.net\n    site: lon1\n    vcf_instance: v\n    vault_path: secret/lon1\n    tier: prod\n' >inventory/managers.yaml
+python3 - <<'PY'
+import json
+GD = "/global-infra/domains/default"; LD = "/infra/domains/default"
+cond = lambda v: [{"resource_type": "Condition", "key": "Tag", "member_type": "VirtualMachine", "operator": "EQUALS", "value": v}]
+def grp(base, i, expr): return {"id": i, "path": f"{base}/groups/{i}", "display_name": i, "expression": expr}
+def rule(base, p, i, src, dst, svc, seq):
+    return {"id": i, "path": f"{base}/security-policies/{p}/rules/{i}", "display_name": i, "sequence_number": seq, "action": "ALLOW",
+            "direction": "IN_OUT", "ip_protocol": "IPV4_IPV6", "logged": True, "source_groups": src, "destination_groups": dst,
+            "services": svc, "scope": ["ANY"], "profiles": ["ANY"]}
+def pol(base, i, rules, scope): return {"id": i, "path": f"{base}/security-policies/{i}", "display_name": i, "category": "Application",
+                                        "sequence_number": 10, "stateful": True, "scope": scope, "rules": rules}
+https_g = {"id": "HTTPS", "path": "/global-infra/services/HTTPS", "display_name": "HTTPS", "_system_owned": True, "service_entries": []}
+gsvc = {"id": "G-Svc", "path": "/global-infra/services/G-Svc", "display_name": "G-Svc",
+        "service_entries": [{"resource_type": "L4PortSetServiceEntry", "display_name": "t9443", "l4_protocol": "TCP", "destination_ports": ["9443"]}]}
+gm = {"domain": "default",
+      "groups": [grp(GD, "G-Web", cond("tier|web")), grp(GD, "Shared", cond("app|shared-gm"))],
+      "services": [https_g, gsvc],
+      "policies": [pol(GD, "g-pol", [rule(GD, "g-pol", "g1", [f"{GD}/groups/G-Web"], [f"{GD}/groups/Shared"], ["/global-infra/services/HTTPS"], 100)], [f"{GD}/groups/G-Web"])]}
+json.dump(gm, open("reports/gm1.json", "w"))
+lm = {"domain": "default",
+      "groups": [grp(LD, "L-App", cond("app|l")), grp(LD, "Shared", cond("app|shared-lm")),
+                 grp(LD, "Nest-G", [{"resource_type": "PathExpression", "paths": [f"{GD}/groups/G-Web"]}]),
+                 grp(GD, "G-Web", cond("tier|web"))],            # a global object, listed by the LM
+      "services": [{"id": "HTTPS", "path": "/infra/services/HTTPS", "display_name": "HTTPS", "_system_owned": True, "service_entries": []}],
+      "policies": [pol(LD, "l-pol", [
+          rule(LD, "l-pol", "r1", [f"{GD}/groups/G-Web"], [f"{LD}/groups/L-App"], ["/global-infra/services/G-Svc", "/infra/services/HTTPS"], 100),
+          rule(LD, "l-pol", "r2", [f"{LD}/groups/Shared"], [f"{LD}/groups/L-App"], ["ANY"], 200),
+          rule(LD, "l-pol", "r3", [f"{GD}/groups/Unknown-G"], [f"{LD}/groups/L-App"], ["ANY"], 300),
+      ], [f"{LD}/groups/L-App"])]}
+json.dump(lm, open("reports/lon1.json", "w"))
+PY
+mir() { python3 scripts/import-estate.py --site "$1" --from-dump "reports/$1.json" --mirror 2>&1; }
+ids_twice() { python3 - <<'PY'
+import sys, yaml, glob, collections
+seen = collections.Counter()
+for f in glob.glob("data/groups/*.yaml"): seen.update((yaml.safe_load(open(f)) or {}).get("groups", {}).keys())
+for f in glob.glob("data/services/*.yaml"): seen.update((yaml.safe_load(open(f)) or {}).get("custom", {}).keys())
+dup = [k for k, n in seen.items() if n > 1]
+print(" ".join(dup)); sys.exit(1 if dup else 0)
+PY
+}
+out_gm="$(mir gm1)"
+out="$(mir lon1)"
+LG="$(cat data/groups/imported-lon1-mirror.yaml)"
+LP="$(cat data/policies/l-pol.yaml)"
+check "the GM's objects are the GM's: owner gm, read from the global tree" bash -c 'grep -q "owner: gm" data/groups/imported-gm1-mirror.yaml && grep -q "^  G-Web:" data/groups/imported-gm1-mirror.yaml'
+check "...all of them taken, nothing left out" bash -c '! grep -q "NOT ADOPTED" <<<"$1" && grep -q "2 group(s), 1 policy/policies, 1 rule(s), 1 custom service(s)" <<<"$1"' _ "$out_gm"
+check "a global object an LM lists is not adopted from the LM" bash -c '! grep -q "^  G-Web:" <<<"$1" && grep -q "G-Web: belongs to the Global Manager" <<<"$2"' _ "$LG" "$out"
+check "no group or service id is declared twice" ids_twice
+check "an LM rule using a global group and service names them; the LM stack resolves them" bash -c 'python3 -c "import yaml,sys;r=yaml.safe_load(sys.stdin)[\"rules\"][\"r1\"];sys.exit(0 if r[\"source_groups\"]==[\"G-Web\"] and r[\"services\"]==[\"G-Svc\",\"HTTPS\"] else 1)" <<<"$1"' _ "$LP"
+check "an LM group with the id of a GM group is not adopted, and says why" bash -c '! grep -q "^  Shared:" <<<"$1" && grep -q "group Shared: its id is also the Global Manager.s group" <<<"$2"' _ "$LG" "$out"
+check "...nor the rule using it, which would bind to the GM's group" bash -c 'grep -q "rule l-pol/r2: uses Shared" <<<"$1" && ! grep -q "^  r2:" <<<"$2"' _ "$out" "$LP"
+check "an LM group nesting a global group is not adopted" grep -q "group Nest-G: nests the global group G-Web" <<<"$out"
+check "a rule using a global group data/ does not declare stays in the UI, and says why" bash -c 'grep -q "rule l-pol/r3: uses Unknown-G (uses the global group Unknown-G, which data/ does not declare" <<<"$1" && ! grep -q "^  r3:" <<<"$2"' _ "$out" "$LP"
+check "a rule and a policy applied to ANY are written as ANY, not as a missing Apply To" bash -c 'python3 -c "import yaml,sys;d=yaml.safe_load(open(\"data/policies/g-pol.yaml\"));sys.exit(0 if d[\"rules\"][\"g1\"][\"scope\"]==[\"ANY\"] else 1)"' 
+check "no raw policy path is written anywhere" bash -c '! grep -rn "/global-infra/\|\"/infra/\| /infra/" data/groups data/policies data/services'
+check "the copy validates, HTTPS named by both managers included" python3 scripts/validate-data.py
+check "the LM stack resolves GM-owned names to their global paths, and never manages them" bash -c 'grep -q "global_group_paths" stacks/local-security/main.tf && grep -q "/global-infra/domains/\${try(g.domain, \"default\")}/groups/\${k}" stacks/local-security/main.tf && grep -q "if try(g.owner, \"lm\") == \"lm\"" stacks/local-security/main.tf'
+before="$(cat data/groups/*.yaml data/services/*.yaml data/policies/*.yaml stacks/*/import-*.tf | sha256sum)"
+mir gm1 >/dev/null; mir lon1 >/dev/null
+check "syncing both again changes nothing" test "$(cat data/groups/*.yaml data/services/*.yaml data/policies/*.yaml stacks/*/import-*.tf | sha256sum)" = "$before"
+
+# The other order: the Local Manager first.
+rm -rf data/groups data/services data/policies data/.import-manifest.json stacks/*/import-*.tf
+mkdir -p data/groups data/services data/policies
+out="$(mir lon1)"
+check "LM first: its rule using the not-yet-copied global group waits in the UI" grep -q "rule l-pol/r1: uses G-Web (uses the global group G-Web, which data/ does not declare" <<<"$out"
+out="$(mir gm1)"
+check "...the GM then leaves its Shared to the LM that claimed the id, and says so" grep -q "group Shared: its id is also another manager.s group" <<<"$out"
+check "...and a policy left with no adoptable rule stays whole in the UI" bash -c 'grep -q "policy g-pol: none of its 1 rule(s) can be adopted" <<<"$1" && ! test -f data/policies/g-pol.yaml' _ "$out"
+mir lon1 >/dev/null
+check "...and the next LM sync takes the rule: both orders converge" bash -c 'python3 -c "import yaml,sys;sys.exit(0 if \"r1\" in yaml.safe_load(open(\"data/policies/l-pol.yaml\"))[\"rules\"] else 1)"'
+check "...still with no id declared twice" ids_twice
+check "...and valid" python3 scripts/validate-data.py
+check "GM domain: global objects are read from domain default unless the inventory says otherwise" bash -c 'grep -q "or \"default\"$" scripts/import-estate.py'
+cd "$T" || exit 1
+
 finish brownfield

@@ -1426,8 +1426,25 @@ as `MANAGED`; objects the importer cannot represent exactly stay in the UI and a
 listed as `NOT ADOPTED`, as everywhere else. Do not edit the mirror files: the
 next sync overwrites them.
 
+**A Global Manager and its Local Managers.** Each object has exactly one owner in
+`data/`, so exactly one stack manages it and the GM and an LM never fight over
+it:
+
+- The GM's copy is read from the global tree (`/global-infra`, domain `default`
+  unless the inventory sets one) and is `owner: gm`. A Local Manager also lists
+  the GM's objects; its copy never takes them (`NOT ADOPTED ... belongs to the
+  Global Manager`).
+- A site-local rule that uses a global group or service names it, and the
+  local-security stack resolves the name to its `/global-infra` path without
+  managing it. If the GM's copy does not hold that object yet, the rule waits in
+  the UI until the next sync after the GM's copy is merged.
+- A local group or service whose id another manager already owns in `data/` is
+  not taken, nor are the rules that use it, since the name would resolve to the
+  other object. Rename one of them in NSX to bring it in.
+- A policy with no rule left to take stays in the UI whole.
+
 Two managers cannot both own an object with the same id (the data is keyed by
-id): the second is listed as `MANAGED` and left in its UI. An object edited in
+id): the second is listed as `NOT ADOPTED` and left in its UI. An object edited in
 the UI into something the importer cannot represent leaves the copy but not
 state, so its plan shows a destroy and is refused every time: hand it back
 (below) to stop managing it.
@@ -4363,7 +4380,7 @@ referenced across the span, and the dfw-policy module fails the plan if you try.
 ## Run
 
 ```bash
-export TF_VAR_domain=global          # never leave this to default
+export TF_VAR_domain=default         # the global domain; a location's domain only for location-specific objects
 terraform init -backend-config=../../envs/gm1.backend.hcl
 terraform plan -out=tfplan -parallelism=5
 ```
@@ -4434,7 +4451,15 @@ locals {
   base_groups      = { for k, g in local.groups : k => g if !contains(local.composite_group_keys, k) }
   composite_groups = { for k, g in local.groups : k => g if contains(local.composite_group_keys, k) }
 
-  group_paths = merge(module.base_groups.paths, module.composite_groups.paths)
+  # The Global Manager's groups, as a Local Manager sees them: read-only, under
+  # /global-infra. A site-local rule may use one by name; this stack never
+  # manages it (owner: gm is filtered out above), so it cannot fight the GM.
+  global_group_paths = {
+    for k, g in local.groups_all : k => "/global-infra/domains/${try(g.domain, "default")}/groups/${k}"
+    if try(g.owner, "lm") == "gm"
+  }
+
+  group_paths = merge(local.global_group_paths, module.base_groups.paths, module.composite_groups.paths)
 
   # --- services -----------------------------------------------------------
   service_files = fileset("${local.data_root}/services", "*.yaml")
@@ -4450,7 +4475,14 @@ locals {
     if try(v.owner, "gm") == "lm" && (contains(try(v.sites, ["*"]), var.site) || contains(try(v.sites, ["*"]), "*"))
   }
 
+  # The Global Manager's custom services, likewise: used by name, never managed here.
+  global_service_paths = {
+    for k, v in local.custom_services_all : k => "/global-infra/services/${k}"
+    if try(v.owner, "gm") == "gm"
+  }
+
   service_paths = merge(
+    local.global_service_paths,
     { for k, s in data.nsxt_policy_service.predefined : k => s.path },
     module.services.paths,
   )
@@ -6239,6 +6271,11 @@ def check_services(docs: dict[Path, dict], sites: set[str], imported: set[str], 
         check_no_raw_paths(where, doc, report)
 
         for name, display in (doc.get("predefined") or {}).items():
+            # A predefined service is a lookup, not an object anyone owns: two
+            # files (a GM's and an LM's, or two adoptions) may both name it.
+            known = services.get(name)
+            if known and known["kind"] == "predefined" and known["display_name"] == display:
+                continue
             if name in services:
                 report.error(where, f"service {name!r} is also defined in {origin[name]}")
                 continue
@@ -7429,7 +7466,9 @@ def convert_rule(rule: dict, group_paths: dict, service_paths: dict) -> dict:
         converted["profiles"] = profiles
     if tags_of(rule):
         converted["tags"] = tags_of(rule)
-    converted["scope"] = scope
+    # Apply To "ANY" (the policy's own scope) is written as ANY: an empty list
+    # would read as a rule that forgot its Apply To, and is refused.
+    converted["scope"] = scope or ["ANY"]
     return converted
 
 
@@ -7456,7 +7495,7 @@ def convert_policy(policy: dict, group_paths: dict, service_paths: dict, owner: 
     header["rule_management"] = "standalone"
     header["scope"] = [
         group_paths.get(p, p) for p in policy.get("scope", []) if p != "ANY"
-    ]
+    ] or ["ANY"]
 
     rules = {}
     for rule in policy.get("rules", []):
@@ -7528,10 +7567,11 @@ def service_unsupported(service: dict) -> str | None:
     return ("service entries of type " + ", ".join(sorted(str(k) for k in kinds))) if kinds else None
 
 
-def unsupported_objects(groups: list[dict], services: list[dict]) -> dict[str, str]:
+def unsupported_objects(groups: list[dict], services: list[dict], start: dict[str, str] | None = None) -> dict[str, str]:
     """path -> reason, for groups and custom services that cannot be adopted.
-    A group that nests an unsupported group is unsupported too."""
-    bad: dict[str, str] = {}
+    A group that nests an unsupported group is unsupported too. start: paths
+    already known to be unadoptable (federation())."""
+    bad: dict[str, str] = dict(start or {})
     for g in groups:
         if not is_system(g) and (why := group_unsupported(g)):
             bad[g["path"]] = why
@@ -7556,9 +7596,9 @@ def unsupported_objects(groups: list[dict], services: list[dict]) -> dict[str, s
 def rule_unsupported(rule: dict, bad: dict[str, str]) -> str | None:
     if rule.get("service_entries"):
         return "inline service entries"
-    used = [p for f in ("source_groups", "destination_groups", "scope", "services") for p in rule.get(f) or [] if p in bad]
+    used = sorted({p for f in ("source_groups", "destination_groups", "scope", "services") for p in rule.get(f) or [] if p in bad})
     if used:
-        return "uses " + ", ".join(sorted({u.rsplit("/", 1)[-1] for u in used})) + " (not adoptable)"
+        return "uses " + "; ".join(f"{u.rsplit('/', 1)[-1]} ({bad[u]})" for u in used)
     return None
 
 
@@ -7650,6 +7690,90 @@ def mirror_files(site: str) -> set[Path]:
     return own
 
 
+def declared_objects(exclude: frozenset[Path] | set[Path] = frozenset()) -> dict[str, dict[str, dict]]:
+    """Groups and custom services data/ declares, id -> definition."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from yamlcompat import load_yaml  # noqa: PLC0415
+
+    out: dict[str, dict[str, dict]] = {"groups": {}, "services": {}}
+    for kind, key in (("groups", "groups"), ("services", "custom")):
+        for f in sorted((DATA / kind).glob("*.yaml")):
+            if f in exclude:
+                continue
+            for name, definition in ((load_yaml(f.read_text()) or {}).get(key) or {}).items():
+                out[kind][name] = definition if isinstance(definition, dict) else {}
+    return out
+
+
+def federation(role: str, site: str, groups: list, services: list, policies: list,
+               declared: dict, group_paths: dict, service_paths: dict) -> dict[str, str]:
+    """What cannot be adopted on this manager because of the Global Manager / Local
+    Manager split, path -> reason; fills group_paths and service_paths with the
+    global objects a Local Manager's rules may use.
+
+    data/ is keyed by id, and each object has one owner, so an object belongs to
+    exactly one manager's stack and two stacks never fight over it. Here that
+    is kept true: a local object whose id another manager already owns in
+    data/ is not adopted (its name would resolve to the other object), and a
+    reference that resolves to nothing data/ declares is not adopted either,
+    rather than written as a raw path."""
+    default_owner = {"groups": "lm", "services": "gm"}
+
+    def elsewhere(kind: str, definition: dict) -> bool:
+        owner = definition.get("owner", default_owner[kind])
+        if role == "gm":
+            return owner != "gm"
+        sites_ = definition.get("sites") or []
+        return owner == "gm" or not (site in sites_ or "*" in sites_)
+
+    if role != "gm":
+        # A Local Manager sees the Global Manager's objects under /global-infra,
+        # read-only. Its own rules may use those that data/ declares as owner: gm.
+        for gid, definition in declared["groups"].items():
+            if definition.get("owner", "lm") == "gm":
+                group_paths[f"/global-infra/domains/{definition.get('domain', 'default')}/groups/{gid}"] = gid
+        for sid, definition in declared["services"].items():
+            if definition.get("owner", "gm") == "gm":
+                service_paths[f"/global-infra/services/{sid}"] = sid
+
+    problems: dict[str, str] = {}
+    for kind, objects in (("groups", groups), ("services", services)):
+        for obj in objects:
+            definition = declared[kind].get(obj["id"])
+            if definition is not None and not is_system(obj) and elsewhere(kind, definition):
+                whose = "the Global Manager's" if definition.get("owner", default_owner[kind]) == "gm" else "another manager's"
+                problems[obj["path"]] = f"its id is also {whose} {kind[:-1]} in data/, so the names would collide"
+
+    def check(path: str, known: dict, what: str) -> None:
+        if path in ("ANY", "") or path in known or path in problems:
+            return
+        if path.startswith("/global-infra/") and role != "gm":
+            problems[path] = f"uses the global {what} {path.rsplit('/', 1)[-1]}, which data/ does not declare: adopt or mirror the Global Manager first"
+        else:
+            problems[path] = f"refers to {path}, which {site} does not hold"
+
+    for policy in policies:
+        for path in policy.get("scope") or []:
+            check(path, group_paths, "group")
+        for rule in policy.get("rules", []):
+            for field in ("source_groups", "destination_groups", "scope"):
+                for path in rule.get(field) or []:
+                    check(path, group_paths, "group")
+            for path in rule.get("services") or []:
+                check(path, service_paths, "service")
+    for group in groups:
+        for expression in group.get("expression", []):
+            if expression.get("resource_type") != "PathExpression":
+                continue
+            for path in expression.get("paths", []):
+                if path.startswith("/global-infra/") and role != "gm":
+                    # A site-local group cannot be built from a global one here.
+                    problems.setdefault(group["path"], f"nests the global group {path.rsplit('/', 1)[-1]}")
+                else:
+                    check(path, group_paths, "group")
+    return problems
+
+
 def existing_keys(exclude: frozenset[Path] | set[Path] = frozenset()) -> dict[str, set[str]]:
     """What data/ already declares: those objects are managed and never re-imported.
     Files in exclude are not counted (mirror mode's own, about to be rewritten)."""
@@ -7738,7 +7862,9 @@ def main() -> int:
         managers = (load_yaml(inventory_path.read_text()) or {}).get("managers") or {}
     manager = managers.get(args.site, {})
     role = args.role or manager.get("role", "lm")
-    domain = args.domain or manager.get("domain") or ("global" if role == "gm" else "default")
+    # On a Global Manager too, global objects live in domain "default" (another
+    # domain is one location's); scripts/tf.sh uses the same default.
+    domain = args.domain or manager.get("domain") or "default"
     base = GM_BASE if role == "gm" else LM_BASE
 
     if args.from_dump:
@@ -7762,27 +7888,34 @@ def main() -> int:
         print(f"wrote {out}")
         return 0
 
-    all_groups = estate.get("groups", [])
-    all_services = estate.get("services", [])
-    all_policies = estate.get("policies", [])
+    # This manager's own tree only. A Local Manager also shows the Global
+    # Manager's objects (under /global-infra); those belong to the GM's data,
+    # never to an LM's, or the same object would be managed twice.
+    tree = "/global-infra/" if role == "gm" else "/infra/"
+    foreign = [o for kind in ("groups", "services", "policies") for o in estate.get(kind, [])
+               if not str(o.get("path", tree)).startswith(tree)]
+    all_groups = [g for g in estate.get("groups", []) if str(g.get("path", tree)).startswith(tree)]
+    all_services = [s for s in estate.get("services", []) if str(s.get("path", tree)).startswith(tree)]
+    all_policies = [p for p in estate.get("policies", []) if str(p.get("path", tree)).startswith(tree)]
 
-    if args.list:
-        return survey(args.site, all_groups, all_services, all_policies)
-    sites = [args.site]
-    owner = "gm" if role == "gm" else "lm"
-
+    own: set[Path] = mirror_files(args.site) if args.mirror else set()
     # References are converted to names using everything that was read, so a
     # rule can name a group this tranche does not adopt.
     group_paths = {g["path"]: g["id"] for g in all_groups if g.get("path")}
     service_paths = {s["path"]: s["id"] for s in all_services if s.get("path")}
+    federated = federation(role, args.site, all_groups, all_services, all_policies,
+                           declared_objects(exclude=own), group_paths, service_paths)
+
+    if args.list:
+        return survey(args.site, all_groups, all_services, all_policies, federated)
+    sites = [args.site]
+    owner = "gm" if role == "gm" else "lm"
 
     groups, services, policies = all_groups, all_services, all_policies
     skipped: list[str] = []
-    own: set[Path] = set()
     if args.mirror:
         # Everything, except what another file declares: that file manages it.
         # Sorted, so an unchanged manager gives byte-identical files.
-        own = mirror_files(args.site)
         have = existing_keys(exclude=own)
         skipped += sorted(f"group {g['id']}" for g in groups if g["id"] in have["groups"] and not is_system(g))
         skipped += sorted(f"service {s['id']}" for s in services if s["id"] in have["services"] and not is_system(s))
@@ -7819,8 +7952,15 @@ def main() -> int:
         policies = [p for p in policies if p["id"] not in have["policies"]]
 
     # Never adopt what cannot be represented exactly; report it instead.
-    bad = unsupported_objects(all_groups, all_services)
-    kept_in_ui: list[str] = []
+    bad = unsupported_objects(all_groups, all_services, federated)
+    kept_in_ui: list[str] = [f"{o.get('resource_type', 'object')} {o.get('id')}: belongs to the Global Manager ({o.get('path')})"
+                             for o in foreign]
+    # A local object shadowed by another manager's id is reported here, not as MANAGED.
+    for kind, objects in (("group", all_groups), ("service", all_services)):
+        for o in objects:
+            if o.get("path") in federated and "names would collide" in federated[o["path"]]:
+                kept_in_ui.append(f"{kind} {o['id']}: {federated[o['path']]}")
+                skipped = [x for x in skipped if x != f"{kind} {o['id']}"]
     for g in groups:
         if g.get("path") in bad:
             kept_in_ui.append(f"group {g['id']}: {bad[g['path']]}")
@@ -7842,12 +7982,22 @@ def main() -> int:
             kept_in_ui.append(reason)
             continue
         rules = []
+        notes = []
         for rule in policy.get("rules", []):
             why = rule_unsupported(rule, bad)
             if why:
-                kept_in_ui.append(f"rule {policy['id']}/{rule['id']}: {why}; stays in the UI, the rest of the policy is adopted")
+                notes.append(f"rule {policy['id']}/{rule['id']}: {why}; stays in the UI, the rest of the policy is adopted")
             else:
                 rules.append(rule)
+        if not rules:
+            # A policy with no rule to adopt stays whole in the UI: data/ holds no
+            # empty policies.
+            reason = f"policy {policy['id']}: none of its {len(policy.get('rules', []))} rule(s) can be adopted"
+            if policy["id"] in args.policy:
+                sys.exit(f"error: {reason}. Nothing was written.")
+            kept_in_ui += [n.replace("; stays in the UI, the rest of the policy is adopted", "") for n in notes] + [reason]
+            continue
+        kept_in_ui += notes
         adoptable.append(dict(policy, rules=rules))
     policies = adoptable
 
@@ -7870,6 +8020,10 @@ def main() -> int:
     converted_groups = {
         g["id"]: convert_group(g, group_paths, owner, sites) for g in groups if not is_system(g)
     }
+    if role == "gm" and domain != "default":
+        # Local Managers find a GM group under its domain (local-security).
+        for definition in converted_groups.values():
+            definition["domain"] = domain
     if converted_groups:
         header = mirror_header if args.mirror else (
             f"# Imported from {args.site} on {datetime.now(timezone.utc):%Y-%m-%d}. Adopted, not created.\n"
@@ -8042,9 +8196,9 @@ def main() -> int:
     return 0
 
 
-def survey(site: str, groups: list, services: list, policies: list) -> int:
+def survey(site: str, groups: list, services: list, policies: list, federated: dict | None = None) -> int:
     """What could be adopted from this manager, policy by policy. Writes nothing."""
-    bad = unsupported_objects(groups, services)
+    bad = unsupported_objects(groups, services, federated)
     have = existing_keys()
     rows = []
     for policy in policies:
@@ -12215,7 +12369,7 @@ managers:
     sddc_manager: sddc-lon-01.example.internal
     vault_path: nsx/data/managers/gm1
     tier: prod
-    domain: global
+    domain: default   # the global domain, spanning every location
     stacks: [global-security]
     description: Global Manager. Owns the federated DFW for the whole estate.
 

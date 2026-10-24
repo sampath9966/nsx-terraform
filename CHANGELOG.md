@@ -32,8 +32,31 @@ cannot fix itself. Run it again after fixing whatever it reported.
 
 **Mirror files.** They start with `# nsx-mirror: <site>` and belong to the job. Objects declared in other files are left to them (`MANAGED`); objects that cannot be represented exactly stay in the UI (`NOT ADOPTED`). `scripts/import-estate.py --mirror` is the same conversion by hand.
 
+**A Global Manager and its Local Managers: nothing taken twice, no drift loops.** Each object has one owner in `data/`, so one stack manages it. These changes keep that true when both are copied:
+
+- **Global objects stay the GM's.** The importer keeps only the manager's own tree: a Local Manager's listing of the GM's objects is never taken (`NOT ADOPTED ... belongs to the Global Manager`).
+- **Global references resolve.** A site-local rule using a global group or service is written by name, and the local-security stack now resolves GM-owned names to their `/global-infra` paths without managing them. Before, the converter wrote the raw path and the validator failed the merge request. Until the GM's copy holds the object, the rule waits in the UI.
+- **No silent mis-binding.** A local object whose id another manager owns in `data/` is not taken, nor are the rules that use it, which would otherwise resolve to the other object. Neither is an LM group that nests a global group.
+- **No raw paths.** A reference that resolves to nothing now leaves the rule in the UI, with the reason, instead of writing a raw path.
+- **No empty policies.** A policy with no rule left to take stays in the UI whole.
+
+**Fixed in adoption generally:**
+- **Apply To `ANY`.** A rule or policy whose *Applied To* is `ANY` was written with an empty scope, which the validator and the dfw-policy module refuse. It is now written as `ANY`, which plans with no change.
+- **Predefined services named twice.** The same predefined service (for example `HTTPS`) named in two files, by the GM's and an LM's copy or by two adoptions, was reported as defined twice. Identical declarations are now accepted.
+- **GM domain.** The importer read a Global Manager's objects from domain `global`; NSX keeps global objects in `default`, as the stacks already assumed. The example inventory and the global-security README said `global` too; fixed.
+- **Not-adopted reasons.** Rules reported as not adopted now say why.
+
 **Tests:**
-- `tests/brownfield-provider.sh`, with the real provider:
+- `tests/brownfield-provider.sh`, with the real provider: an LM rule using the GM's group and service, Apply To `ANY`, plans as a pure import (`10 to import, 0 to change`), manages none of the GM's objects, applies as imports only, and the next two plans report no changes.
+- `tests/brownfield.sh` copies a GM and an LM side by side and covers:
+  - the LM's listing of a global object;
+  - an LM group with a GM group's id, and the rule using it;
+  - an LM group nesting a global group;
+  - rules using a declared and an undeclared global group;
+  - `ANY` scope, and `HTTPS` named by both managers;
+  - no id declared twice, no raw paths, the copy validating, and a re-sync changing nothing;
+  - both sync orders (LM first, then GM) converging.
+- `tests/brownfield-provider.sh`, mirror mode, with the real provider:
   - the whole copy plans as `8 to import, 0 to add, 0 to change, 0 to destroy`;
   - the write credential is refused, and the read-only sync-state apply imports all 8;
   - a UI change not yet synced is refused, by the plan and by the apply;
