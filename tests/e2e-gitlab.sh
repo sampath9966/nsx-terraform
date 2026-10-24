@@ -84,7 +84,16 @@ check "gitlab-https.sh succeeds" test "$rc" -eq 0
 [ "$rc" -eq 0 ] || tail -40 "$SCRATCH/https.log" | sed 's/^/    /'
 export GITLAB_SSL_DIR="$SSL"
 CA="$SSL/ca.crt"
-check "answers over HTTPS on 8443, trusting only our CA" curl -sf -o /dev/null --max-time 20 --cacert "$CA" https://127.0.0.1:8443/users/sign_in
+# GitLab can still be cycling a service for a few seconds after the switch, so
+# this waits up to a minute; on failure it shows what GitLab last answered.
+https_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 20 --cacert "$CA" https://127.0.0.1:8443/users/sign_in; }
+for _ in 1 2 3 4 5 6; do
+	code="$(https_code)"
+	[ "$code" = 200 ] && break
+	sleep 10
+done
+check "answers over HTTPS on 8443, trusting only our CA" test "$code" = 200
+[ "$code" = 200 ] || echo "    last answer: HTTP ${code:-none}"
 check "is NOT trusted without the CA" bash -c "! curl -sf -o /dev/null --max-time 20 https://127.0.0.1:8443/users/sign_in"
 check "certificate carries the IP in its SAN" bash -c "echo | openssl s_client -connect 127.0.0.1:8443 -CAfile '$CA' 2>/dev/null | openssl x509 -noout -text | grep -q 'IP Address:127.0.0.1'"
 check "old HTTP port no longer answers" bash -c "! curl -sf -o /dev/null --max-time 10 http://127.0.0.1:8929/users/sign_in"
