@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.2.9"
+VERSION="1.2.10"
 
 ROOT="$PWD"
 FORCE=0
@@ -1171,6 +1171,8 @@ deploy/gitlab/.env
 deploy/gitlab/ssl/
 # Optional per-host CI network overrides (may hold proxy credentials).
 deploy/gitlab/ci-network.env
+# Provider packages fetched by scripts/ci-image.sh for the CI image.
+deploy/ci-image/plugins/
 
 # Originals saved by the generator's update script before it overwrites a file.
 .nsx-update-backup/
@@ -2066,6 +2068,13 @@ openssl s_client -connect <manager>:443 -showcerts </dev/null 2>/dev/null |
 
 The SAN must list the name or address in `inventory/managers.yaml`; if it does
 not, replace the certificate on the manager. Do not turn verification off.
+
+Jobs reach managers directly, never through the internet proxy the runner may
+have: `scripts/with-credentials.sh` adds the manager's host (and
+`SDDC_MANAGER_HOST`) to `NO_PROXY`. A manager name sent to such a proxy fails
+as `remote error: tls: unrecognized name`, a 403 or a 502. Only where managers
+really are reached through a proxy, set the CI/CD variable
+`NSX_MANAGER_VIA_PROXY=1`.
 
 | Variable | Value | Flags |
 |---|---|---|
@@ -5111,6 +5120,38 @@ eval "$(python3 "$REPO_ROOT/scripts/ci-matrix.py" --export "$SITE")"
 [ -n "${NSX_HOST:-}" ] || die "site '$SITE' is not in inventory/managers.yaml"
 
 export NSXT_MANAGER_HOST="$NSX_HOST"
+
+# Managers (and SDDC Manager) sit on the management network. A job whose
+# HTTPS_PROXY is set for internet access would otherwise send them through
+# that proxy: Terraform and curl match NO_PROXY by name, and a CIDR entry such
+# as 10.0.0.0/8 only covers IP literals, never an FQDN. The proxy then fails
+# the request (often as "tls: unrecognized name" or a 403/502). Add the
+# hosts themselves. NSX_MANAGER_VIA_PROXY=1 keeps the proxy for networks that
+# really do reach managers through it.
+bypass_proxy() {
+	local h="$1" list
+	h="${h#*://}"
+	h="${h%%/*}"
+	case "$h" in
+	\[*)
+		h="${h#\[}"
+		h="${h%%]*}"
+		;;
+	*:*:*) ;;
+	*) h="${h%%:*}" ;;
+	esac
+	[ -n "$h" ] || return 0
+	list="${NO_PROXY:-${no_proxy:-}}"
+	case ",${list// /}," in
+	*",$h,"*) ;;
+	*) list="${list:+$list,}$h" ;;
+	esac
+	export NO_PROXY="$list" no_proxy="$list"
+}
+if [ "${NSX_MANAGER_VIA_PROXY:-}" != 1 ]; then
+	bypass_proxy "$NSX_HOST"
+	[ -z "${SDDC_MANAGER_HOST:-}" ] || bypass_proxy "$SDDC_MANAGER_HOST"
+fi
 
 # Keep the session alive across requests — materially faster on large plans.
 export NSXT_SESSION_AUTH="${NSXT_SESSION_AUTH:-true}"
@@ -8482,11 +8523,15 @@ packages. `scripts/converge.sh` (run for you by `update.sh`) also registers the
 runner and configures it for this host: proxy settings found on the host, the
 host's CA bundle, and a pull policy that uses the local image.
 
-Terraform providers are the one thing jobs still download. If this network cannot
-reach `registry.terraform.io`, the validate job shows a warning rather than
-failing; set the CI/CD variable `NSX_TF_NETWORK_MIRROR` to an internal mirror, or
-put `NSX_HTTPS_PROXY=...` in `deploy/gitlab/ci-network.env` and run
-`scripts/converge.sh`. `scripts/converge.sh --check` reports without changing anything.
+The NSX provider is in the image too, at the exact version pinned in
+`deploy/ci-image/providers.tf`, so plans and applies download nothing. The
+image build fetches it once, through the same proxy settings jobs get, and
+`terraform providers mirror` checks its signature as it does. If that fetch
+fails, converge warns, the image is built without it, jobs download it as
+before, and the next converge tries again. To change the version, edit
+`providers.tf` and run `scripts/converge.sh`. An internal mirror set as the
+CI/CD variable `NSX_TF_NETWORK_MIRROR` is used instead of the image's copy.
+`scripts/converge.sh --check` reports without changing anything.
 
 ## What it is not
 
@@ -9341,13 +9386,21 @@ write_file deploy/ci-image/Dockerfile <<'SCAFFOLD_EOF'
 # works, and jobs start with everything already installed.
 #
 # Python 3 (validation and pipeline generation), Terraform, and the tools the
-# scripts use: bash, curl, git, make. Changing this file changes its hash, and
-# the next converge rebuilds the image.
+# scripts use: bash, curl, git, make. Changing this file or providers.tf
+# changes the image's hash, and the next converge rebuilds the image.
+#
+# The NSX provider pinned in providers.tf is in the image too, so a plan never
+# downloads it. ci-image.sh fetches it into plugins/ on the host before the
+# build, the way jobs reach the internet. Terraform uses
+# /usr/local/share/terraform/plugins on its own (an implied local mirror):
+# providers found there are never looked up anywhere else. A job that sets
+# NSX_TF_NETWORK_MIRROR or NSX_TF_FS_MIRROR uses that instead.
 
 FROM hashicorp/terraform:1.9.8 AS terraform
 FROM python:3.12-bookworm
 
 COPY --from=terraform /bin/terraform /usr/local/bin/terraform
+COPY plugins/ /usr/local/share/terraform/plugins/
 
 ENV TF_IN_AUTOMATION=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -9361,6 +9414,21 @@ CMD ["bash"]
 
 RUN terraform version && python3 --version && bash --version >/dev/null \
     && curl --version >/dev/null && git --version && make --version >/dev/null
+SCAFFOLD_EOF
+
+write_file deploy/ci-image/providers.tf <<'SCAFFOLD_EOF'
+# The providers built into the CI image (see Dockerfile). An exact version, so
+# every job of every pipeline runs the same provider until this changes. It
+# must satisfy the stacks' own constraint ("~> 3.9"). Changing it rebuilds the
+# image at the next scripts/converge.sh.
+terraform {
+  required_providers {
+    nsxt = {
+      source  = "vmware/nsxt"
+      version = "3.12.1"
+    }
+  }
+}
 SCAFFOLD_EOF
 
 write_file scripts/tf-mirror.sh <<'SCAFFOLD_EOF'
@@ -9491,6 +9559,14 @@ write_file scripts/ci-image.sh <<'SCAFFOLD_EOF'
 # two Docker Hub images and nothing else: no apk, apt or pip, which a locked-down
 # network usually blocks even when Docker Hub is reachable through a proxy.
 #
+# The NSX provider pinned in deploy/ci-image/providers.tf goes into the image
+# too, so plans and applies never download it. It is fetched before the build
+# by 'terraform providers mirror' in the Terraform base image, with the proxy
+# settings jobs get (scripts/gitlab-runner.sh --print-env) and the host's CA
+# bundle. If that fetch fails the image is still built, without the provider,
+# and this exits 2: jobs then download it themselves, and the next run tries
+# again.
+#
 # NSX_CI_IMAGE (default nsx-ci:1). A name that does not start with 'nsx-ci:' is
 # treated as an image from your own registry: it is pulled, not built.
 
@@ -9518,6 +9594,51 @@ verify() {
 	docker run --rm "$IMAGE" sh -c \
 		'terraform version >/dev/null && python3 --version >/dev/null && bash --version >/dev/null && curl --version >/dev/null && git --version >/dev/null' \
 		>/dev/null 2>&1
+}
+
+PLUGINS="$CONTEXT/plugins"
+PROVIDER_DIR="registry.terraform.io/vmware/nsxt"
+baked() { # the image holds the pinned provider for this host's platform
+	docker run --rm "$IMAGE" sh -c "ls /usr/local/share/terraform/plugins/$PROVIDER_DIR/terraform-provider-nsxt_$(provider_version)_linux_$(platform)*.zip" >/dev/null 2>&1
+}
+provider_version() { sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$CONTEXT/providers.tf" | head -1; }
+platform() {
+	case "$(docker info --format '{{.Architecture}}' 2>/dev/null || uname -m)" in
+	aarch64 | arm64) echo arm64 ;;
+	*) echo amd64 ;;
+	esac
+}
+
+# Fetch the pinned providers into $PLUGINS, the way a job would reach the
+# internet. Returns 1, with the reason in $log, if it could not.
+fetch_providers() {
+	local envfile bundle=() attempt tfimg
+	tfimg="$(bases | head -1)"
+	rm -rf "$PLUGINS"
+	mkdir -p "$PLUGINS"
+	envfile="$(mktemp)"
+	[ -x "$REPO_ROOT/scripts/gitlab-runner.sh" ] && "$REPO_ROOT/scripts/gitlab-runner.sh" --print-env >"$envfile" 2>/dev/null
+	# The host trust store, so a TLS-inspecting proxy's CA is trusted as on the host.
+	for ca in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt; do
+		[ -f "$ca" ] && bundle=(-v "$ca:/etc/ssl/certs/ca-certificates.crt:ro") && break
+	done
+	for attempt in 1 2 3; do
+		say "fetching vmware/nsxt $(provider_version) for the CI image (attempt $attempt of 3)..."
+		# As this user, so the next run can replace what it writes; HOME for
+		# Terraform's own files, which an arbitrary user cannot write in /root.
+		if docker run --rm --network host --env-file "$envfile" ${bundle[@]+"${bundle[@]}"} \
+			--user "$(id -u):$(id -g)" -e HOME=/tmp -e CHECKPOINT_DISABLE=1 \
+			-v "$CONTEXT:/ctx" -w /ctx "$tfimg" providers mirror -platform="linux_$(platform)" /ctx/plugins >>"$log" 2>&1 &&
+			ls "$PLUGINS/$PROVIDER_DIR"/*.zip >/dev/null 2>&1; then
+			rm -f "$envfile"
+			return 0
+		fi
+		[ "$attempt" -lt 3 ] && sleep $((attempt * ${NSX_PULL_RETRY_SLEEP:-15}))
+	done
+	rm -f "$envfile"
+	rm -rf "$PLUGINS"
+	mkdir -p "$PLUGINS"
+	return 1
 }
 
 why_build_failed() {
@@ -9550,15 +9671,21 @@ if [[ "$IMAGE" != nsx-ci:* ]]; then
 fi
 
 [ -f "$CONTEXT/Dockerfile" ] || die "$CONTEXT/Dockerfile is missing. Bring the tree up to date with update.sh."
-want="$(sha256sum "$CONTEXT/Dockerfile" | cut -c1-12)"
+[ -f "$CONTEXT/providers.tf" ] || die "$CONTEXT/providers.tf is missing. Bring the tree up to date with update.sh."
+want="$(cat "$CONTEXT/Dockerfile" "$CONTEXT/providers.tf" | sha256sum | cut -c1-12)"
 have="$(docker image inspect -f '{{ index .Config.Labels "nsx.dockerfile" }}' "$IMAGE" 2>/dev/null || true)"
 
+# An image built without the provider is labelled <hash>-noprovider, and is
+# rebuilt (the fetch tried again) on every run until the fetch works.
 if [ "$have" = "$want" ]; then
-	if verify; then
-		say "CI image $IMAGE is current."
+	if verify && baked; then
+		say "CI image $IMAGE is current (vmware/nsxt $(provider_version) inside)."
 		exit 0
 	fi
 	say "CI image $IMAGE is present but does not pass its checks; rebuilding."
+elif [ "$have" = "$want-noprovider" ]; then
+	[ "$CHECK" = 1 ] && { say "CI image $IMAGE has no NSX provider inside: jobs download it. Run scripts/converge.sh to try again."; exit 2; }
+	say "CI image $IMAGE has no NSX provider inside; trying again."
 elif [ -n "$have" ]; then
 	say "CI image $IMAGE is out of date; rebuilding."
 fi
@@ -9588,10 +9715,15 @@ ensure_bases() {
 }
 
 ensure_bases
+label="$want"
+if ! fetch_providers; then
+	label="$want-noprovider"
+	fetch_failed="$(grep -Ei 'error|failed|could not|timeout|x509|proxy' "$log" | tail -6)"
+fi
 say "building CI image $IMAGE (a minute or two the first time)..."
-if ! docker build --pull=false --label "nsx.dockerfile=$want" -t "$IMAGE" "$CONTEXT" >>"$log" 2>&1; then
+if ! docker build --pull=false --label "nsx.dockerfile=$label" -t "$IMAGE" "$CONTEXT" >>"$log" 2>&1; then
 	# Registry metadata lookups can fail where a plain build of cached images still works.
-	if ! DOCKER_BUILDKIT=0 docker build --pull=false --label "nsx.dockerfile=$want" -t "$IMAGE" "$CONTEXT" >>"$log" 2>&1; then
+	if ! DOCKER_BUILDKIT=0 docker build --pull=false --label "nsx.dockerfile=$label" -t "$IMAGE" "$CONTEXT" >>"$log" 2>&1; then
 		tail -15 "$log" | sed 's/^/    /' >&2
 		why_build_failed "$log" >&2
 		die "could not build $IMAGE."
@@ -9601,7 +9733,17 @@ verify || {
 	tail -5 "$log" | sed 's/^/    /' >&2
 	die "built $IMAGE but it failed its own checks."
 }
-say "CI image $IMAGE built and verified."
+if [ "$label" != "$want" ]; then
+	printf '%s\n' "${fetch_failed:-(no error text)}" | sed 's/^/    /'
+	say "  The NSX provider could not be fetched from this host the way jobs reach the internet, so"
+	say "  jobs will download it themselves. Fix the network (NSX_HTTPS_PROXY in deploy/gitlab/ci-network.env,"
+	say "  the proxy allowing registry.terraform.io, releases.hashicorp.com and release-assets.githubusercontent.com),"
+	say "  or set the CI/CD variable NSX_TF_NETWORK_MIRROR, then run scripts/converge.sh again."
+	say "CI image $IMAGE built and verified, WITHOUT the NSX provider."
+	exit 2
+fi
+baked || die "built $IMAGE but vmware/nsxt $(provider_version) is not inside it."
+say "CI image $IMAGE built and verified (vmware/nsxt $(provider_version) inside)."
 SCAFFOLD_EOF
 mark_executable scripts/ci-image.sh
 
@@ -9996,11 +10138,12 @@ ok "Docker is reachable"
 # --- the CI image ---------------------------------------------------------------
 img_args=()
 [ "$CHECK" = 1 ] && img_args=(--check)
-if out="$("$REPO_ROOT/scripts/ci-image.sh" ${img_args[@]+"${img_args[@]}"} 2>&1)"; then
-	ok "$(printf '%s' "$out" | tail -1)"
-else
-	fail "CI image $CI_IMAGE" "$(printf '%s' "$out" | tail -12 | sed 's/^/ /')"
-fi
+out="$("$REPO_ROOT/scripts/ci-image.sh" ${img_args[@]+"${img_args[@]}"} 2>&1)"
+case $? in
+0) ok "$(printf '%s' "$out" | tail -1)" ;;
+2) warn "CI image $CI_IMAGE has no NSX provider inside" "$(printf '%s' "$out" | tail -12 | sed 's/^/ /')" ;;
+*) fail "CI image $CI_IMAGE" "$(printf '%s' "$out" | tail -12 | sed 's/^/ /')" ;;
+esac
 
 # --- GitLab on this host ---------------------------------------------------------
 gitlab_here=0
@@ -10070,6 +10213,8 @@ for url in ("https://registry.terraform.io/.well-known/terraform.json", "https:/
 sys.exit(bad)'
 	if out="$(docker run --rm --network host --env-file "$envfile" ${bundle[@]+"${bundle[@]}"} --entrypoint "" "$CI_IMAGE" python3 -c "$probe" 2>&1)"; then
 		ok "Job containers can reach registry.terraform.io and releases.hashicorp.com"
+	elif docker run --rm --entrypoint "" "$CI_IMAGE" sh -c 'ls /usr/local/share/terraform/plugins/registry.terraform.io/vmware/nsxt/*.zip' >/dev/null 2>&1; then
+		ok "Job containers cannot reach the public Terraform registry, but the NSX provider is in the CI image"
 	else
 		mirror=""
 		[ -f "$COMPOSE_DIR/ci-network.env" ] && mirror="$(grep -E '^NSX_TF_(NETWORK|FS)_MIRROR=' "$COMPOSE_DIR/ci-network.env" || true)"

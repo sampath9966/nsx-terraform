@@ -232,6 +232,15 @@ check "passwords with quotes, dollars, backslashes and spaces arrive intact" tes
 check "a plan job cannot use the apply credential" grep -q "no NSX credentials" <<<"$(wc2 NSX_CRED_SCOPE=plan NSX_APPLY_USERNAME=w NSX_APPLY_PASSWORD=w)"
 check "an apply job cannot use the plan credential" grep -q "no NSX credentials" <<<"$(wc2 NSX_CRED_SCOPE=apply NSX_PLAN_USERNAME=r NSX_PLAN_PASSWORD=r)"
 check "a password never appears in an error message" bash -c '! grep -q SECRETVALUE <<<"$1"' _ "$(wc2 NSX_USERNAME=u NSX_PASSWORD=SECRETVALUE VAULT_ADDR=http://x)"
+np() { (cd "$T" && env -i PATH="$PATH" NSX_USERNAME=u NSX_PASSWORD=p "$@" scripts/with-credentials.sh hyd-gm01 -- sh -c 'printf "%s|%s" "$NO_PROXY" "$no_proxy"' 2>&1); }
+check "the manager is added to NO_PROXY, keeping what was there" test "$(np NO_PROXY=10.0.0.0/8)" = "10.0.0.0/8,gm.example.net|10.0.0.0/8,gm.example.net"
+check "...from no_proxy when only that is set" test "$(np no_proxy=localhost)" = "localhost,gm.example.net|localhost,gm.example.net"
+check "...not twice" test "$(np NO_PROXY=gm.example.net)" = "gm.example.net|gm.example.net"
+check "...and SDDC Manager too" test "$(np SDDC_MANAGER_HOST=sddc.example.net:443)" = "gm.example.net,sddc.example.net|gm.example.net,sddc.example.net"
+check "NSX_MANAGER_VIA_PROXY=1 leaves NO_PROXY alone" test "$(np NSX_MANAGER_VIA_PROXY=1 NO_PROXY=x)" = "x|"
+sed -i 's/host: gm.example.net/host: gm.example.net:8443/' "$T/inventory/managers.yaml"
+check "a port in the inventory host is not part of the NO_PROXY entry" test "$(np)" = "gm.example.net|gm.example.net"
+sed -i 's/host: gm.example.net:8443/host: gm.example.net/' "$T/inventory/managers.yaml"
 check "the wrapped command's exit status is preserved" bash -c '(cd "$1" && env -i PATH="$PATH" NSX_USERNAME=u NSX_PASSWORD=p scripts/with-credentials.sh hyd-gm01 -- sh -c "exit 7") >/dev/null 2>&1; [ $? -eq 7 ]' _ "$T"
 
 # Git is given only the runner's tls-ca-file. That file has to carry the host
@@ -286,10 +295,23 @@ build)
 		fi
 	done
 	label="$(printf '%s\n' "$@" | sed -n 's/^nsx.dockerfile=//p')"
+	if ls "${*: -1}"/plugins/registry.terraform.io/vmware/nsxt/*.zip >/dev/null 2>&1; then : >"$d/baked"; else rm -f "$d/baked"; fi
 	echo "nsx-ci:1" >>"$d/local"
 	printf '%s' "$label" >"$d/label.nsx-ci_1"
 	exit 0 ;;
-run) exit 0 ;;
+run)
+	case "$*" in
+	*"providers mirror"*)
+		[ "${FAKE_MIRROR:-ok}" = fail ] && { echo "Error: failed to query provider: request canceled (Client.Timeout exceeded)" >&2; exit 1; }
+		ctx="$(printf '%s\n' "$@" | sed -n 's/:\/ctx$//p')"
+		mkdir -p "$ctx/plugins/registry.terraform.io/vmware/nsxt"
+		: >"$ctx/plugins/registry.terraform.io/vmware/nsxt/terraform-provider-nsxt_3.12.1_linux_amd64.zip"
+		printf '%s\n' "$@" >"$d/mirror-args"
+		exit 0 ;;
+	*/usr/local/share/terraform/plugins*) [ -f "$d/baked" ] ;;
+	*) exit 0 ;;
+	esac
+	exit ;;
 esac
 exit 0
 STUB
@@ -331,5 +353,28 @@ rc=$?
 check "rate-limited with nothing cached: exits non-zero" test "$rc" -ne 0
 check "...names the rate limit and what to do" bash -c 'grep -qi "rate-limiting" <<<"$1" && grep -q "docker login" <<<"$1"' _ "$out"
 check "...after retrying the pull" bash -c '[ "$(grep -c "^pull" "$1/calls")" -ge 3 ]' _ "$FD"
+
+# The NSX provider in the image.
+: >"$FD/local"
+rm -f "$FD"/label.*
+out="$(fd_run)"
+rc=$?
+check "the provider is fetched and built into the image" bash -c '[ "$2" -eq 0 ] && grep -q "vmware/nsxt 3.12.1 inside" <<<"$1"' _ "$out" "$rc"
+check "...for this platform, as the invoking user, through the job network settings" bash -c 'grep -qx -- "-platform=linux_amd64" "$1/mirror-args" && grep -qx -- "--user" "$1/mirror-args" && grep -qx -- "--env-file" "$1/mirror-args"' _ "$FD"
+check "...and the fetched packages are not committed" grep -qx "deploy/ci-image/plugins/" "$T/.gitignore"
+out="$(fd_run)"
+check "an image with the provider inside is current" bash -c '! grep -q "^build" "$1/calls" && grep -q "is current" <<<"$2"' _ "$FD" "$out"
+sed -i 's/version = "3.12.1"/version = "3.12.2"/' "$T/deploy/ci-image/providers.tf"
+out="$(fd_run)"
+check "a new provider pin rebuilds the image" grep -q "out of date" <<<"$out"
+sed -i 's/version = "3.12.2"/version = "3.12.1"/' "$T/deploy/ci-image/providers.tf"
+rm -f "$FD"/label.*
+out="$(fd_run FAKE_MIRROR=fail)"
+rc=$?
+check "a failed fetch still builds a working image, and exits 2" test "$rc" -eq 2
+check "...saying so, with the reason and the fix" bash -c 'grep -q "WITHOUT the NSX provider" <<<"$1" && grep -q "Client.Timeout" <<<"$1" && grep -q "NSX_HTTPS_PROXY" <<<"$1"' _ "$out"
+out="$(fd_run)"
+check "...and the next run tries again and bakes it" bash -c 'grep -q "trying again" <<<"$1" && grep -q "inside)" <<<"$1"' _ "$out"
+check "the pinned provider satisfies the stacks' constraint (~> 3.9)" bash -c 'v="$(sed -n "s/.*version = \"\(.*\)\"/\1/p" "$1/deploy/ci-image/providers.tf")"; grep -rq "\"~> 3.9\"" "$1/stacks" && [ "${v%%.*}" = 3 ] && [ "$(echo "$v" | cut -d. -f2)" -ge 9 ]' _ "$T"
 
 finish ci-scripts
