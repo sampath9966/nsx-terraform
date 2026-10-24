@@ -13,6 +13,28 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.5.1
+
+A production-readiness pass over the whole path from mirror to apply, run as the pipeline runs it: on a CI image without PyYAML, with `terraform fmt -check`, and with the real NSX provider against a manager shaped like a production one. Each item below would otherwise have stopped the first real mirror at a later step.
+
+**YAML is read with a full parser everywhere.** The CI image now carries PyYAML, fetched on the runner host as the NSX provider is (through the job proxy, or from `NSX_PIP_INDEX_URL`), and installed offline. Where it is missing anyway, YAML is read with Terraform's own `yamldecode`, the parser the stacks use, all files in one call: 5,000 documents in under a second, with no difference from PyYAML in a fuzz test. The built-in reader is left only for a machine with neither. Dates in standby approvals are read in either form. `converge` says which part of the image is missing.
+
+**Generated import files pass `terraform fmt`.** They were not aligned as fmt aligns them, so the pipeline's `terraform` job would have failed on every mirror.
+
+**Adopted data validates as NSX holds it.** An unlisted tag scope in an adopted group, and equal sequence numbers in an adopted policy, are warnings, not errors (still errors in files you write). Sequence number 0 is allowed. A group with no criteria is taken with a `why_empty` note instead of failing the plan, and a policy whose rules NSX numbered twice is marked `allow_duplicate_sequence` so the plan accepts it.
+
+**System services are used by id, not looked up by name.** A federated Local Manager lists its own `HTTPS` and the Global Manager's; a lookup by display name finds both and fails the plan. Imported system services are written as `predefined_ids` and used by their path.
+
+**More of the estate is taken over exactly:** MAC-address groups, "IP Addresses Only" groups, and IP protocol (GRE, ESP...), ALG, IGMP and EtherType service entries. A condition whose key, member type or operator the schema does not list, or with a tag-scope operator other than equals (which the provider cannot carry), is left in the UI with the reason instead of being written wrongly.
+
+**CI runs what used to be run by hand.** The real-provider suite is now a CI job, and the offline suites also run reading YAML as an image without PyYAML would.
+
+**Names NSX allows no longer break the copy.** The first real mirror of hyd-gm01 failed validation with 229 errors from one cause: a group named `Azure-AD-IP's`. Where PyYAML is not installed (the CI image), the built-in YAML reader took the apostrophe for the start of a quoted string and rejected the whole groups file, so every rule referring to a group reported it undefined. The reader now treats a quote as YAML does, only where a value starts, and decodes quoted values in full. The writer quotes mapping keys as it quotes values, and escapes quotes, backslashes, line breaks, commas and brackets. Every file the mirror writes is now tested to read the same with PyYAML and without it, and with Terraform.
+
+**Two policies with one display name are both kept.** NSX allows it (`CSS` twice, different ids); the validator refused the second. It still refuses a hand-written policy that duplicates another.
+
+**Imported sequence numbers are taken as they are.** The "not a multiple of 100" advice is for rules written here; it is no longer printed for every imported rule.
+
 ## 1.5.0
 
 **Drift is raised as a GitLab issue, to investigate.** During the observation period, every sync that finds the manager changed in the UI raises an issue labelled `nsx-drift` and `site:<site>`: each object added, changed or deleted, what changed in it, who last changed it and when (from NSX), and a checklist (who and why, keep or revert, should it have been a merge request). A change is raised once, not on every sync. The first copy is the baseline, and objects nobody touched since the last copy (taken over by a newer importer) are not raised. After cutover the new `drift` job (schedule with `DRIFT_SITE`) does the same for managed managers from a refresh-only plan. `scripts/drift.sh` now plans through `tf.sh drift`, so the plan has the manager's variables, state and trust; before, it ran Terraform without them.

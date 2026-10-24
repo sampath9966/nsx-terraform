@@ -437,6 +437,85 @@ check "...nor the one after (no loop)" grep -q "No changes" <<<"$(tf plan local-
 cp "$SCRATCH/ui.orig" "$UI"
 cd "$T" || exit 1
 
+echo "a production-shaped manager, end to end, as the pipeline runs it (no PyYAML)"
+# Every shape the audit found in real estates, through the same steps as the
+# pipeline: mirror, validate with the built-in YAML reader (the CI image may
+# lack PyYAML), terraform fmt -check, plan (pure import), apply, then no changes.
+T5="$SCRATCH/tree5"
+generate "$T5" --no-examples
+cd "$T5" || exit 1
+printf 'managers:\n  lon1:\n    role: lm\n    host: 127.0.0.1:%s\n    site: lon1\n    vcf_instance: vcf-a\n    vault_path: secret/nsx/lon1\n    tier: prod\n' "$port" >inventory/managers.yaml
+printf 'terraform {\n  backend "local" {}\n}\n' >stacks/local-security/backend_override.tf
+printf 'path = "%s/prod.tfstate"\n' "$SCRATCH" >envs/lon1.backend.hcl
+cp "$UI" "$SCRATCH/ui.before-prod"
+python3 - "$UI" <<'PY'
+import json, sys
+D = "/infra/domains/default"; SV = "/infra/services"
+def g(i, expr, **kw): return dict({"id": i, "path": f"{D}/groups/{i}", "display_name": i, "expression": expr}, **kw)
+cond = lambda k, m, o, v, **kw: dict({"resource_type": "Condition", "key": k, "member_type": m, "operator": o, "value": v}, **kw)
+groups = [
+    g("Azure-AD-IP's", [cond("Tag", "VirtualMachine", "EQUALS", "unlisted-scope|x")], description='line one\nline "two"'),
+    g("Name-Prefix", [cond("Name", "VirtualMachine", "STARTSWITH", "web-")]),
+    g("Empty-Placeholder", []),
+    g("IP-Only", [{"resource_type": "IPAddressExpression", "ip_addresses": ["10.20.0.0/24"]}], group_type=["IPAddress"]),
+    g("MAC-Hosts", [{"resource_type": "MACAddressExpression", "mac_addresses": ["00:50:56:aa:bb:cc"]}]),
+    g("Pods", [cond("Tag", "Pod", "EQUALS", "app|x")]),
+    g("Not-Scope", [cond("Tag", "VirtualMachine", "EQUALS", "env|prod", scope_operator="NOTEQUALS")]),
+]
+svc = lambda i, entries: {"id": i, "path": f"{SV}/{i}", "display_name": i, "service_entries": entries}
+services = [
+    svc("gm_UDP_49152–65535", [{"resource_type": "L4PortSetServiceEntry", "display_name": "u", "l4_protocol": "UDP", "destination_ports": ["49152-65535"], "source_ports": []}]),
+    svc("GRE-Tunnel", [{"resource_type": "IPProtocolServiceEntry", "display_name": "gre", "protocol_number": 47}]),
+    svc("FTP-ALG", [{"resource_type": "ALGTypeServiceEntry", "display_name": "ftp", "alg": "FTP", "destination_ports": ["21"], "source_ports": []}]),
+    svc("IGMP-Any", [{"resource_type": "IGMPTypeServiceEntry", "display_name": "igmp"}]),
+]
+d = json.load(open(sys.argv[1]))
+d["groups"] += groups
+d["services"] += services
+# A federated Local Manager also lists the Global Manager's HTTPS: same display name.
+d["services"].append({"id": "HTTPS", "path": "/global-infra/services/HTTPS", "display_name": "HTTPS", "_system_owned": True,
+                      "service_entries": [{"resource_type": "L4PortSetServiceEntry", "display_name": "HTTPS", "l4_protocol": "TCP", "destination_ports": ["443"]}]})
+def rule(p, i, seq, src, dst, svcs):
+    return {"id": i, "path": f"{D}/security-policies/{p}/rules/{i}", "display_name": i, "sequence_number": seq, "action": "ALLOW",
+            "direction": "IN_OUT", "ip_protocol": "IPV4_IPV6", "logged": False, "disabled": False, "sources_excluded": False,
+            "destinations_excluded": False, "source_groups": src, "destination_groups": dst, "services": svcs, "scope": ["ANY"], "profiles": ["ANY"]}
+def pol(i, rules, desc=None):
+    out = {"id": i, "path": f"{D}/security-policies/{i}", "display_name": "CSS", "category": "Application", "sequence_number": 0,
+           "stateful": True, "tcp_strict": True, "locked": False, "scope": ["ANY"], "rules": rules}
+    if desc: out["description"] = desc
+    return out
+G = lambda i: f"{D}/groups/{i}"
+d["policies"] += [
+    pol("CSS", [rule("CSS", "zero", 0, [G("Azure-AD-IP's")], [G("Name-Prefix")], [f"{SV}/HTTPS"]),
+                rule("CSS", "same-a", 470, [G("IP-Only")], [G("MAC-Hosts")], [f"{SV}/gm_UDP_49152–65535", f"{SV}/GRE-Tunnel"]),
+                rule("CSS", "same-b", 470, [G("Empty-Placeholder")], ["ANY"], [f"{SV}/FTP-ALG", f"{SV}/IGMP-Any"]),
+                rule("CSS", "pods", 900, [G("Pods")], ["ANY"], ["ANY"])], desc='quoted "text"\nand a line'),
+    pol("CSS-LbTAAIz-d", [rule("CSS-LbTAAIz-d", "r1", 10, [G("Not-Scope")], ["ANY"], ["ANY"]),
+                          rule("CSS-LbTAAIz-d", "r2", 20, [G("Name-Prefix")], ["ANY"], [f"{SV}/HTTPS"])]),
+]
+json.dump(d, open(sys.argv[1], "w"))
+PY
+out="$(env -u NSXT_MANAGER_HOST NSX_LON1_USERNAME=u NSX_LON1_PASSWORD=p scripts/with-credentials.sh lon1 --from env -- \
+	python3 scripts/import-estate.py --site lon1 --dump-only "$SCRATCH/prod-cap.json" >/dev/null 2>&1 &&
+	python3 scripts/import-estate.py --site lon1 --from-dump "$SCRATCH/prod-cap.json" --mirror 2>&1)"
+check "every shape NSX allows is taken, except what cannot be represented, each with its reason" bash -c '
+	grep -q "NOT ADOPTED  group Pods: a condition with member_type Pod" <<<"$1" &&
+	grep -q "NOT ADOPTED  group Not-Scope: a condition with scope_operator NOTEQUALS" <<<"$1" &&
+	grep -q "NOT ADOPTED  rule CSS/pods: uses Pods" <<<"$1" && grep -q "NOT ADOPTED  rule CSS-LbTAAIz-d/r1: uses Not-Scope" <<<"$1" &&
+	! grep -qE "NOT ADOPTED  (group|service) (Azure|Name-Prefix|Empty|IP-Only|MAC|gm_UDP|GRE|FTP|IGMP)" <<<"$1"' _ "$out"
+check "...system services by id, not by name" grep -q "^predefined_ids:" data/services/imported-lon1-mirror.yaml
+check "...and a policy NSX numbered with duplicates keeps them, marked" grep -q "allow_duplicate_sequence: true" data/policies/CSS.yaml
+v="$(NSX_YAML_FALLBACK=1 python3 scripts/validate-data.py 2>&1)"
+check "the copy validates with the built-in YAML reader, as on a CI image without PyYAML" bash -c '! grep -q "^ERROR" <<<"$1" && grep -q "0 error(s)" <<<"$1"' _ "$v"
+check "...an unlisted tag scope in an adopted group is a warning, not an error" grep -q "^warning .*tag scope .unlisted-scope." <<<"$v"
+check "terraform fmt -check passes on everything the mirror wrote" bash -c 'terraform fmt -check -recursive stacks >/dev/null'
+out="$(tf plan local-security lon1)"
+check "the real provider plans it as a pure import: two HTTPS, empty and IP-only groups, MAC, ALG, IGMP, GRE, sequence 0" bash -c 'grep -qE "Plan: [0-9]+ to import, 0 to add, 0 to change, 0 to destroy" <<<"$1" && grep -q "plan-guard: allowed" <<<"$1"' _ "$out"
+check "...and it applies as imports only" grep -qE "Resources: [0-9]+ imported, 0 added, 0 changed, 0 destroyed" <<<"$(APPROVE=yes tf apply local-security lon1)"
+check "...after which the plan is empty: everything read back as written" grep -q "No changes" <<<"$(tf plan local-security lon1)"
+cp "$SCRATCH/ui.before-prod" "$UI"
+cd "$T" || exit 1
+
 writes="$(grep WRITE "$SCRATCH/requests.log" | grep -vc "/api/session/create" || true)"
 check "NSX received no write at all (login sessions aside)" test "$writes" -eq 0
 
