@@ -694,8 +694,11 @@ Each step is independent and says what to do when it fails. It never restarts th
 runner unless the runner's configuration changed, so it is safe to run while a job
 is running. Run it any time with `scripts/converge.sh` (or `--check` to only look).
 
-**Locked-down networks.** The jobs need no package mirrors. They do need Terraform
-providers for `init`; if the job containers cannot reach `registry.terraform.io`:
+**Locked-down networks.** The jobs need no package mirrors, and the NSX provider is
+built into the CI image (pinned in `deploy/ci-image/providers.tf`), so plans
+download nothing. Only the image build fetches it, once; if that fails, converge
+warns and jobs fall back to downloading it. If the job containers cannot reach
+`registry.terraform.io` and the provider is not in the image:
 
 - the `terraform` validate job ends as a **warning** (exit 42), never silently and
   never as a hard failure, and its log says what to set;

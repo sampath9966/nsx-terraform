@@ -295,10 +295,23 @@ build)
 		fi
 	done
 	label="$(printf '%s\n' "$@" | sed -n 's/^nsx.dockerfile=//p')"
+	if ls "${*: -1}"/plugins/registry.terraform.io/vmware/nsxt/*.zip >/dev/null 2>&1; then : >"$d/baked"; else rm -f "$d/baked"; fi
 	echo "nsx-ci:1" >>"$d/local"
 	printf '%s' "$label" >"$d/label.nsx-ci_1"
 	exit 0 ;;
-run) exit 0 ;;
+run)
+	case "$*" in
+	*"providers mirror"*)
+		[ "${FAKE_MIRROR:-ok}" = fail ] && { echo "Error: failed to query provider: request canceled (Client.Timeout exceeded)" >&2; exit 1; }
+		ctx="$(printf '%s\n' "$@" | sed -n 's/:\/ctx$//p')"
+		mkdir -p "$ctx/plugins/registry.terraform.io/vmware/nsxt"
+		: >"$ctx/plugins/registry.terraform.io/vmware/nsxt/terraform-provider-nsxt_3.12.1_linux_amd64.zip"
+		printf '%s\n' "$@" >"$d/mirror-args"
+		exit 0 ;;
+	*/usr/local/share/terraform/plugins*) [ -f "$d/baked" ] ;;
+	*) exit 0 ;;
+	esac
+	exit ;;
 esac
 exit 0
 STUB
@@ -340,5 +353,28 @@ rc=$?
 check "rate-limited with nothing cached: exits non-zero" test "$rc" -ne 0
 check "...names the rate limit and what to do" bash -c 'grep -qi "rate-limiting" <<<"$1" && grep -q "docker login" <<<"$1"' _ "$out"
 check "...after retrying the pull" bash -c '[ "$(grep -c "^pull" "$1/calls")" -ge 3 ]' _ "$FD"
+
+# The NSX provider in the image.
+: >"$FD/local"
+rm -f "$FD"/label.*
+out="$(fd_run)"
+rc=$?
+check "the provider is fetched and built into the image" bash -c '[ "$2" -eq 0 ] && grep -q "vmware/nsxt 3.12.1 inside" <<<"$1"' _ "$out" "$rc"
+check "...for this platform, as the invoking user, through the job network settings" bash -c 'grep -qx -- "-platform=linux_amd64" "$1/mirror-args" && grep -qx -- "--user" "$1/mirror-args" && grep -qx -- "--env-file" "$1/mirror-args"' _ "$FD"
+check "...and the fetched packages are not committed" grep -qx "deploy/ci-image/plugins/" "$T/.gitignore"
+out="$(fd_run)"
+check "an image with the provider inside is current" bash -c '! grep -q "^build" "$1/calls" && grep -q "is current" <<<"$2"' _ "$FD" "$out"
+sed -i 's/version = "3.12.1"/version = "3.12.2"/' "$T/deploy/ci-image/providers.tf"
+out="$(fd_run)"
+check "a new provider pin rebuilds the image" grep -q "out of date" <<<"$out"
+sed -i 's/version = "3.12.2"/version = "3.12.1"/' "$T/deploy/ci-image/providers.tf"
+rm -f "$FD"/label.*
+out="$(fd_run FAKE_MIRROR=fail)"
+rc=$?
+check "a failed fetch still builds a working image, and exits 2" test "$rc" -eq 2
+check "...saying so, with the reason and the fix" bash -c 'grep -q "WITHOUT the NSX provider" <<<"$1" && grep -q "Client.Timeout" <<<"$1" && grep -q "NSX_HTTPS_PROXY" <<<"$1"' _ "$out"
+out="$(fd_run)"
+check "...and the next run tries again and bakes it" bash -c 'grep -q "trying again" <<<"$1" && grep -q "inside)" <<<"$1"' _ "$out"
+check "the pinned provider satisfies the stacks' constraint (~> 3.9)" bash -c 'v="$(sed -n "s/.*version = \"\(.*\)\"/\1/p" "$1/deploy/ci-image/providers.tf")"; grep -rq "\"~> 3.9\"" "$1/stacks" && [ "${v%%.*}" = 3 ] && [ "$(echo "$v" | cut -d. -f2)" -ge 9 ]' _ "$T"
 
 finish ci-scripts
