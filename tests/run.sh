@@ -49,6 +49,8 @@ echo "== gitlab-https.sh certificates and guards"
 tests/https-cert.sh || rc=1
 echo "== brownfield adoption: importer, plan guard, hand-back, per-manager safety"
 tests/brownfield.sh || rc=1
+echo "== change control: approvals, standby approvals, change requests, change log"
+tests/change-control.sh || rc=1
 
 if [ "${1:-}" = "--provider" ]; then
 	echo "== brownfield adoption with the real NSX provider (needs Terraform and registry access)"

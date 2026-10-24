@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.3.1"
+VERSION="1.4.0"
 
 ROOT="$PWD"
 FORCE=0
@@ -2129,7 +2129,9 @@ rather than a trap.
 | `VAULT_PLAN_TOKEN` | **read-only** token | masked |
 | `VAULT_APPLY_TOKEN` | write token | masked, **protected** |
 | `CI_API_TOKEN` | project token, `api` scope, so plans can be posted to the MR | masked |
-| `NSX_APPLY_MODE` | `manual` (default) or `auto` | optional |
+| `NSX_APPLY_MODE` | `manual` (default), `auto`, or `approval` (change control, below) | optional |
+| `NSX_BOT_TOKEN` | change control only: project access token, role **Maintainer**, `api` scope | masked, **protected** |
+| `NSX_REQUIRED_APPROVALS` | change control only: approvals per change (default `2`) | optional |
 
 Without Vault, put the NSX credentials in GitLab instead. The first complete
 pair wins, where `<SITE>` is the manager key upper-cased (`hyd-gm01` is
@@ -2213,6 +2215,70 @@ add it to the inventory, and its plan job appears on the next merge request.
 GitHub Actions does the same thing with `scripts/ci-matrix.py --format github`.
 Both read the same `scripts/ci_matrix_lib.py`, so the two platforms cannot drift
 apart.
+
+## Change control: two approvals before anything reaches NSX
+
+GitLab Community Edition has no enforced approval rules and no deployment
+approvals, so with `NSX_APPLY_MODE=approval` the pipeline enforces them itself
+(`scripts/change-control.py`):
+
+1. **Merge request.** Formatting, validation and the plans run on it. A
+   Maintainer other than its author merges it, or another engineer approves it.
+   Turn on *Settings → Merge requests → Pipelines must succeed*, and set
+   *Settings → Repository → Protected branches* → `main` to **Allowed to
+   merge: Maintainers**, **Allowed to push and merge: No one**.
+2. **Change Request.** On the default branch every manager is planned, then
+   the `change request` job opens an issue (label `nsx-change`) with what each
+   plan changes in NSX, the merge requests in the change, their authors and who
+   reviewed them, and the plans in full. Plans that change nothing open none.
+   Every merge since the last applied change is checked: one that its author
+   merged with no other approval, or a commit that reached `main` without a
+   merge request, **blocks** the change request (label `nsx-blocked`, the
+   pipeline fails), and nothing in it can be applied until that change is
+   reverted or reviewed in a new merge request.
+3. **Approvals.** Approvers give the issue a :thumbsup:. It needs
+   `NSX_REQUIRED_APPROVALS` of them (default 2), each from a **Maintainer** or
+   from an engineer standing in for one, and never from an author of a change
+   in it. A stand-in and the Maintainer they stand in for count once between
+   them.
+4. **Apply.** The `approve and apply` job applies every manager's saved plan
+   and records the result. A Maintainer can start it, or the approvals schedule
+   starts it within minutes of the last approval. Either way it checks the
+   approvals again first, so the button alone approves nothing. It is manual
+   and non-blocking: the pipeline shows **passed** while the change waits.
+5. **Record.** The result goes on the Change Request, which is closed (label
+   `nsx-applied`), or left open marked `nsx-apply-failed` with the error. Each
+   change also adds a line to the wiki page **NSX Change Log**: when, the change
+   request, its merge requests, authors, reviewers, approvers and the result.
+
+A newer change supersedes one still waiting (its plan already holds it); the
+older issue is closed and its approvals do not carry over. Managers in mirror
+mode are not change-controlled: their state follows NSX on its own.
+
+**The approvals schedule.** *Build → Pipeline schedules → New schedule* on the
+default branch, every 5–10 minutes, with the variable `APPROVAL_SWEEP` = `1`.
+It only starts the apply of change requests that already have their approvals.
+
+**Standby approvals.** When a Maintainer is away, they hand their approval to
+another engineer for a set period in `inventory/delegations.yaml`, through a
+merge request like any other change:
+
+```yaml
+delegations:
+  - from: alice        # the Maintainer
+    to: carol          # who approves in their place
+    until: 2026-11-15  # the last day, UTC
+    reason: annual leave
+```
+
+It counts only until `until`, never for a change the Maintainer authored, and
+`make validate` questions one longer than a month.
+
+**Setup**, once: set `NSX_APPLY_MODE=approval`; create a project access token
+(*Settings → Access tokens*, role Maintainer, scope `api`) as `NSX_BOT_TOKEN`;
+keep at least `NSX_REQUIRED_APPROVALS` Maintainers besides any author; create
+the approvals schedule. GitLab only: GitHub Actions keeps its own environment
+approvals.
 
 ## The approver's job
 
@@ -5876,6 +5942,7 @@ import argparse
 import json
 import re
 import sys
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -6125,6 +6192,12 @@ def check_inventory(report: Report) -> dict:
 
     for name, m in managers.items():
         role = m.get("role")
+        if role == "gm" and m.get("domain") not in (None, "default"):
+            report.warn(
+                where,
+                f"{name}: domain {m.get('domain')!r}. On a Global Manager, global objects live in "
+                "domain 'default'; another domain is one location's. Leave it out unless that is the intent.",
+            )
         for stack in m.get("stacks") or []:
             if role == "gm" and stack != "global-security":
                 report.error(where, f"{name}: a Global Manager cannot run the {stack} stack.")
@@ -6135,6 +6208,46 @@ def check_inventory(report: Report) -> dict:
             report.warn(where, f"{name}: no envs/{name}.backend.hcl — nothing can initialise for this manager.")
 
     return managers
+
+
+def check_delegations(managers: dict, report: Report) -> None:
+    """inventory/delegations.yaml: standby approvals for change control
+    (scripts/change-control.py). Each hands one Maintainer's approval to another
+    engineer until a date; the file is reviewed like any change."""
+    path = REPO_ROOT / "inventory" / "delegations.yaml"
+    if not path.exists():
+        return
+    where = "inventory/delegations.yaml"
+    try:
+        doc = load_yaml(path.read_text()) or {}
+    except Exception as exc:  # noqa: BLE001
+        report.error(where, f"unparseable YAML: {exc}")
+        return
+    today = datetime.now(timezone.utc).date()
+    for i, d in enumerate(doc.get("delegations") or []):
+        label = f"delegations[{i}]"
+        if not isinstance(d, dict):
+            report.error(where, f"{label}: expected from, to, until (and a reason)")
+            continue
+        unknown = set(d) - {"from", "to", "until", "reason"}
+        if unknown:
+            report.error(where, f"{label}: unknown key(s) {', '.join(sorted(unknown))}")
+        if not d.get("from") or not d.get("to"):
+            report.error(where, f"{label}: needs both from (the Maintainer) and to (who stands in)")
+        elif d["from"] == d["to"]:
+            report.error(where, f"{label}: {d['from']} cannot stand in for themselves")
+        try:
+            until = date.fromisoformat(str(d.get("until")))
+        except ValueError:
+            report.error(where, f"{label}: until must be a date, YYYY-MM-DD (the last day it applies, UTC)")
+            continue
+        if not d.get("reason"):
+            report.warn(where, f"{label}: no reason given; say why, for whoever reads the approvals later")
+        if until < today:
+            report.warn(where, f"{label}: ended on {until}; remove it")
+        elif (until - today).days > 31:
+            report.warn(where, f"{label}: runs until {until}, more than a month. A standby approval is for a "
+                               "set period; for a lasting change, make the engineer a Maintainer.")
 
 
 def check_tag_scopes(report: Report) -> dict:
@@ -6647,6 +6760,7 @@ def main() -> int:
     check_policies(policy_docs, groups, services, sites, imported, report)
     tagged_vms = check_vm_tags(scopes, sites, report)
     check_env_backends(report)
+    check_delegations(managers, report)
     check_site_files("network", "network.schema.json", scopes, sites, report)
     check_site_files("platform", "platform.schema.json", scopes, sites, report)
 
@@ -11595,6 +11709,10 @@ write_file .gitlab-ci.yml <<'SCAFFOLD_EOF'
 # Mirror mode: a pipeline schedule (or Run pipeline) on the default branch with
 # MIRROR_SITE set runs only the 'mirror' job, which keeps data/ a copy of the
 # managers still run from the UI. docs/IMPORT.md, "Mirror mode".
+#
+# Change control (NSX_APPLY_MODE=approval): a pipeline schedule with
+# APPROVAL_SWEEP=1 runs only the 'approvals' job, which starts the apply of
+# every change request that has its approvals. docs/GITOPS.md.
 
 stages:
   - adopt
@@ -11646,6 +11764,17 @@ adopt:
 # Reads with the read-only plan credential; keeps one merge request per manager
 # up to date; never applies and never pushes to the default branch.
 
+approvals:
+  stage: adopt
+  variables:
+    GIT_DEPTH: "0"
+  script:
+    - python3 scripts/change-control.py sweep
+  resource_group: nsx-approvals
+  interruptible: false
+  rules:
+    - if: $APPROVAL_SWEEP && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
 mirror:
   stage: adopt
   variables:
@@ -11670,6 +11799,8 @@ data:
       when: never
     - if: $MIRROR_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
+    - if: $APPROVAL_SWEEP && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -11689,6 +11820,8 @@ terraform:
       when: never
     - if: $MIRROR_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
+    - if: $APPROVAL_SWEEP && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -11707,6 +11840,8 @@ matrix:
       when: never
     - if: $MIRROR_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
+    - if: $APPROVAL_SWEEP && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -11724,6 +11859,8 @@ managers:
     - if: $ADOPT_SITE && $CI_PIPELINE_SOURCE == "web"
       when: never
     - if: $MIRROR_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+      when: never
+    - if: $APPROVAL_SWEEP && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
@@ -11771,9 +11908,14 @@ MR_SOURCE = os.environ.get("CI_MERGE_REQUEST_SOURCE_BRANCH_NAME", "")
 # lab, or if the merge request approval is the only gate you want. On a
 # production firewall across 10+ managers, keep it manual: an approved merge
 # request says the change is wanted, not that this plan is what to apply now.
+#
+# approval: change control (scripts/change-control.py). The plans raise a Change
+# Request issue; once it has its approvals, ONE 'approve and apply' job applies
+# every manager's plan and records the result. GitLab Community Edition has no
+# enforced approval rules, so the rules are enforced here and in that job.
 APPLY_MODE = os.environ.get("NSX_APPLY_MODE", "manual").strip().lower()
-if APPLY_MODE not in ("manual", "auto"):
-    sys.exit(f"error: NSX_APPLY_MODE must be 'manual' or 'auto', got {APPLY_MODE!r}")
+if APPLY_MODE not in ("manual", "auto", "approval"):
+    sys.exit(f"error: NSX_APPLY_MODE must be 'manual', 'auto' or 'approval', got {APPLY_MODE!r}")
 
 
 def job_name(prefix: str, row: dict) -> str:
@@ -11805,7 +11947,7 @@ def main() -> int:
         return 0
 
     out: list[str] = []
-    out.append("stages: [plan, apply]")
+    out.append("stages: [plan, review, apply]")
     out.append("")
     # A child of a merge request pipeline is itself a merge request pipeline.
     # Jobs with no rules default to 'only: branches, tags', which GitLab leaves
@@ -11833,11 +11975,15 @@ def main() -> int:
         out.append('    - scripts/with-credentials.sh "$SITE" -- scripts/tf.sh plan "$STACK" "$SITE"')
         out.append('    - scripts/tf.sh show "$STACK" "$SITE" | tee "plan-$STACK-$SITE.txt"')
         out.append("    - scripts/post-plan-comment.sh \"$STACK\" \"$SITE\" \"plan-$STACK-$SITE.txt\"")
+        # A copy under the manager's name: a job that takes several plans (the
+        # change control's) would otherwise get one stack's plan per stack.
+        out.append('    - mkdir -p "plans/$SITE/$STACK" && cp "stacks/$STACK/tfplan" "stacks/$STACK/tfplan.site" "plans/$SITE/$STACK/"')
         out.append("  artifacts:")
         out.append("    name: \"plan-$STACK-$SITE\"")
         out.append("    paths:")
         out.append(f'      - stacks/{row["stack"]}/tfplan')
         out.append(f'      - stacks/{row["stack"]}/tfplan.site')
+        out.append(f'      - plans/{row["site"]}/{row["stack"]}/')
         out.append('      - "plan-$STACK-$SITE.txt"')
         out.append("    expire_in: 1 week")
         out.append("    when: always")
@@ -11876,6 +12022,8 @@ def main() -> int:
             out.append('    - scripts/with-credentials.sh "$SITE" -- scripts/tf.sh apply "$STACK" "$SITE"')
             out.append("")
             continue
+        if APPLY_MODE == "approval":
+            continue  # applied by the one 'approve and apply' job, below
 
         apply_job = job_name("apply", row)
         out.append(f'"{apply_job}":')
@@ -11909,6 +12057,52 @@ def main() -> int:
         out.append('    - scripts/with-credentials.sh "$SITE" -- scripts/tf.sh apply "$STACK" "$SITE"')
         out.append("")
 
+    managed = [r for r in rows if r.get("mode") != "mirror"]
+    if APPLY_MODE == "approval" and IS_DEFAULT_BRANCH and managed:
+        # GitLab allows 50 entries in needs; one change request takes them all.
+        if len(managed) + 1 > 50:
+            sys.exit(f"error: {len(managed)} manager stacks: change control needs one job to take every plan, "
+                     "and GitLab allows 50. Split the inventory, or use NSX_APPLY_MODE=manual.")
+        plans = [job_name("plan", r) for r in managed]
+        out.append('"change request":')
+        out.append("  stage: review")
+        out.append("  needs:")
+        for p in plans:
+            out.append(f'    - job: "{p}"')
+            out.append("      artifacts: true")
+        out.append("  variables:")
+        # Full history: every merge since the last applied change is checked.
+        out.append('    GIT_DEPTH: "0"')
+        out.append("  script:")
+        out.append("    - python3 scripts/change-control.py open")
+        out.append("  artifacts:")
+        out.append("    reports:")
+        out.append("      dotenv: change.env")
+        out.append("")
+        out.append(f'"{"approve and apply"}":')
+        out.append("  stage: apply")
+        out.append("  needs:")
+        out.append('    - job: "change request"')
+        out.append("      artifacts: true")
+        for p in plans:
+            out.append(f'    - job: "{p}"')
+            out.append("      artifacts: true")
+        # Started by a Maintainer, or by the approvals sweep once the change
+        # request has its approvals. Either way the job checks them itself
+        # before applying anything. Not blocking: the pipeline ends 'passed'
+        # while the change waits for its approvals.
+        out.append("  when: manual")
+        out.append("  allow_failure: true")
+        out.append("  resource_group: nsx-apply")
+        out.append("  variables:")
+        out.append('    GIT_DEPTH: "0"')
+        out.append("    VAULT_TOKEN: $VAULT_APPLY_TOKEN")
+        out.append("    NSX_CRED_SCOPE: apply")
+        out.append("    APPROVE: \"yes\"")
+        out.append("  script:")
+        out.append("    - scripts/approve-apply.sh")
+        out.append("")
+
     print("\n".join(out))
     return 0
 
@@ -11917,6 +12111,598 @@ if __name__ == "__main__":
     raise SystemExit(main())
 SCAFFOLD_EOF
 mark_executable scripts/gitlab-child-pipeline.py
+
+write_file scripts/change-control.py <<'SCAFFOLD_EOF'
+#!/usr/bin/env python3
+"""Change control on GitLab Community Edition: who may apply a change to NSX,
+and a record of every one that was.
+
+With NSX_APPLY_MODE=approval a change reaches NSX like this:
+
+  1. A merge request passes its checks (format, validation, plans) and is
+     merged into the default branch by another engineer: whoever merges it, or
+     approves it, must not be its author.
+  2. On the default branch every manager is planned, then 'open' raises a
+     Change Request issue: what each plan changes, the merge requests in it, and
+     who wrote and reviewed each one.
+  3. Approvers give the issue a thumbs-up. It needs NSX_REQUIRED_APPROVALS of
+     them (default 2), each from a Maintainer, or from an engineer a Maintainer
+     has handed their approval to for a period (inventory/delegations.yaml);
+     never from the author of a change in it.
+  4. The 'approve and apply' job applies every manager's saved plan. A
+     Maintainer can start it, or 'sweep' (a scheduled job) starts it once the
+     approvals are in. 'gate' checks all of the above again first, whoever
+     started it, so the button alone approves nothing.
+  5. 'record' writes the result on the issue, closes it, and adds a line to the
+     wiki page "NSX Change Log".
+
+  scripts/change-control.py open                                 job 'change request'
+  scripts/change-control.py gate                                 start of 'approve and apply'
+  scripts/change-control.py record --result ok|failed --log FILE end of 'approve and apply'
+  scripts/change-control.py sweep                                job 'approvals', scheduled
+
+A newer change supersedes an older one still waiting: the newer plan already
+holds every change on the branch, so the older issue is closed and its
+approvals do not carry over.
+
+Needs NSX_BOT_TOKEN (or NSX_ADOPT_TOKEN): a project access token with the api
+scope and the Maintainer role. Exit status: 0 done or approved, 2 refused,
+3 nothing to approve, 1 error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import date, datetime, timezone
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ci_matrix_lib import entries  # noqa: E402
+from yamlcompat import load_yaml  # noqa: E402
+
+LABEL = "nsx-change"
+AWAITING = "nsx-awaiting-approval"
+APPLYING = "nsx-applying"
+APPLIED = "nsx-applied"
+FAILED = "nsx-apply-failed"
+SUPERSEDED = "nsx-superseded"
+BLOCKED = "nsx-blocked"
+WIKI_SLUG = "NSX-Change-Log"
+WIKI_TITLE = "NSX Change Log"
+APPROVE_JOB = "approve and apply"
+MAINTAINER = 40
+DEVELOPER = 30
+MARK = re.compile(r"<!-- nsx-change pipeline=(\d+) sha=([0-9a-f]{7,40}) -->")
+BOT = re.compile(r"^(project|group)_\d+_bot")
+DELEGATIONS = REPO_ROOT / "inventory" / "delegations.yaml"
+STATE = REPO_ROOT / "change-approvals.json"
+PLAN_LINES = 300
+
+
+def die(message: str, code: int = 1) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+class GitLab:
+    """The few calls this needs, with the token in a header and GitLab's CA."""
+
+    def __init__(self) -> None:
+        self.api = os.environ.get("CI_API_V4_URL", "").rstrip("/")
+        self.project = os.environ.get("CI_PROJECT_ID", "")
+        self.token = os.environ.get("NSX_BOT_TOKEN") or os.environ.get("NSX_ADOPT_TOKEN") or ""
+        if not (self.api and self.project):
+            die("CI_API_V4_URL and CI_PROJECT_ID are not set: this runs in a GitLab job")
+        if not self.token:
+            die("NSX_BOT_TOKEN is not set: a project access token, role Maintainer, scope api, masked and protected")
+        ca = os.environ.get("CI_SERVER_TLS_CA_FILE")
+        self.ctx = ssl.create_default_context(cafile=ca) if ca and Path(ca).is_file() else ssl.create_default_context()
+        # An internal CA without keyUsage is fine for GitLab's runner and git;
+        # Python 3.13's strict checks would refuse it. Chain and name still checked.
+        self.ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+
+    def call(self, method: str, path: str, body: dict | None = None, query: dict | None = None,
+             missing_ok: bool = False):
+        url = f"{self.api}/projects/{urllib.parse.quote(self.project, safe='')}{path}"
+        if query:
+            url += "?" + urllib.parse.urlencode(query, doseq=True)
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(url, data=data, method=method)
+        request.add_header("PRIVATE-TOKEN", self.token)
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(request, context=self.ctx, timeout=60) as response:
+                text = response.read().decode() or "null"
+                return json.loads(text), response.headers
+        except urllib.error.HTTPError as exc:
+            if missing_ok and exc.code == 404:
+                return None, exc.headers
+            detail = exc.read().decode(errors="replace")[:300]
+            die(f"GitLab API {method} {path}: HTTP {exc.code} {detail}")
+        except urllib.error.URLError as exc:
+            die(f"GitLab API {method} {path}: {exc.reason}")
+
+    def get(self, path: str, query: dict | None = None, missing_ok: bool = False):
+        return self.call("GET", path, query=query, missing_ok=missing_ok)[0]
+
+    def get_all(self, path: str, query: dict | None = None) -> list:
+        out: list = []
+        page = "1"
+        while page:
+            data, headers = self.call("GET", path, query=dict(query or {}, per_page=100, page=page))
+            out.extend(data or [])
+            page = (headers.get("X-Next-Page") or "").strip()
+        return out
+
+    def note(self, iid: int, body: str) -> None:
+        self.call("POST", f"/issues/{iid}/notes", {"body": body})
+
+    def labels(self, iid: int, *names: str, close: bool = False) -> None:
+        body: dict = {"labels": ",".join((LABEL,) + names)}
+        if close:
+            body["state_event"] = "close"
+        self.call("PUT", f"/issues/{iid}", body)
+
+
+# --- who may approve ---------------------------------------------------------
+
+def members(gl: GitLab) -> dict[str, int]:
+    """username -> access level, inherited membership included; bots left out."""
+    return {m["username"]: int(m.get("access_level", 0)) for m in gl.get_all("/members/all")
+            if not BOT.match(m.get("username", ""))}
+
+
+def delegations(today: date) -> list[dict]:
+    """The standby approvals in force today: a Maintainer's approval handed to
+    another engineer until a date (inclusive, UTC)."""
+    if not DELEGATIONS.exists():
+        return []
+    doc = load_yaml(DELEGATIONS.read_text()) or {}
+    active = []
+    for d in doc.get("delegations") or []:
+        try:
+            until = date.fromisoformat(str(d.get("until")))
+        except ValueError:
+            continue
+        if d.get("from") and d.get("to") and today <= until:
+            active.append({"from": str(d["from"]), "to": str(d["to"]), "until": until.isoformat()})
+    return active
+
+
+def principal(user: str, authors: set[str], levels: dict[str, int], standby: list[dict]) -> tuple[str | None, str]:
+    """Whose approval a thumbs-up from user counts as, and why or why not."""
+    if user in authors:
+        return None, "an author of a change in it"
+    if levels.get(user, 0) >= MAINTAINER:
+        return user, "Maintainer"
+    for d in standby:
+        if d["to"] != user:
+            continue
+        if d["from"] in authors:
+            continue
+        if levels.get(d["from"], 0) >= MAINTAINER and levels.get(user, 0) >= DEVELOPER:
+            return d["from"], f"standing in for {d['from']} until {d['until']}"
+    return None, "not a Maintainer, and no standby approval in force"
+
+
+def approvals(gl: GitLab, iid: int, authors: set[str]) -> tuple[list[tuple[str, str, str]], list[tuple[str, str]]]:
+    """(accepted: user, counts as, why), (not counted: user, why). Each person
+    counts once, and a stand-in and the Maintainer they stand in for count once
+    between them."""
+    levels = members(gl)
+    standby = delegations(datetime.now(timezone.utc).date())
+    accepted: list[tuple[str, str, str]] = []
+    rejected: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for emoji in gl.get_all(f"/issues/{iid}/award_emoji"):
+        if emoji.get("name") not in ("thumbsup", "+1"):
+            continue
+        user = (emoji.get("user") or {}).get("username", "")
+        who, why = principal(user, authors, levels, standby)
+        if who is None:
+            rejected.append((user, why))
+        elif who in seen:
+            rejected.append((user, f"counts as {who}, who is counted already"))
+        else:
+            seen.add(who)
+            accepted.append((user, who, why))
+    return accepted, rejected
+
+
+def required() -> int:
+    try:
+        n = int(os.environ.get("NSX_REQUIRED_APPROVALS", "2"))
+    except ValueError:
+        die("NSX_REQUIRED_APPROVALS must be a whole number")
+    if n < 1:
+        die("NSX_REQUIRED_APPROVALS must be at least 1")
+    return n
+
+
+# --- what is in the change, and was it reviewed --------------------------------
+
+def git(*args: str) -> str:
+    return subprocess.run(["git", *args], cwd=REPO_ROOT, capture_output=True, text=True, check=False).stdout.strip()
+
+
+def last_applied(gl: GitLab) -> str | None:
+    found = gl.get("/issues", {"labels": f"{LABEL},{APPLIED}", "state": "closed",
+                               "order_by": "updated_at", "sort": "desc", "per_page": 1}) or []
+    for issue in found:
+        mark = MARK.search(issue.get("description") or "")
+        if mark:
+            return mark.group(2)
+    return None
+
+
+def commits_since(last: str | None, head: str) -> list[str]:
+    """The default branch's own commits since the last applied change, oldest
+    first. Without that history (first change, or rewritten), just this one."""
+    if last and subprocess.run(["git", "merge-base", "--is-ancestor", last, head], cwd=REPO_ROOT,
+                               capture_output=True).returncode == 0:
+        listed = git("log", "--first-parent", "--reverse", "--format=%H", f"{last}..{head}").split()
+        if listed:
+            return listed
+    return [head]
+
+
+def review(gl: GitLab, head: str) -> tuple[list[dict], list[str]]:
+    """Every merge request in this change, and what breaks the rule that another
+    engineer reviewed each: merged it, or approved it."""
+    branch = os.environ.get("CI_DEFAULT_BRANCH", "main")
+    changes: dict[int, dict] = {}
+    problems: list[str] = []
+    for sha in commits_since(last_applied(gl), head):
+        merged = [m for m in gl.get(f"/repository/commits/{sha}/merge_requests") or []
+                  if m.get("state") == "merged" and m.get("target_branch", branch) == branch]
+        if not merged:
+            problems.append(f"commit {sha[:8]} reached {branch} without a merge request")
+            continue
+        mr = merged[0]
+        if mr["iid"] in changes:
+            continue
+        author = (mr.get("author") or {}).get("username", "")
+        merger = (mr.get("merge_user") or mr.get("merged_by") or {}).get("username")
+        approved = gl.get(f"/merge_requests/{mr['iid']}/approvals") or {}
+        approvers = [(a.get("user") or {}).get("username") for a in approved.get("approved_by") or []]
+        reviewers = sorted({u for u in [merger, *approvers] if u and u != author})
+        changes[mr["iid"]] = {"iid": mr["iid"], "title": mr.get("title", ""), "url": mr.get("web_url", ""),
+                              "author": author, "reviewers": reviewers}
+        if not reviewers:
+            problems.append(f"!{mr['iid']} ({mr.get('title', '')}) was merged by its author {author}, "
+                            "and no other engineer approved it")
+    return list(changes.values()), problems
+
+
+# --- the plans ---------------------------------------------------------------
+
+def plan_summary(text: str | None) -> tuple[str, bool]:
+    """(what the plan says, whether applying it changes anything)."""
+    if text is None:
+        return "no plan (its job did not produce one)", False
+    for line in text.splitlines():
+        if line.startswith("Plan:"):
+            return line.strip(), True
+        if line.startswith("No changes"):
+            return "No changes.", False
+    return "only output values change", False
+
+
+def targets() -> list[dict]:
+    """Managers this change control applies to: not those in mirror mode, whose
+    state follows NSX on its own."""
+    return [r for r in entries(None) if r["mode"] != "mirror"]
+
+
+def plans() -> list[tuple[dict, str, bool, str | None]]:
+    out = []
+    for row in targets():
+        path = REPO_ROOT / f"plan-{row['stack']}-{row['site']}.txt"
+        text = path.read_text() if path.exists() else None
+        summary, changes = plan_summary(text)
+        out.append((row, summary, changes, text))
+    return out
+
+
+# --- commands ----------------------------------------------------------------
+
+def mention(users) -> str:
+    return ", ".join(f"@{u}" for u in users) or "nobody"
+
+
+def cmd_open(gl: GitLab) -> int:
+    pipeline = os.environ.get("CI_PIPELINE_ID", "")
+    head = os.environ.get("CI_COMMIT_SHA") or git("rev-parse", "HEAD")
+    dotenv = REPO_ROOT / "change.env"
+    found = plans()
+    if not any(changes for _, _, changes, _ in found):
+        dotenv.write_text("CHANGE_ISSUE=\n")
+        print("Nothing to approve: no plan changes anything in NSX.")
+        return 0
+
+    # A newer change holds every older one still waiting: close those.
+    for issue in gl.get_all("/issues", {"labels": LABEL, "state": "opened"}):
+        mark = MARK.search(issue.get("description") or "")
+        if mark and mark.group(1) != pipeline and APPLYING not in issue.get("labels", []):
+            gl.note(issue["iid"], f"Superseded: the default branch has moved on, and the change request for "
+                                   f"pipeline {pipeline} holds this change too. Approve that one instead.")
+            gl.labels(issue["iid"], SUPERSEDED, close=True)
+
+    changes, problems = review(gl, head)
+    authors = sorted({c["author"] for c in changes})
+    title_parts = [c["title"] for c in changes] or [f"default branch at {head[:8]}"]
+    title = "NSX change: " + "; ".join(title_parts)
+    if len(title) > 200:
+        title = title[:197] + "..."
+
+    lines = [f"<!-- nsx-change pipeline={pipeline} sha={head} -->",
+             f"**Change Request** for `{head[:8]}` on `{os.environ.get('CI_DEFAULT_BRANCH', 'main')}`"
+             f" ([pipeline]({os.environ.get('CI_PIPELINE_URL', '')})).", "",
+             "### What changes in NSX", "", "| Manager | Stack | Plan |", "|---|---|---|"]
+    for row, summary, _, _ in found:
+        lines.append(f"| {row['site']} | {row['stack']} | {summary} |")
+    lines += ["", "### Merge requests in it", "", "| | Title | Author | Reviewed by |", "|---|---|---|---|"]
+    for c in changes:
+        lines.append(f"| [!{c['iid']}]({c['url']}) | {c['title']} | @{c['author']} | {mention(c['reviewers'])} |")
+    if problems:
+        lines += ["", "### Blocked: not every change was reviewed", ""]
+        lines += [f"- {p}" for p in problems]
+        lines += ["", "Nothing here can be applied. Revert the change, or open a merge request that another "
+                      "engineer reviews; the next change request on the default branch replaces this one."]
+    else:
+        lines += ["", "### Approve", "",
+                  f"Give this issue a :thumbsup:. It needs **{required()}** approval(s), each from a Maintainer, "
+                  "or from an engineer standing in for one (`inventory/delegations.yaml`), and never from an author "
+                  f"of a change in it ({mention(authors)}).", "",
+                  f"Then the **{APPROVE_JOB}** job in the pipeline applies it: a Maintainer can start it, or the "
+                  "approvals schedule starts it within minutes. The approvals are checked again before anything "
+                  "is applied."]
+    lines += ["", "### Plans", ""]
+    for row, summary, _, text in found:
+        body = (text or "").splitlines()
+        shown = body[:PLAN_LINES]
+        more = f"\n... {len(body) - PLAN_LINES} more line(s) in the plan job's log" if len(body) > PLAN_LINES else ""
+        lines += [f"<details><summary>{row['site']} / {row['stack']}: {summary}</summary>", "", "```",
+                  *shown, "```" + more, "", "</details>", ""]
+
+    issue, _ = gl.call("POST", "/issues", {"title": title, "description": "\n".join(lines),
+                                           "labels": ",".join((LABEL, BLOCKED if problems else AWAITING))})
+    dotenv.write_text(f"CHANGE_ISSUE={issue['iid']}\n")
+    print(f"change request: {issue.get('web_url', issue['iid'])}")
+    if problems:
+        print("BLOCKED: not every change was reviewed by another engineer:")
+        for p in problems:
+            print(f"  - {p}")
+        return 2
+    return 0
+
+
+def check(gl: GitLab, iid: int, pipeline: str | None) -> tuple[dict, list[dict], list[tuple[str, str, str]], list[tuple[str, str]], list[str]]:
+    """Everything that must hold before an apply. Returns the issue, its changes,
+    the approvals counted and not, and what refuses it (empty when it may go)."""
+    issue = gl.get(f"/issues/{iid}")
+    mark = MARK.search(issue.get("description") or "")
+    refusals: list[str] = []
+    if not mark:
+        die(f"issue #{iid} is not a change request")
+    if pipeline and mark.group(1) != str(pipeline):
+        refusals.append(f"issue #{iid} is the change request of pipeline {mark.group(1)}, not this one")
+    labels = set(issue.get("labels") or [])
+    if issue.get("state") != "opened" or labels & {SUPERSEDED, BLOCKED, APPLIED}:
+        refusals.append(f"change request #{iid} is {issue.get('state')} ({', '.join(sorted(labels)) or 'no labels'})")
+    changes, problems = review(gl, mark.group(2))
+    refusals += problems
+    authors = {c["author"] for c in changes}
+    accepted, rejected = approvals(gl, iid, authors)
+    need = required()
+    if len(accepted) < need:
+        refusals.append(f"{len(accepted)} of {need} approval(s)")
+    return issue, changes, accepted, rejected, refusals
+
+
+def show_approvals(accepted, rejected) -> None:
+    for user, who, why in accepted:
+        print(f"  counted      @{user} ({why})")
+    for user, why in rejected:
+        print(f"  not counted  @{user}: {why}")
+
+
+def cmd_gate(gl: GitLab) -> int:
+    iid = os.environ.get("CHANGE_ISSUE", "").strip()
+    if not iid:
+        print("Nothing to approve: no plan in this pipeline changes anything in NSX.")
+        return 3
+    issue, changes, accepted, rejected, refusals = check(gl, int(iid), os.environ.get("CI_PIPELINE_ID"))
+    print(f"change request #{iid}: {issue.get('title', '')}")
+    show_approvals(accepted, rejected)
+    if refusals:
+        print("REFUSED:")
+        for r in refusals:
+            print(f"  - {r}")
+        return 2
+    STATE.write_text(json.dumps({"issue": int(iid), "changes": changes,
+                                 "approved": [{"user": u, "as": w, "why": y} for u, w, y in accepted]}))
+    gl.labels(int(iid), APPLYING)
+    gl.note(int(iid), f"Approved by {mention(u for u, _, _ in accepted)}. Applying: {os.environ.get('CI_JOB_URL', 'this pipeline')}")
+    print("approved: applying.")
+    return 0
+
+
+def cmd_record(gl: GitLab, result: str, log: Path) -> int:
+    if not STATE.exists():
+        die("nothing to record: the gate did not approve this job")
+    state = json.loads(STATE.read_text())
+    iid = state["issue"]
+    text = log.read_text() if log.exists() else ""
+    rows, target = [], None
+    for line in text.splitlines():
+        if line.startswith("== "):
+            target = line[3:].strip()
+            if target.endswith("no changes, skipped"):
+                rows.append((target.split(":")[0], "no changes, skipped"))
+                target = None
+        elif target and ("Apply complete!" in line or line.startswith("Error:") or "refusing to apply" in line):
+            rows.append((target, line.strip()))
+            target = None
+    if target:
+        rows.append((target, "did not finish"))
+    job = os.environ.get("CI_JOB_URL", "")
+    approved = state["approved"]
+    who = ", ".join(f"@{a['user']}" + (f" (for @{a['as']})" if a["as"] != a["user"] else "") for a in approved)
+    body = [f"**{'Applied' if result == 'ok' else 'Apply FAILED'}** by [{APPROVE_JOB}]({job}). Approved by {who}.", "",
+            "| Target | Result |", "|---|---|", *(f"| {t} | {r} |" for t, r in rows)]
+    if result != "ok":
+        tail = text.splitlines()[-40:]
+        body += ["", "Last lines of the apply:", "```", *tail, "```", "",
+                 "The issue stays open. Fix the cause in a merge request; its change request replaces this one."]
+    gl.note(iid, "\n".join(body))
+    if result == "ok":
+        gl.labels(iid, APPLIED, close=True)
+    else:
+        gl.labels(iid, FAILED)
+
+    # The change log: one line per change, newest last.
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    issue_url = gl.get(f"/issues/{iid}").get("web_url", "")
+    changes = state["changes"]
+    mrs = ", ".join("!" + str(c["iid"]) for c in changes) or "-"
+    row = (f"| {stamp} | [#{iid}]({issue_url}) | {mrs} "
+           f"| {mention(sorted({c['author'] for c in changes}))} "
+           f"| {mention(sorted({r for c in changes for r in c['reviewers']}))} | {who} "
+           f"| {'applied' if result == 'ok' else 'FAILED'} | [job]({job}) |")
+    page = gl.get(f"/wikis/{WIKI_SLUG}", missing_ok=True)
+    if page is None:
+        content = "\n".join([f"# {WIKI_TITLE}", "",
+                             "Every change applied to NSX through the pipeline, written by scripts/change-control.py.", "",
+                             "| When | Change request | Merge requests | Authors | Reviewed by | Approved by | Result | Job |",
+                             "|---|---|---|---|---|---|---|---|", row, ""])
+        gl.call("POST", "/wikis", {"title": WIKI_TITLE, "content": content})
+    else:
+        gl.call("PUT", f"/wikis/{WIKI_SLUG}", {"title": WIKI_TITLE, "content": page["content"].rstrip("\n") + "\n" + row + "\n"})
+    print(f"recorded on #{iid} and in the wiki page {WIKI_TITLE}.")
+    return 0
+
+
+def cmd_sweep(gl: GitLab) -> int:
+    started = 0
+    for issue in gl.get_all("/issues", {"labels": f"{LABEL},{AWAITING}", "state": "opened"}):
+        iid = issue["iid"]
+        mark = MARK.search(issue.get("description") or "")
+        if not mark:
+            continue
+        _, _, accepted, rejected, refusals = check(gl, iid, None)
+        if refusals:
+            print(f"#{iid}: waiting ({'; '.join(refusals)})")
+            continue
+        jobs = gl.get_all(f"/pipelines/{mark.group(1)}/jobs", {"scope[]": "manual"})
+        job = next((j for j in jobs if j.get("name") == APPROVE_JOB), None)
+        if not job:
+            print(f"#{iid}: approved, but pipeline {mark.group(1)} has no '{APPROVE_JOB}' job waiting")
+            continue
+        gl.labels(iid, APPLYING)
+        played, _ = gl.call("POST", f"/jobs/{job['id']}/play")
+        gl.note(iid, f"Approvals complete ({mention(u for u, _, _ in accepted)}): started "
+                     f"[{APPROVE_JOB}]({(played or {}).get('web_url', job.get('web_url', ''))}).")
+        print(f"#{iid}: approved, apply started")
+        started += 1
+    print(f"{started} change(s) started.")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="command", required=True)
+    sub.add_parser("open")
+    sub.add_parser("gate")
+    rec = sub.add_parser("record")
+    rec.add_argument("--result", choices=["ok", "failed"], required=True)
+    rec.add_argument("--log", type=Path, required=True)
+    sub.add_parser("sweep")
+    args = ap.parse_args()
+    gl = GitLab()
+    if args.command == "open":
+        return cmd_open(gl)
+    if args.command == "gate":
+        return cmd_gate(gl)
+    if args.command == "record":
+        return cmd_record(gl, args.result, args.log)
+    return cmd_sweep(gl)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+SCAFFOLD_EOF
+mark_executable scripts/change-control.py
+
+write_file scripts/approve-apply.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# The 'approve and apply' job of NSX_APPLY_MODE=approval: one per change.
+#
+#   scripts/approve-apply.sh
+#
+# 1. scripts/change-control.py gate: the change request has its approvals and
+#    every change in it was reviewed. Whoever started this job, nothing below
+#    runs otherwise.
+# 2. Each manager's saved plan, in inventory order, through scripts/tf.sh apply
+#    (which runs plan-guard again). A manager whose plan changes nothing is
+#    skipped. The first failure stops the rest.
+# 3. scripts/change-control.py record: the result on the change request, and a
+#    line in the wiki change log, whether it worked or not.
+#
+# Plans arrive as artifacts under plans/<site>/<stack>/, so two managers that
+# share a stack keep their own plan.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT" || exit 1
+
+python3 scripts/change-control.py gate
+rc=$?
+[ "$rc" -eq 3 ] && exit 0
+[ "$rc" -eq 0 ] || exit "$rc"
+
+log="$REPO_ROOT/apply.log"
+: >"$log"
+status=ok
+while read -r site stack _; do
+	[ -n "$site" ] || continue
+	text="plan-$stack-$site.txt"
+	if ! grep -q '^Plan:' "$text" 2>/dev/null; then
+		echo "== $site/$stack: no changes, skipped" | tee -a "$log"
+		continue
+	fi
+	echo "== $site/$stack" | tee -a "$log"
+	if ! cp "plans/$site/$stack/tfplan" "plans/$site/$stack/tfplan.site" "stacks/$stack/" 2>>"$log"; then
+		echo "error: no saved plan for $site/$stack in this pipeline" | tee -a "$log"
+		status=failed
+		break
+	fi
+	if ! scripts/with-credentials.sh "$site" -- scripts/tf.sh apply "$stack" "$site" 2>&1 | tee -a "$log"; then
+		status=failed
+		break
+	fi
+done < <(python3 scripts/ci-matrix.py --format lines --managed-only)
+
+if ! python3 scripts/change-control.py record --result "$status" --log "$log"; then
+	echo "error: the result could not be recorded on the change request; record it by hand." >&2
+	exit 1
+fi
+[ "$status" = ok ]
+SCAFFOLD_EOF
+mark_executable scripts/approve-apply.sh
 
 fi # wants_ci gitlab
 
