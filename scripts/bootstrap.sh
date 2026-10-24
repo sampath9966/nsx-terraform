@@ -1416,6 +1416,20 @@ state. If an engineer changed the manager after the sync read it, the plan
 differs from the copy; it is refused, nothing is pushed back onto NSX, and the
 next sync brings the change in.
 
+**Every UI change becomes an issue to investigate.** When a sync finds that
+engineers changed the manager since the copy on the default branch, it also
+raises a GitLab issue labelled `nsx-drift` and `site:<site>`. The issue lists
+each object added, changed or deleted, what changed in it (`action ALLOW → DROP`,
+`source_groups +App-Web`), and who last changed it and when, as NSX records them.
+It also has a checklist: who made the change and why, keep it or revert it, and
+whether it should have come through a merge request. That is the tracker for
+the observation period: close each issue once its changes are explained. A
+change is raised once, however many syncs see it; a further change to the same
+object is raised again. The first copy of a manager is its baseline, not drift.
+An object nobody touched in NSX since the last copy is not raised either, so
+an importer upgrade that can take over more objects does not flood the tracker.
+Filter the board on the `nsx-drift` label.
+
 It needs `NSX_ADOPT_TOKEN`, as the adopt job. An unchanged manager rewrites the
 same bytes, so a quiet manager produces no merge requests. Objects declared in any
 other file (adopted by hand, or written by you) are left to that file and listed
@@ -1450,21 +1464,43 @@ the UI into something the importer cannot represent leaves the copy but not
 state, so its plan shows a destroy and is refused every time: hand it back
 (below) to stop managing it.
 
-**Cut over** when the team is ready to stop changing that manager by hand:
+**Cut over** when the team is ready to stop changing that manager by hand. The
+imported copy is not a report: it becomes the configuration, and engineers
+change it, and add to it, like anything they wrote themselves.
 
-1. Agree a short freeze on UI changes for that manager.
+1. Agree a freeze on UI changes for that manager, and explain its open
+   `nsx-drift` issues.
 2. Run the sync (*Run pipeline*, `MIRROR_SITE` = the manager), merge its merge
-   request, and let `sync-state` finish. The plan must report no changes.
-3. In a merge request, change the manager's `mode: mirror` to `mode: managed`
-   (or remove the line). State already holds everything, so there is nothing
-   to apply.
-4. In a merge request, delete `stacks/<stack>/import-<site>-mirror.tf`. The data
-   files stay; they are now the source of truth. Their first line may stay or
-   go: the mirror job refuses managers in managed mode.
+   request, and let `sync-state` finish.
+3. *Run pipeline* on the default branch with `CUTOVER_SITE` = the manager. The
+   `cutover` job (`scripts/cutover.sh`):
+   - reads the manager and stops if anything changed in the UI since the sync;
+   - turns its copy into ordinary data files: the "do not edit" header goes,
+     `imported-<site>-mirror.yaml` becomes `imported-<site>.yaml`, and the import
+     blocks are deleted, since state already holds every object;
+   - sets `mode: managed` in the inventory;
+   - plans every stack of the manager with exactly that, and stops unless each
+     plan changes nothing at all;
+   - opens the merge request **Cut <site> over to managed**.
+4. Merge it. That is the cutover. Nothing is applied: there is nothing to apply.
 
-From then on, changes go through merge requests. A change made in the UI shows
-in the next plan as a difference Terraform would undo, and `scripts/drift.sh`
-reports it.
+From then on, for that manager:
+
+- **Change an imported object** by editing it in its file: a rule in
+  `data/policies/<policy-id>.yaml`, a group in `data/groups/imported-<site>.yaml`.
+  **Add** rules to an imported policy in the same file (`scripts/add-rule.py`),
+  and new groups, services and policies in new files. The plan shows exactly
+  that change, and it goes through review and change control like any other.
+- Imported objects keep the ids NSX gave them (`_h-app01`, spaces and all); a
+  new object you write follows the naming convention, which the validator
+  enforces.
+- **A change made in the UI is drift.** Schedule the `drift` job: *Build →
+  Pipeline schedules*, on the default branch, with `DRIFT_SITE` = `all` (every
+  manager in mode: managed) or one manager, every hour or so. It runs a
+  refresh-only plan per manager and stack with the read-only credential,
+  changes nothing, and raises each change as an `nsx-drift` issue, with who made
+  it and when, as in mirror mode. Either bring the change into `data/` in a
+  merge request, or the next apply puts NSX back to the repository.
 
 ## 1. Capture, read-only
 
@@ -5024,6 +5060,7 @@ write_file scripts/tf.sh <<'SCAFFOLD_EOF'
 #   scripts/tf.sh plan   <stack> <site>
 #   scripts/tf.sh show   <stack> <site>
 #   scripts/tf.sh apply  <stack> <site>     # requires APPROVE=yes
+#   scripts/tf.sh drift  <stack> <site>     # refresh-only plan: exit 2 on drift
 #
 # Credentials are never read from a file here. Either they are already in the
 # environment as NSXT_MANAGER_HOST / NSXT_USERNAME / NSXT_PASSWORD, or you wrap
@@ -5037,7 +5074,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PARALLELISM="${PARALLELISM:-5}"
 
 usage() {
-	sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+	sed -n '3,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 	exit "${1:-1}"
 }
 
@@ -5263,6 +5300,21 @@ apply)
 	fi
 	run apply -parallelism="$PARALLELISM" -input=false tfplan
 	rm -f "$plan_file" "$plan_site_file"
+	;;
+drift)
+	# Refresh-only: state against the live manager. Proposes nothing and
+	# changes nothing; never touches the reviewed tfplan. With DRIFT_JSON set,
+	# the plan is also written there as JSON. Exit 0 no drift, 2 drift.
+	ensure_init
+	set +e
+	run plan -refresh-only -detailed-exitcode -input=false -out=drift.tfplan "$@"
+	status=$?
+	set -e
+	if [ "$status" = 2 ] && [ -n "${DRIFT_JSON:-}" ]; then
+		run show -json drift.tfplan >"$DRIFT_JSON" || status=1
+	fi
+	rm -f "$stack_dir/drift.tfplan"
+	exit "$status"
 	;;
 *)
 	usage 1
@@ -8968,6 +9020,10 @@ write_file scripts/mirror.sh <<'SCAFFOLD_EOF'
 # they have no apply job, and their sync-state job only imports and refreshes
 # Terraform's state, with the read-only credential, until mode: managed.
 #
+# Changes engineers made in the UI since the copy on the default branch are
+# also raised as a GitLab issue, labelled nsx-drift (scripts/drift-issue.py):
+# who changed what and when, to investigate during the observation period.
+#
 # Needs NSX_ADOPT_TOKEN, as the adopt job: a project access token with the api
 # and write_repository scopes. Masked and protected.
 
@@ -9141,7 +9197,7 @@ if not e["NEW"]:
 json.dump(body, open(sys.argv[1], "w"))
 PY
 	if [ -n "$open_mr" ]; then
-		gitlab PUT "/merge_requests/$open_mr" "$work/mr.json" >/dev/null || { failed+=("$site"); continue; }
+		response="$(gitlab PUT "/merge_requests/$open_mr" "$work/mr.json")" || { failed+=("$site"); continue; }
 		iid="$open_mr"
 		echo "updated merge request !$iid"
 	else
@@ -9152,6 +9208,14 @@ PY
 		}
 		iid="$(json_field iid <<<"$response")"
 		echo "merge request: $(json_field web_url <<<"$response")"
+	fi
+
+	# What engineers changed in the UI since the copy on the default branch,
+	# raised as an issue to investigate. A failure here is reported, not fatal:
+	# the merge request already carries the changes.
+	if ! python3 scripts/drift-issue.py mirror --site "$site" --base "$base" --dump "$dump" \
+		--link "$(json_field web_url <<<"$response")"; then
+		echo "warning: the drift issue for $site could not be raised (above)" >&2
 	fi
 
 	if [ "${MIRROR_AUTO_MERGE:-}" = 1 ] && [ -n "$iid" ]; then
@@ -9181,6 +9245,409 @@ fi
 SCAFFOLD_EOF
 mark_executable scripts/mirror.sh
 
+write_file scripts/drift-issue.py <<'SCAFFOLD_EOF'
+#!/usr/bin/env python3
+"""Raise a GitLab issue for changes made in NSX outside this repository, so
+each one is investigated: who made it, why, and whether it stays.
+
+  scripts/drift-issue.py mirror --site S --base REF --dump FILE [--link URL]
+      Run by scripts/mirror.sh after it rewrote a manager's mirror files:
+      compares them, object by object, with REF (the default branch).
+  scripts/drift-issue.py plan --site S --stack STACK --plan-json FILE [--link URL]
+      Run by scripts/drift-job.sh for a manager in mode: managed: the drift
+      a refresh-only plan found (NSX no longer matches Terraform's state).
+
+One issue per run that found something new, labelled nsx-drift and
+site:<site>. It lists each object, what changed, and who last changed it and
+when, as NSX records them on every object it still has. That is the tracker
+for the observation period: close an issue once every change in it is
+explained.
+
+Each object is reported once per version. The next run seeing the same change
+does not report it again (the issues themselves are the record, nothing else
+is kept); a further change to the same object is reported. In mirror mode:
+
+  * The first copy of a manager is its baseline, not drift.
+  * A difference whose object NSX says nobody modified since the copy on REF
+    (less an hour, the time a sync may take) is not drift either: it comes from
+    the repository side, typically an object a newer importer can take over
+    for the first time.
+
+Needs NSX_BOT_TOKEN or NSX_ADOPT_TOKEN (scope api). Exit status: 0 done
+(issue raised, or nothing new), 1 error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from yamlcompat import load_yaml  # noqa: E402
+
+LABEL = "nsx-drift"
+MIRROR_MARK = "# nsx-mirror: "
+MARK = re.compile(r"<!-- nsx-drift object=([0-9a-f]{16}) version=([0-9a-f]{16}) -->")
+MAX_ROWS = 300
+SYNC_MARGIN = 3600  # seconds: a sync reads the manager this long, at most, before its commit
+
+
+def die(message: str) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def digest(value) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+class GitLab:
+    def __init__(self) -> None:
+        self.api = os.environ.get("CI_API_V4_URL", "").rstrip("/")
+        self.project = os.environ.get("CI_PROJECT_ID", "")
+        self.token = os.environ.get("NSX_BOT_TOKEN") or os.environ.get("NSX_ADOPT_TOKEN") or ""
+        if not (self.api and self.project):
+            die("CI_API_V4_URL and CI_PROJECT_ID are not set: this runs in a GitLab job")
+        if not self.token:
+            die("NSX_BOT_TOKEN (or NSX_ADOPT_TOKEN) is not set: a project access token with the api scope")
+        ca = os.environ.get("CI_SERVER_TLS_CA_FILE")
+        self.ctx = ssl.create_default_context(cafile=ca) if ca and Path(ca).is_file() else ssl.create_default_context()
+        self.ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+
+    def call(self, method: str, path: str, body: dict | None = None, query: dict | None = None):
+        url = f"{self.api}/projects/{urllib.parse.quote(self.project, safe='')}{path}"
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(url, data=data, method=method)
+        request.add_header("PRIVATE-TOKEN", self.token)
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(request, context=self.ctx, timeout=60) as response:
+                return json.loads(response.read().decode() or "null"), response.headers
+        except urllib.error.HTTPError as exc:
+            die(f"GitLab API {method} {path}: HTTP {exc.code} {exc.read().decode(errors='replace')[:300]}")
+        except urllib.error.URLError as exc:
+            die(f"GitLab API {method} {path}: {exc.reason}")
+
+    def reported(self, site: str) -> set[tuple[str, str]]:
+        """(object, version) pairs already in an nsx-drift issue for this site, open or closed."""
+        seen: set[tuple[str, str]] = set()
+        page = "1"
+        for _ in range(10):  # the 1000 most recent issues
+            issues, headers = self.call("GET", "/issues", query={
+                "labels": f"{LABEL},site:{site}", "state": "all", "order_by": "created_at",
+                "sort": "desc", "per_page": 100, "page": page})
+            for issue in issues or []:
+                seen.update(MARK.findall(issue.get("description") or ""))
+            page = (headers.get("X-Next-Page") or "").strip()
+            if not page:
+                break
+        return seen
+
+
+# --------------------------------------------------------------------------
+# What changed
+# --------------------------------------------------------------------------
+
+def mirror_objects(files: dict[str, str], site: str) -> dict[tuple[str, str], dict]:
+    """(kind, id) -> definition, from this site's mirror files."""
+    out: dict[tuple[str, str], dict] = {}
+    for path, text in files.items():
+        if text.split("\n", 1)[0].strip() != f"{MIRROR_MARK}{site}":
+            continue
+        doc = load_yaml(text) or {}
+        if path.startswith("data/groups/"):
+            for key, value in (doc.get("groups") or {}).items():
+                out[("group", str(key))] = value
+        elif path.startswith("data/services/"):
+            for key, value in (doc.get("custom") or {}).items():
+                out[("service", str(key))] = value
+        elif path.startswith("data/policies/"):
+            header = doc.get("policy") or {}
+            pid = str(header.get("id") or Path(path).stem)
+            out[("policy", pid)] = header
+            for key, value in (doc.get("rules") or {}).items():
+                out[("rule", f"{pid}/{key}")] = value
+    return out
+
+
+def files_at(ref: str) -> dict[str, str]:
+    """The data files at ref, read in one git process."""
+    names = subprocess.run(["git", "ls-tree", "-r", "--name-only", ref, "--", "data/groups", "data/services", "data/policies"],
+                           cwd=REPO_ROOT, capture_output=True, text=True, check=True).stdout.splitlines()
+    names = [n for n in names if n.endswith(".yaml")]
+    if not names:
+        return {}
+    batch = subprocess.run(["git", "cat-file", "--batch"], cwd=REPO_ROOT, check=True, capture_output=True,
+                           input="".join(f"{ref}:{n}\n" for n in names).encode()).stdout
+    out: dict[str, str] = {}
+    at = 0
+    for name in names:
+        header_end = batch.index(b"\n", at)
+        size = int(batch[at:header_end].split()[2])
+        out[name] = batch[header_end + 1:header_end + 1 + size].decode()
+        at = header_end + 1 + size + 1
+    return out
+
+
+def files_now() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for kind in ("groups", "services", "policies"):
+        for f in sorted((REPO_ROOT / "data" / kind).glob("*.yaml")):
+            out[str(f.relative_to(REPO_ROOT))] = f.read_text()
+    return out
+
+
+def describe(before, after) -> str:
+    """What differs between two versions of one object, briefly."""
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return "changed"
+    parts = []
+    for key in sorted(set(before) | set(after)):
+        old, new = before.get(key), after.get(key)
+        if old == new:
+            continue
+        if isinstance(old, list) or isinstance(new, list):
+            o = [json.dumps(x, sort_keys=True) if not isinstance(x, str) else x for x in old or []]
+            n = [json.dumps(x, sort_keys=True) if not isinstance(x, str) else x for x in new or []]
+            plus = [x for x in n if x not in o]
+            minus = [x for x in o if x not in n]
+            if all(isinstance(x, str) for x in (old or []) + (new or [])) and (plus or minus):
+                parts.append(f"{key} " + " ".join([f"+{x}" for x in plus] + [f"-{x}" for x in minus]))
+            else:
+                parts.append(f"{key} changed")
+        elif isinstance(old, dict) or isinstance(new, dict):
+            parts.append(f"{key} changed")
+        elif old is None:
+            parts.append(f"{key} set to {new}")
+        elif new is None:
+            parts.append(f"{key} removed (was {old})")
+        else:
+            parts.append(f"{key} {old} → {new}")
+    text = "; ".join(parts) or "changed"
+    return text if len(text) <= 240 else text[:237] + "..."
+
+
+def nsx_index(dump: dict) -> dict[tuple[str, str], dict]:
+    """(kind, id) -> the object as NSX returned it, for who changed it and when."""
+    out: dict[tuple[str, str], dict] = {}
+    for g in dump.get("groups", []):
+        out.setdefault(("group", g.get("id", "")), g)
+    for s in dump.get("services", []):
+        out.setdefault(("service", s.get("id", "")), s)
+    for p in dump.get("policies", []):
+        out.setdefault(("policy", p.get("id", "")), p)
+        for r in p.get("rules", []):
+            out.setdefault(("rule", f"{p.get('id')}/{r.get('id')}"), r)
+    return out
+
+
+def when(obj: dict | None) -> tuple[str, str, float | None]:
+    """Who last changed an NSX object, when (text), and when (epoch seconds)."""
+    if not obj:
+        return "", "", None
+    stamp = obj.get("_last_modified_time") or obj.get("_create_time")
+    seconds = stamp / 1000 if isinstance(stamp, (int, float)) else None
+    text = datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%d %H:%M") if seconds else ""
+    return str(obj.get("_last_modified_user") or obj.get("_create_user") or ""), text, seconds
+
+
+def mirror_changes(site: str, base: str, dump: dict) -> list[dict] | None:
+    """The changes to report; None when REF holds no copy of the site yet (baseline)."""
+    old_files = files_at(base)
+    old = mirror_objects(old_files, site)
+    if not old:
+        return None
+    new = mirror_objects(files_now(), site)
+    mine = [p for p, t in old_files.items() if t.split("\n", 1)[0].strip() == f"{MIRROR_MARK}{site}"]
+    copied = int(subprocess.run(["git", "log", "-1", "--format=%ct", base, "--", *mine], cwd=REPO_ROOT,
+                                capture_output=True, text=True, check=True).stdout.strip() or 0)
+    since = copied - SYNC_MARGIN
+    live = nsx_index(dump)
+    gone_policies = {k[1] for k in old if k[0] == "policy" and k not in new}
+    items = []
+    for key in sorted(set(old) | set(new)):
+        kind, ident = key
+        before, after = old.get(key), new.get(key)
+        if before == after:
+            continue
+        if kind == "rule" and before is not None and after is None and ident.split("/", 1)[0] in gone_policies:
+            continue  # reported with its policy
+        who, at, seconds = when(live.get(key))
+        if after is not None and seconds is not None and seconds < since:
+            continue  # nobody changed it in NSX since the copy: the repository side moved
+        if before is None:
+            change, detail = "added", ""
+        elif after is None:
+            change = "deleted"
+            detail = f"with its {sum(1 for k in old if k[0] == 'rule' and k[1].startswith(ident + '/'))} rule(s)" if kind == "policy" else ""
+            who, at = "", ""
+        else:
+            change, detail = "changed", describe(before, after)
+        items.append({"key": f"{kind} {ident}", "kind": kind, "id": ident, "change": change, "detail": detail,
+                      "who": who, "at": at, "version": digest(after) if after is not None else "0" * 16})
+    return items
+
+
+def plan_changes(plan: dict) -> list[dict]:
+    """Drift a refresh-only plan found, with who and when from NSX when it can be read."""
+    items = []
+    for drift in plan.get("resource_drift") or []:
+        change = drift.get("change") or {}
+        actions = change.get("actions") or []
+        before, after = change.get("before"), change.get("after")
+        if actions == ["no-op"]:
+            continue
+        address = drift.get("address", "")
+        item = {"key": address, "kind": drift.get("type", "resource"), "id": address,
+                "change": "deleted" if after is None else "changed",
+                "detail": "" if after is None else describe(
+                    {k: v for k, v in (before or {}).items() if k != "revision"},
+                    {k: v for k, v in after.items() if k != "revision"}),
+                "who": "", "at": "", "version": digest(after) if after is not None else "0" * 16,
+                "path": (after or before or {}).get("path", "")}
+        items.append(item)
+    return items
+
+
+def lookup_owners(site: str, items: list[dict]) -> None:
+    """Who last changed each drifted object, from NSX (read-only credential)."""
+    import importlib.util  # noqa: PLC0415
+    spec = importlib.util.spec_from_file_location("import_estate", REPO_ROOT / "scripts" / "import-estate.py")
+    estate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(estate)
+    estate.CA_SITE = site  # this manager's CA, as for its plans
+    host, user, password = (os.environ.get(k, "") for k in ("NSXT_MANAGER_HOST", "NSXT_USERNAME", "NSXT_PASSWORD"))
+    insecure = os.environ.get("NSXT_ALLOW_UNVERIFIED_SSL", "").strip().lower() in ("true", "1", "yes")
+    for item in items:
+        path = item.get("path") or ""
+        if item["change"] == "deleted" or not path:
+            continue
+        prefix = "/global-manager/api/v1" if path.startswith("/global-infra/") else "/policy/api/v1"
+        try:
+            obj = estate.api_get(host, prefix + urllib.parse.quote(path), user, password, insecure)
+        except SystemExit:
+            continue
+        item["who"], item["at"], _ = when(obj)
+
+
+# --------------------------------------------------------------------------
+# The issue
+# --------------------------------------------------------------------------
+
+def cell(text: str) -> str:
+    return str(text).replace("|", "\\|").replace("\n", " ")
+
+
+def issue_body(site: str, items: list[dict], mode: str, link: str) -> str:
+    source = "the mirror sync" if mode == "mirror" else "a drift check (refresh-only plan)"
+    rows = [f"| {i['change']} | `{cell(i['key'])}` | {cell(i['detail'])} | {cell(i['who']) or '?'} | {i['at'] or '?'} |"
+            for i in items[:MAX_ROWS]]
+    if len(items) > MAX_ROWS:
+        rows.append(f"| | ... and {len(items) - MAX_ROWS} more | see the job's log | | |")
+    if mode == "mirror":
+        keep = ("Intended: nothing to do here, the mirror merge request brings it into the repository "
+                "(and Terraform's state follows).")
+        undo = "Not intended: revert it in NSX; the next sync takes it out of the repository again."
+        after = ("After cutover to `mode: managed` a change like this must come through a merge request: "
+                 "the drift check raises it the same way, and the next apply would undo it.")
+    else:
+        keep = "Intended: bring it into `data/` in a merge request, so the next apply keeps it."
+        undo = "Not intended: the next apply of this manager reverts it to the repository, or revert it in NSX."
+        after = "This manager is in `mode: managed`: changes are made through merge requests, not the UI."
+    lines = [
+        f"{source.capitalize()} of **{site}** found {len(items)} change(s) made in NSX, not through this repository.",
+        "",
+        f"Found by: {link}" if link else "",
+        "",
+        "| change | object | what changed | last changed by | when (UTC) |",
+        "|---|---|---|---|---|",
+        *rows,
+        "",
+        "\"Last changed by\" and \"when\" are what NSX records on the object. NSX keeps nothing on a deleted object: "
+        "its audit log (System > Audit) has who deleted it.",
+        "",
+        "### Investigation",
+        "- [ ] Who made each change, and why: the incident or change ticket.",
+        f"- [ ] {keep}",
+        f"- [ ] {undo}",
+        "- [ ] Should it have gone through a merge request? Agree what to do differently, if so.",
+        "",
+        after,
+        "",
+        "Close this issue once every change in it is explained.",
+        "",
+        *[f"<!-- nsx-drift object={digest(i['key'])} version={i['version']} -->" for i in items],
+    ]
+    return "\n".join(lines)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("mode", choices=["mirror", "plan"])
+    ap.add_argument("--site", required=True)
+    ap.add_argument("--base", help="mirror: the ref the copy is compared with (the default branch)")
+    ap.add_argument("--dump", help="mirror: the capture the sync read")
+    ap.add_argument("--stack", help="plan: the stack the plan is for")
+    ap.add_argument("--plan-json", help="plan: terraform show -json of the refresh-only plan")
+    ap.add_argument("--link", default="", help="where it was found (a merge request or job URL)")
+    args = ap.parse_args()
+
+    if args.mode == "mirror":
+        if not (args.base and args.dump):
+            die("mirror needs --base and --dump")
+        items = mirror_changes(args.site, args.base, json.loads(Path(args.dump).read_text()))
+        if items is None:
+            print(f"drift: first copy of {args.site}, the baseline: no drift issue.")
+            return 0
+    else:
+        if not (args.stack and args.plan_json):
+            die("plan needs --stack and --plan-json")
+        items = plan_changes(json.loads(Path(args.plan_json).read_text()))
+        if items and os.environ.get("NSXT_MANAGER_HOST"):
+            lookup_owners(args.site, items)
+    if not items:
+        print(f"drift: no change made in NSX on {args.site} to report.")
+        return 0
+
+    gitlab = GitLab()
+    seen = gitlab.reported(args.site)
+    new = [i for i in items if (digest(i["key"]), i["version"]) not in seen]
+    if not new:
+        print(f"drift: {len(items)} change(s) on {args.site}, each already in an nsx-drift issue.")
+        return 0
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    where = f" ({args.stack})" if args.stack else ""
+    issue, _ = gitlab.call("POST", "/issues", {
+        "title": f"NSX drift on {args.site}{where}: {len(new)} change(s) made outside the repository, {stamp}",
+        "description": issue_body(args.site, new, args.mode, args.link),
+        "labels": f"{LABEL},site:{args.site}",
+    })
+    print(f"drift: {len(new)} change(s) on {args.site} to investigate: {(issue or {}).get('web_url', 'issue raised')}")
+    for i in new[:20]:
+        print(f"  {i['change']:8} {i['key']}  {i['who']} {i['at']}".rstrip())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+SCAFFOLD_EOF
+mark_executable scripts/drift-issue.py
+
 write_file scripts/drift.sh <<'SCAFFOLD_EOF'
 #!/usr/bin/env bash
 #
@@ -9195,7 +9662,8 @@ write_file scripts/drift.sh <<'SCAFFOLD_EOF'
 # quietly overwrite the estate you imported.
 #
 # Reports go to reports/, which is gitignored: a plan reveals the security
-# posture of the estate and is not a review attachment.
+# posture of the estate and is not a review attachment. With DRIFT_JSON set, the
+# plan is also written there as JSON (scripts/drift-job.sh raises an issue from it).
 #
 # Exit status: 0 no drift, 1 error, 2 drift detected.
 
@@ -9217,11 +9685,9 @@ report="$report_dir/drift-${stack}-${site}-${stamp}.txt"
 mkdir -p "$report_dir"
 
 # -refresh-only compares state against the live manager without proposing any
-# configuration change, so nothing here can be mistaken for a fix.
-"$REPO_ROOT/scripts/tf.sh" init "$stack" "$site" >/dev/null 2>&1
-
-(cd "$REPO_ROOT/stacks/$stack" && terraform plan -refresh-only -detailed-exitcode -input=false -no-color) \
-	>"$report" 2>&1
+# configuration change, so nothing here can be mistaken for a fix. Through
+# tf.sh, so the plan has the manager's variables, state and trust.
+"$REPO_ROOT/scripts/tf.sh" drift "$stack" "$site" -no-color >"$report" 2>&1
 status=$?
 
 case "$status" in
@@ -9247,6 +9713,313 @@ case "$status" in
 esac
 SCAFFOLD_EOF
 mark_executable scripts/drift.sh
+
+write_file scripts/drift-job.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# The 'drift' job: for managers in mode: managed, find changes made in NSX
+# outside this repository and raise each as a GitLab issue to investigate.
+#
+# Run from a pipeline schedule (or Run pipeline) on the default branch with
+#   DRIFT_SITE   a manager, several separated by spaces, or 'all'
+#
+# For each manager and stack: a refresh-only plan with the read-only plan
+# credential (scripts/drift.sh), then scripts/drift-issue.py. Nothing is
+# changed, in NSX or in the repository. Managers in mode: mirror are left to
+# the mirror job, which raises their drift itself. Exit status: 0 done, drift
+# or not (drift is an issue, not a failed job); 1 a manager could not be checked.
+#
+# Needs NSX_BOT_TOKEN or NSX_ADOPT_TOKEN (api scope), masked and protected.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT" || exit 1
+
+if [ "${1:-}" = --one ]; then # --one SITE STACK, inside with-credentials.sh
+	site="$2"
+	stack="$3"
+	json="$(mktemp)"
+	trap 'rm -f "$json"' EXIT
+	DRIFT_JSON="$json" scripts/drift.sh "$stack" "$site"
+	case $? in
+	0) exit 0 ;;
+	2) python3 scripts/drift-issue.py plan --site "$site" --stack "$stack" --plan-json "$json" --link "${CI_JOB_URL:-}" ;;
+	*) exit 1 ;;
+	esac
+	exit $?
+fi
+
+[ -n "${DRIFT_SITE:-}" ] || {
+	echo "error: DRIFT_SITE is not set: a manager in mode: managed, several, or 'all'" >&2
+	exit 1
+}
+failed=()
+checked=0
+while read -r site stack _; do
+	[ -n "$site" ] || continue
+	if [ "$DRIFT_SITE" != all ] && [[ " $DRIFT_SITE " != *" $site "* ]]; then
+		continue
+	fi
+	echo
+	echo "=== $site / $stack"
+	checked=$((checked + 1))
+	NSX_CRED_SCOPE=plan scripts/with-credentials.sh "$site" -- scripts/drift-job.sh --one "$site" "$stack" || failed+=("$site/$stack")
+done < <(python3 scripts/ci-matrix.py --format lines --managed-only)
+
+[ "$checked" -gt 0 ] || echo "no manager in mode: managed matches DRIFT_SITE='$DRIFT_SITE' (managers in mirror mode are checked by the mirror job)"
+if [ "${#failed[@]}" -gt 0 ]; then
+	echo "error: not checked: ${failed[*]} (above)" >&2
+	exit 1
+fi
+SCAFFOLD_EOF
+mark_executable scripts/drift-job.sh
+
+write_file scripts/cutover.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# Cut a manager over from mirror mode to managed: the copy becomes the source of
+# truth, in one merge request that is proven to change nothing in NSX.
+#
+# Run by the 'cutover' job: Build -> Pipelines -> Run pipeline on the default
+# branch, with
+#
+#   CUTOVER_SITE   the manager, in mode: mirror
+#
+# 1. Reads the manager (read-only) and checks the repository still holds exactly
+#    what it holds: a change made in the UI since the last sync stops here.
+# 2. Turns its mirror files into ordinary data files: the "do not edit" header
+#    goes, data/groups|services/imported-<site>-mirror.yaml lose "-mirror", and
+#    the import blocks (stacks/<stack>/import-<site>-mirror.tf) are deleted:
+#    Terraform's state already holds every object. mode: mirror becomes
+#    mode: managed in inventory/managers.yaml.
+# 3. Plans every stack of the manager with that result. Each plan must change
+#    nothing at all (no import, create, update, destroy or hand-back): state
+#    holds everything and the files describe NSX exactly. Otherwise it stops
+#    and says what differs.
+# 4. Pushes the branch cutover/<site> and opens the merge request. Merging it is
+#    the cutover. From then on engineers edit those files, or add new ones, in
+#    merge requests; a change made in the UI is drift (scripts/drift-job.sh).
+#
+# Needs NSX_ADOPT_TOKEN, as the mirror job.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+die() {
+	echo "error: $*" >&2
+	exit 1
+}
+
+site="${CUTOVER_SITE:-}"
+[ -n "$site" ] || die "CUTOVER_SITE is not set: the manager to cut over, in mode: mirror"
+[ -n "${NSX_ADOPT_TOKEN:-}${NSX_ADOPT_REMOTE:-}" ] ||
+	die "NSX_ADOPT_TOKEN is not set: a project access token (api, write_repository), masked and protected"
+api="${CI_API_V4_URL:?CI_API_V4_URL is not set}"
+project="${CI_PROJECT_ID:?CI_PROJECT_ID is not set}"
+target="${CI_DEFAULT_BRANCH:-main}"
+base="$(git rev-parse HEAD)"
+start="$(git symbolic-ref -q --short HEAD || echo "$base")"
+branch="cutover/$site"
+
+mode="$(python3 - "$site" <<'PY'
+import sys
+sys.path.insert(0, "scripts")
+from ci_matrix_lib import managers, mode_of
+m = managers().get(sys.argv[1])
+print(mode_of(sys.argv[1], m) if m is not None else "")
+PY
+)" || die "cannot read the inventory (above)"
+case "$mode" in
+mirror) ;;
+"") die "$site is not a manager in inventory/managers.yaml" ;;
+*) die "$site is in mode: $mode, not mirror: there is nothing to cut over" ;;
+esac
+
+[ -z "$(git status --porcelain -- data stacks inventory)" ] ||
+	die "data/, stacks/ or inventory/ has uncommitted changes: commit or stash them first"
+work="$(mktemp -d)"
+# Back where it started; anything left untracked under data/ or stacks/ was
+# written here (the tree was clean above).
+trap 'rm -rf "$work"; git checkout -q -f "$start" 2>/dev/null || true; git clean -qfd -- data stacks 2>/dev/null || true' EXIT
+git checkout -q -f -B "$branch" "$base"
+
+echo "== 1. $site still matches the repository"
+NSX_CRED_SCOPE=plan scripts/with-credentials.sh "$site" -- \
+	python3 scripts/import-estate.py --site "$site" --dump-only "$work/capture.json" >/dev/null
+python3 scripts/import-estate.py --site "$site" --from-dump "$work/capture.json" --mirror >"$work/report.txt" ||
+	{ cat "$work/report.txt"; die "the copy of $site could not be regenerated (above)"; }
+if [ -n "$(git status --porcelain -- data stacks)" ]; then
+	git status --short -- data stacks | head -40
+	die "$site changed in the UI since the last sync (above). Run the mirror (MIRROR_SITE=$site), merge its merge request, let sync-state finish, then cut over again."
+fi
+echo "it does."
+
+echo "== 2. the copy becomes the source of truth"
+python3 - "$site" <<'PY'
+import json, re, sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+site = sys.argv[1]
+mark = f"# nsx-mirror: {site}"
+today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+header = (
+    f"# Imported from {site} in mirror mode; managed by this repository since {today}.\n"
+    "# Edit it like any data file, in a merge request: change these objects here,\n"
+    "# add a rule to a policy in that policy's file (scripts/add-rule.py), and put\n"
+    "# new objects in new files. A change made in the NSX UI is drift.\n\n"
+)
+renamed: dict[str, str] = {}
+count = 0
+for kind in ("groups", "services", "policies"):
+    for f in sorted(Path("data", kind).glob("*.yaml")):
+        text = f.read_text()
+        if text.split("\n", 1)[0].strip() != mark:
+            continue
+        lines = text.split("\n")
+        i = 0
+        while i < len(lines) and lines[i].startswith("#"):
+            i += 1
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+        target = f.with_name(f"imported-{site}.yaml") if f.name == f"imported-{site}-mirror.yaml" else f
+        if target != f and target.exists():
+            sys.exit(f"error: {target} exists already; merge it into {f} by hand first")
+        target.write_text(header + "\n".join(lines[i:]))
+        if target != f:
+            f.unlink()
+            renamed[str(f)] = str(target)
+        count += 1
+removed = [str(f) for f in sorted(Path("stacks").glob(f"*/import-{site}-mirror.tf"))]
+for f in removed:
+    Path(f).unlink()
+
+manifest_path = Path("data/.import-manifest.json")
+if manifest_path.exists():
+    manifest = json.loads(manifest_path.read_text())
+    manifest["imported"] = [renamed.get(r, r) for r in manifest.get("imported", []) if r not in removed]
+    (manifest.get("mirrors") or {}).pop(site, None)
+    if not manifest.get("mirrors"):
+        manifest.pop("mirrors", None)
+    manifest.setdefault("sources", []).append({"site": site, "cutover": today})
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+inventory = Path("inventory/managers.yaml")
+lines = inventory.read_text().split("\n")
+start = next((i for i, l in enumerate(lines) if re.fullmatch(rf"\s*{re.escape(site)}:\s*", l)), None)
+if start is None:
+    sys.exit(f"error: {site} not found in {inventory}")
+indent = len(lines[start]) - len(lines[start].lstrip())
+done = False
+for i in range(start + 1, len(lines)):
+    line = lines[i]
+    if line.strip() and len(line) - len(line.lstrip()) <= indent:
+        break
+    if re.fullmatch(r"\s+mode:\s*mirror\s*(#.*)?", line):
+        lines[i] = re.sub(r"mirror", "managed", line, count=1)
+        done = True
+        break
+if not done:
+    sys.exit(f"error: no 'mode: mirror' line under {site} in {inventory}")
+inventory.write_text("\n".join(lines))
+print(f"{count} file(s) now ordinary data files; import blocks removed: {', '.join(removed) or 'none'}; "
+      f"{site}: mode: managed")
+PY
+
+echo "== 3. plan $site: it must change nothing"
+summary="$work/plans.txt"
+: >"$summary"
+stacks="$(python3 scripts/ci-matrix.py --format lines | awk -v s="$site" '$1 == s { print $2 }')"
+[ -n "$stacks" ] || die "no stack is planned for $site"
+for stack in $stacks; do
+	echo "-- $stack"
+	if ! out="$(NSX_CRED_SCOPE=plan scripts/with-credentials.sh "$site" -- scripts/tf.sh plan "$stack" "$site" 2>&1)"; then
+		printf '%s\n' "$out" | tail -40
+		die "the plan of $site/$stack failed (above): nothing was pushed"
+	fi
+	line="$(grep -E "^plan-guard $site/$stack" <<<"$out" | tail -1)"
+	printf '%s\n' "$line"
+	if ! grep -qE ": 0 import, 0 create, 0 update, 0 destroy/replace, 0 hand back" <<<"$line"; then
+		grep -E "^  # |will be (created|updated|destroyed|imported)|must be replaced" <<<"$out" | head -40
+		die "the plan of $site/$stack is not empty (above): the files and state do not describe NSX exactly yet. Run the mirror and sync-state again; nothing was pushed."
+	fi
+	echo "$stack: no changes" >>"$summary"
+done
+
+git add -A data stacks inventory
+git -c user.name="${GITLAB_USER_NAME:-nsx-cutover}" -c user.email="${GITLAB_USER_EMAIL:-nsx-cutover@localhost}" \
+	-c commit.gpgsign=false commit -q -m "Cut $site over to managed
+
+The mirror copy of $site becomes the source of truth: ordinary data files,
+no import blocks, mode: managed. Planned by scripts/cutover.sh in pipeline
+${CI_PIPELINE_ID:-local}: no changes."
+
+push_env=() auth=()
+if [ -n "${NSX_ADOPT_REMOTE:-}" ]; then
+	remote="$NSX_ADOPT_REMOTE"
+else
+	remote="${CI_SERVER_URL%/}/${CI_PROJECT_PATH}.git"
+	auth=(-c "http.extraHeader=Authorization: Basic $(printf 'oauth2:%s' "$NSX_ADOPT_TOKEN" | base64 | tr -d '\n')")
+	if [ -n "${CI_SERVER_TLS_CA_FILE:-}" ] && [ -r "$CI_SERVER_TLS_CA_FILE" ]; then
+		push_env=(GIT_SSL_CAINFO="$CI_SERVER_TLS_CA_FILE")
+	fi
+fi
+env ${push_env[@]+"${push_env[@]}"} git ${auth[@]+"${auth[@]}"} push -q --force "$remote" "HEAD:refs/heads/$branch" ||
+	die "could not push $branch"
+
+token_header=()
+[ -z "${NSX_ADOPT_TOKEN:-}" ] || token_header=(--header "PRIVATE-TOKEN: ${NSX_ADOPT_TOKEN}")
+gitlab() { # gitlab METHOD PATH [JSON-FILE]
+	local data=()
+	[ -z "${3:-}" ] || data=(--header "Content-Type: application/json" --data "@$3")
+	curl --silent --show-error --fail-with-body --max-time 60 -X "$1" \
+		${CI_SERVER_TLS_CA_FILE:+--cacert "$CI_SERVER_TLS_CA_FILE"} \
+		${token_header[@]+"${token_header[@]}"} ${data[@]+"${data[@]}"} "${api%/}/projects/${project}$2"
+}
+open_mr="$(gitlab GET "/merge_requests?state=opened&source_branch=$branch&target_branch=$target" |
+	python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[0]["iid"] if d else "")')" || open_mr=""
+SITE="$site" BRANCH="$branch" TARGET="$target" NEW="$open_mr" python3 - "$work/mr.json" "$summary" <<'PY'
+import json, os, sys
+e = os.environ
+plans = open(sys.argv[2]).read().split()
+description = "\n".join([
+    f"Cuts **{e['SITE']}** over from mirror mode to managed. Merging this is the cutover.",
+    "",
+    "- Its mirror files become ordinary data files: the \"do not edit\" header is gone, and",
+    "  `imported-<site>-mirror.yaml` is now `imported-<site>.yaml`.",
+    "- Its import blocks are deleted: Terraform's state already holds every object.",
+    f"- `inventory/managers.yaml`: `mode: managed`. Its plans and applies run like every other manager's.",
+    "",
+    "Planned by the cutover job against the live manager, with this exact content: **no changes** in any stack.",
+    "This merge request's own pipeline plans it again; it must say the same.",
+    "",
+    "### Before merging",
+    "- [ ] The UI freeze for this manager is agreed and in place.",
+    "- [ ] Every open `nsx-drift` issue for it is explained.",
+    "",
+    "### After merging",
+    "- Change these objects by editing their files, and add new objects in new files, in merge requests.",
+    "- A change made in the NSX UI is drift: the drift check raises an issue, and the next apply would undo it.",
+    "- Placeholder `why_static` notes still say IMPORTED AS-IS: replace them as the groups are touched.",
+])
+body = {"title": f"Cut {e['SITE']} over to managed", "description": description}
+if not e["NEW"]:
+    body.update(source_branch=e["BRANCH"], target_branch=e["TARGET"], remove_source_branch=True)
+json.dump(body, open(sys.argv[1], "w"))
+PY
+if [ -n "$open_mr" ]; then
+	gitlab PUT "/merge_requests/$open_mr" "$work/mr.json" >/dev/null || die "$branch was pushed, but merge request !$open_mr could not be updated"
+	echo "updated merge request !$open_mr"
+else
+	response="$(gitlab POST "/merge_requests" "$work/mr.json")" ||
+		die "$branch was pushed, but the merge request could not be opened: $response"
+	echo "merge request: $(python3 -c 'import json,sys; print(json.load(sys.stdin).get("web_url", ""))' <<<"$response")"
+fi
+SCAFFOLD_EOF
+mark_executable scripts/cutover.sh
 
 # ---------------------------------------------------------------------------
 # 7. Backend config and CI
@@ -11896,6 +12669,11 @@ write_file .gitlab-ci.yml <<'SCAFFOLD_EOF'
 # MIRROR_SITE set runs only the 'mirror' job, which keeps data/ a copy of the
 # managers still run from the UI. docs/IMPORT.md, "Mirror mode".
 #
+# Cutover: Run pipeline on the default branch with CUTOVER_SITE runs only the
+# 'cutover' job, which opens the merge request that takes a manager out of
+# mirror mode. Drift: a schedule with DRIFT_SITE runs only the 'drift' job,
+# which raises changes made in NSX as nsx-drift issues. docs/IMPORT.md.
+#
 # Change control (NSX_APPLY_MODE=approval): a pipeline schedule with
 # APPROVAL_SWEEP=1 runs only the 'approvals' job, which starts the apply of
 # every change request that has its approvals. docs/GITOPS.md.
@@ -11966,6 +12744,8 @@ mirror:
   variables:
     NSX_CRED_SCOPE: plan
     VAULT_TOKEN: $VAULT_PLAN_TOKEN
+    # Full history: drift is dated against when the copy was last merged.
+    GIT_DEPTH: "0"
   script:
     - scripts/mirror.sh
   # One sync at a time, and never cancelled halfway through a push.
@@ -11973,6 +12753,41 @@ mirror:
   interruptible: false
   rules:
     - if: $MIRROR_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# --- cutover: a manager leaves mirror mode ----------------------------------
+# Run pipeline on the default branch with CUTOVER_SITE. Checks the manager still
+# matches the repository, turns its copy into ordinary data files, plans it
+# (must change nothing) and opens the merge request that is the cutover.
+
+cutover:
+  stage: adopt
+  variables:
+    NSX_CRED_SCOPE: plan
+    VAULT_TOKEN: $VAULT_PLAN_TOKEN
+  script:
+    - scripts/cutover.sh
+  # Never while a sync of the same copy runs.
+  resource_group: nsx-mirror
+  interruptible: false
+  rules:
+    - if: $CUTOVER_SITE && $CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# --- drift: changes made in NSX outside the repository -----------------------
+# A pipeline schedule with DRIFT_SITE (a manager in mode: managed, or 'all').
+# A refresh-only plan per manager and stack, read-only; each change found is
+# raised as an nsx-drift issue. Managers in mirror mode: the mirror job does it.
+
+drift:
+  stage: adopt
+  variables:
+    NSX_CRED_SCOPE: plan
+    VAULT_TOKEN: $VAULT_PLAN_TOKEN
+  script:
+    - scripts/drift-job.sh
+  resource_group: nsx-drift
+  interruptible: false
+  rules:
+    - if: $DRIFT_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 # --- validate: offline, no credentials, runs on everything ------------------
 
@@ -11986,6 +12801,10 @@ data:
     - if: $MIRROR_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
     - if: $APPROVAL_SWEEP && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+      when: never
+    - if: $CUTOVER_SITE && $CI_PIPELINE_SOURCE == "web"
+      when: never
+    - if: $DRIFT_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
@@ -12008,6 +12827,10 @@ terraform:
       when: never
     - if: $APPROVAL_SWEEP && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
+    - if: $CUTOVER_SITE && $CI_PIPELINE_SOURCE == "web"
+      when: never
+    - if: $DRIFT_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -12028,6 +12851,10 @@ matrix:
       when: never
     - if: $APPROVAL_SWEEP && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
+    - if: $CUTOVER_SITE && $CI_PIPELINE_SOURCE == "web"
+      when: never
+    - if: $DRIFT_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -12047,6 +12874,10 @@ managers:
     - if: $MIRROR_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
     - if: $APPROVAL_SWEEP && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+      when: never
+    - if: $CUTOVER_SITE && $CI_PIPELINE_SOURCE == "web"
+      when: never
+    - if: $DRIFT_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

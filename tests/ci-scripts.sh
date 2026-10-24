@@ -421,6 +421,7 @@ d = yaml.safe_load(open(sys.argv[1]))
 rules = d["mirror"]["rules"]
 ok = len(rules) == 1 and "$MIRROR_SITE" in rules[0]["if"] and '"schedule"' in rules[0]["if"] and "$CI_DEFAULT_BRANCH" in rules[0]["if"]
 ok = ok and d["mirror"]["variables"]["NSX_CRED_SCOPE"] == "plan" and d["mirror"]["interruptible"] is False
+ok = ok and d["mirror"]["variables"]["GIT_DEPTH"] == "0"
 sys.exit(0 if ok else 1)
 PY
 check "the approvals sweep runs only from a schedule or Run pipeline, on the default branch, with full history" python3 - "$ci" <<'PY'
@@ -441,6 +442,33 @@ for job in ("data", "terraform", "matrix", "managers"):
     if not any("$MIRROR_SITE" in r.get("if", "") and r.get("when") == "never" for r in first):
         sys.exit(1)
 PY
+check "cutover runs only from Run pipeline on the default branch, one at a time with the mirror, read-only" python3 - "$ci" <<'PY'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+j = d["cutover"]
+ok = len(j["rules"]) == 1 and "$CUTOVER_SITE" in j["rules"][0]["if"] and '"web"' in j["rules"][0]["if"] and '"schedule"' not in j["rules"][0]["if"]
+ok = ok and "$CI_DEFAULT_BRANCH" in j["rules"][0]["if"] and j["resource_group"] == "nsx-mirror" and j["variables"]["NSX_CRED_SCOPE"] == "plan"
+ok = ok and j["script"] == ["scripts/cutover.sh"] and j["interruptible"] is False
+sys.exit(0 if ok else 1)
+PY
+check "the drift check runs from a schedule or Run pipeline on the default branch, read-only" python3 - "$ci" <<'PY'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+j = d["drift"]
+ok = len(j["rules"]) == 1 and "$DRIFT_SITE" in j["rules"][0]["if"] and '"schedule"' in j["rules"][0]["if"] and "$CI_DEFAULT_BRANCH" in j["rules"][0]["if"]
+ok = ok and j["variables"]["NSX_CRED_SCOPE"] == "plan" and j["script"] == ["scripts/drift-job.sh"]
+sys.exit(0 if ok else 1)
+PY
+check "...and a cutover or drift pipeline runs nothing else" python3 - "$ci" <<'PY'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+for job in ("data", "terraform", "matrix", "managers"):
+    for var in ("$CUTOVER_SITE", "$DRIFT_SITE"):
+        if not any(var in r.get("if", "") and r.get("when") == "never" for r in d[job]["rules"]):
+            sys.exit(1)
+PY
+check "drift-job.sh without DRIFT_SITE says what to set" bash -c 'cd "$1" && ! out="$(scripts/drift-job.sh 2>&1)" && grep -q "DRIFT_SITE is not set" <<<"$out"' _ "$T"
+check "cutover.sh without CUTOVER_SITE says what to set" bash -c 'cd "$1" && ! out="$(scripts/cutover.sh 2>&1)" && grep -q "CUTOVER_SITE is not set" <<<"$out"' _ "$T"
 
 # The NSX provider in the image.
 : >"$FD/local"

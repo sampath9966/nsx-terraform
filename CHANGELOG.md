@@ -15,6 +15,10 @@ cannot fix itself. Run it again after fixing whatever it reported.
 
 ## 1.5.0
 
+**Drift is raised as a GitLab issue, to investigate.** During the observation period, every sync that finds the manager changed in the UI raises an issue labelled `nsx-drift` and `site:<site>`: each object added, changed or deleted, what changed in it, who last changed it and when (from NSX), and a checklist (who and why, keep or revert, should it have been a merge request). A change is raised once, not on every sync. The first copy is the baseline, and objects nobody touched since the last copy (taken over by a newer importer) are not raised. After cutover the new `drift` job (schedule with `DRIFT_SITE`) does the same for managed managers from a refresh-only plan. `scripts/drift.sh` now plans through `tf.sh drift`, so the plan has the manager's variables, state and trust; before, it ran Terraform without them.
+
+**Cutover is one job and one merge request.** *Run pipeline* with `CUTOVER_SITE`: the `cutover` job checks the manager still matches the repository, turns its copy into ordinary data files (no "do not edit" header, `imported-<site>.yaml`, no import blocks), sets `mode: managed`, plans every stack of the manager and requires each plan to change nothing, then opens the merge request. After it is merged, engineers edit the imported objects in their files and add new ones on top, through merge requests. Proven with the real provider: an edited imported rule and an added one plan as exactly `1 to add, 1 to change`.
+
 **Mirror and adopt take three shapes a real estate is full of.** The first mirror of a production Global Manager left most of its rules in the UI for three reasons. All three are now taken over exactly, and proven with the real NSX provider to import with no change and no drift afterwards:
 
 - **Groups of VMs picked one by one** (the UI's Members tab, `ExternalIDExpression`). Written as `member_type: VirtualMachine` and `external_ids:` (each VM's instance UUID), with a `why_static` note like any static group. The group module builds them; the validator wants `member_type` with `external_ids`.
