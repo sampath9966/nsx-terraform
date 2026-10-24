@@ -52,6 +52,19 @@ tests/brownfield.sh || rc=1
 echo "== change control: approvals, standby approvals, change requests, change log"
 tests/change-control.sh || rc=1
 
+# CI parity: a CI image without PyYAML reads YAML with Terraform's yamldecode,
+# or, with no terraform either, with the built-in reader. The suites that read
+# data run again each way, unless this run already forces one.
+if [ -z "${NSX_YAML_FALLBACK:-}" ]; then
+	if command -v terraform >/dev/null 2>&1; then
+		echo "== again, reading YAML as a CI image without PyYAML does (Terraform's yamldecode)"
+		NSX_YAML_FALLBACK=1 tests/brownfield.sh || rc=1
+		NSX_YAML_FALLBACK=1 tests/change-control.sh || rc=1
+	fi
+	echo "== again, reading YAML with neither PyYAML nor terraform (the built-in reader)"
+	NSX_YAML_FALLBACK=1 NSX_YAML_NO_TERRAFORM=1 tests/brownfield.sh || rc=1
+fi
+
 if [ "${1:-}" = "--provider" ]; then
 	echo "== brownfield adoption with the real NSX provider (needs Terraform and registry access)"
 	tests/brownfield-provider.sh || rc=1

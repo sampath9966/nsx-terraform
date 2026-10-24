@@ -13,13 +13,22 @@ jobs:
   offline:
     name: offline tests (syntax, shellcheck, selftest, update, certificates)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-      - name: Run offline tests
+      - name: Run offline tests (also as a CI image without PyYAML reads YAML)
         run: tests/run.sh
+
+  provider:
+    name: real NSX provider against a mock manager
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Adopt, mirror, cut over and check drift with vmware/nsxt; NSX must receive no write
+        run: tests/brownfield-provider.sh
 
   e2e:
     name: real GitLab (${{ matrix.mode }})

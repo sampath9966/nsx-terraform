@@ -147,10 +147,12 @@ check "the clone script does not clear the host proxy" bash -c '! docker exec ns
 # with none, so the provider cannot be fetched and the image is built without.
 if [ "$MODE" = fresh ]; then
 	check "the NSX provider is in the CI image" docker run --rm nsx-ci:1 sh -c 'ls /usr/local/share/terraform/plugins/registry.terraform.io/vmware/nsxt/*.zip'
+	check "PyYAML is in the CI image" docker run --rm nsx-ci:1 python3 -c 'import yaml'
 	check "the converge report says jobs need no registry for it" grep -q "the NSX provider is in the CI image" "$SCRATCH/update.log"
 else
 	check "the converge report warns the image has no NSX provider, with the fix" bash -c 'grep -q "has no NSX provider inside" "$1" && grep -q "NSX_TF_NETWORK_MIRROR" "$1"' _ "$SCRATCH/update.log"
 	check "...and that jobs cannot download it either" grep -q "cannot download Terraform providers" "$SCRATCH/update.log"
+	check "...and that PyYAML is missing too, and validation reads YAML with Terraform instead" grep -q "no PyYAML inside (validation reads YAML with Terraform instead)" "$SCRATCH/update.log"
 fi
 
 started_runner="$(docker inspect -f '{{.State.StartedAt}}' nsx-gitlab-runner)"

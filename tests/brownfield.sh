@@ -47,7 +47,8 @@ groups = [
     g("App-DB", [cond("app|db")]),
     g("App-All", [{"resource_type": "PathExpression", "paths": [f"{D}/groups/App-Web", f"{D}/groups/App-DB"]}]),
     g("Jump", [{"resource_type": "IPAddressExpression", "ip_addresses": ["10.1.1.10"]}]),
-    g("Mac", [{"resource_type": "MACAddressExpression", "mac_addresses": ["00:50:56:aa:bb:cc"]}]),
+    # Membership by Active Directory group (identity firewall): not representable.
+    g("Mac", [{"resource_type": "IdentityGroupExpression", "identity_groups": [{"distinguished_name": "CN=ops,DC=corp"}]}]),
     g("Nests-Mac", [{"resource_type": "PathExpression", "paths": [f"{D}/groups/Mac"]}]),
     g("Other", [cond("app|other")]),
 ]
@@ -55,7 +56,7 @@ services = [
     {"id": "App-8443", "path": f"{SV}/App-8443", "display_name": "App 8443",
      "service_entries": [{"resource_type": "L4PortSetServiceEntry", "display_name": "TCP-8443", "l4_protocol": "TCP", "destination_ports": ["8443"]}]},
     {"id": "HTTPS", "path": f"{SV}/HTTPS", "display_name": "HTTPS", "_system_owned": True, "service_entries": []},
-    {"id": "GRE", "path": f"{SV}/GRE", "display_name": "GRE", "service_entries": [{"resource_type": "IPProtocolServiceEntry", "protocol_number": 47}]},
+    {"id": "GRE", "path": f"{SV}/GRE", "display_name": "GRE", "service_entries": [{"resource_type": "NestedServiceServiceEntry", "nested_service_path": "/infra/services/HTTPS"}]},
 ]
 def r(p, i, src, dst, svc, seq, **kw):
     return dict({"id": i, "path": f"{D}/security-policies/{p}/rules/{i}", "display_name": i, "sequence_number": seq, "action": "ALLOW",
@@ -103,9 +104,9 @@ check "custom services are imported, not created" grep -q "module.services.nsxt_
 check "rules are imported into their policy" grep -q "each.value.policy" <<<"$I"
 
 echo "importer: never lossy"
-check "a MAC-based group is not adopted, and says why" grep -q "group Mac: membership by MACAddressExpression" <<<"$out"
+check "an identity (AD) group is not adopted, and says why" grep -q "group Mac: membership by IdentityGroupExpression" <<<"$out"
 check "a group nesting it is not adopted" grep -q "group Nests-Mac: nests Mac" <<<"$out"
-check "a service with other entry types is not adopted" grep -q "service GRE: service entries of type IPProtocolServiceEntry" <<<"$out"
+check "a service with an entry type that cannot be represented is not adopted" grep -q "service GRE: service entries of type NestedServiceServiceEntry" <<<"$out"
 check "a rule with inline service entries stays in the UI" grep -q "rule legacy-app/inline: inline service entries" <<<"$out"
 check "rules using unadoptable objects stay in the UI" bash -c 'grep -q "rule legacy-app/printers: uses Nests-Mac" <<<"$1" && grep -q "rule legacy-app/gre: uses GRE" <<<"$1"' _ "$out"
 check "the rest of the policy is still adopted" bash -c 'grep -q "^  web-to-db:" <<<"$1" && grep -q "^  jump-https:" <<<"$1" && ! grep -q "^  inline:" <<<"$1"' _ "$P"
@@ -634,11 +635,13 @@ check "the policy module takes an address in a rule without looking it up as a g
 cp data/policies/g-pol.yaml "$SCRATCH/g-pol.yaml"
 cp data/groups/imported-gm1-mirror.yaml "$SCRATCH/gm1-groups.yaml"
 python3 - <<'PY'
-import yaml
+import importlib.util, yaml
+spec = importlib.util.spec_from_file_location("ie", "scripts/import-estate.py"); ie = importlib.util.module_from_spec(spec); spec.loader.exec_module(ie)
+# Written as the repository writes YAML, so any of its readers takes it.
 d = yaml.safe_load(open("data/policies/g-pol.yaml")); d["rules"]["ips"]["scope"] = ["10.9.9.9"]
-open("data/policies/g-pol.yaml", "w").write(yaml.safe_dump(d))
+open("data/policies/g-pol.yaml", "w").write(ie.to_yaml(d))
 d = yaml.safe_load(open("data/groups/imported-gm1-mirror.yaml")); del d["groups"]["VM-Jump"]["criteria"][0]["member_type"]
-open("data/groups/imported-gm1-mirror.yaml", "w").write(yaml.safe_dump(d))
+open("data/groups/imported-gm1-mirror.yaml", "w").write(ie.to_yaml(d))
 PY
 out="$(python3 scripts/validate-data.py 2>&1)"
 check "an address in an Apply To is refused, and says where addresses are allowed" grep -q "not in its Apply To" <<<"$out"

@@ -1171,8 +1171,9 @@ deploy/gitlab/.env
 deploy/gitlab/ssl/
 # Optional per-host CI network overrides (may hold proxy credentials).
 deploy/gitlab/ci-network.env
-# Provider packages fetched by scripts/ci-image.sh for the CI image.
+# Provider packages and Python wheels fetched by scripts/ci-image.sh for the CI image.
 deploy/ci-image/plugins/
+deploy/ci-image/wheels/
 
 # Originals saved by the generator's update script before it overwrites a file.
 .nsx-update-backup/
@@ -1538,9 +1539,12 @@ Nothing you already have is overwritten: an existing target is written as
 Importing them would change them on the first apply, because Terraform clears
 any setting it does not manage:
 
-- groups with MAC or identity (AD) membership, or extended criteria, and groups
-  that nest one of those;
-- services with entries other than TCP/UDP ports and ICMP;
+- groups with identity (AD) membership or other extended criteria, a group type
+  other than "IP Addresses Only", or a condition whose key, member type or
+  operator the schema does not list, or with a tag-scope operator other than
+  equals (the provider cannot carry it); and groups that nest one of those;
+- services with a nested-service entry, or an ALG entry with other than one
+  destination port;
 - rules with inline service entries, or that use one of the above. The rest of
   their policy is still adopted: Terraform manages rules one by one and leaves
   the others alone;
@@ -1552,6 +1556,13 @@ any setting it does not manage:
 make validate
 ```
 
+- What is taken as it is, exactly as NSX holds it: tag, name and OS conditions,
+  IP and MAC addresses, VMs picked one by one, "IP Addresses Only" groups,
+  empty groups (with a `why_empty` placeholder), services of TCP/UDP, ICMP,
+  IP protocol (GRE, ESP...), ALG, IGMP and EtherType entries, the services NSX
+  ships with (`predefined_ids`, by id: display names are not unique), and
+  rules with sequence number 0 or numbers NSX holds twice in one policy
+  (`allow_duplicate_sequence`).
 - Every group with static membership (IP addresses, or VMs picked one by one:
   `external_ids`, each VM's instance UUID) has a placeholder `why_static`.
   Replace it with the real reason. A VM rebuilt or restored as a new VM gets a
@@ -1560,7 +1571,9 @@ make validate
   does (`172.19.20.57`, `10.1.0.0/16`, `172.17.9.10-172.17.9.20`), next to group
   names. Not in an Apply To, which takes groups only.
 - Tag scopes must be in `data/schema/tag-scopes.yaml`. Add the ones your estate
-  uses deliberately; a typo there silently empties a group.
+  uses deliberately; a typo there silently empties a group. In files adopted
+  from NSX an unlisted scope is a warning (it is a fact of the estate); in
+  files you write it is an error.
 - A rule with an empty `scope` is pushed to every host in the span. The
   validator fails it: that is a finding about your estate, not a bug.
 - Object keys are the real NSX ids, kept verbatim (mixed case included). The
@@ -2795,6 +2808,15 @@ write_file data/schema/group.schema.json <<'SCAFFOLD_EOF'
             "type": "string",
             "description": "Required when the group has static membership. Explain what would let it become dynamic."
           },
+          "why_empty": {
+            "type": "string",
+            "minLength": 1,
+            "description": "A group with no criteria matches nothing; only with this note saying why it exists."
+          },
+          "group_type": {
+            "enum": ["IPAddress"],
+            "description": "IPAddress: an 'IP Addresses Only' group (IP addresses and nested groups of the same type)."
+          },
           "conjunction": { "enum": ["AND", "OR"] },
           "tags": {
             "type": "array",
@@ -2844,6 +2866,11 @@ write_file data/schema/group.schema.json <<'SCAFFOLD_EOF'
                 },
                 "ip_addresses": {
                   "type": "array",
+                  "items": { "type": "string" }
+                },
+                "mac_addresses": {
+                  "type": "array",
+                  "minItems": 1,
                   "items": { "type": "string" }
                 },
                 "external_ids": {
@@ -2898,9 +2925,13 @@ write_file data/schema/policy.schema.json <<'SCAFFOLD_EOF'
         "owner": { "enum": ["gm", "lm"] },
         "domain": { "type": "string" },
         "sites": { "type": "array", "items": { "type": "string" } },
-        "sequence_number": { "type": "integer", "minimum": 1 },
+        "sequence_number": { "type": "integer", "minimum": 0 },
         "stateful": { "type": "boolean" },
         "tcp_strict": { "type": "boolean" },
+        "allow_duplicate_sequence": {
+          "type": "boolean",
+          "description": "Set by the importer when NSX holds rules of this policy with equal sequence numbers; they are kept as they are."
+        },
         "locked": { "type": "boolean" },
         "comments": { "type": "string" },
         "tags": { "type": "array", "items": { "type": "object", "required": ["scope", "tag"], "additionalProperties": false, "properties": { "scope": { "type": "string" }, "tag": { "type": "string" } } } },
@@ -2927,7 +2958,7 @@ write_file data/schema/policy.schema.json <<'SCAFFOLD_EOF'
         "properties": {
           "name": { "type": "string" },
           "description": { "type": "string" },
-          "sequence_number": { "type": "integer", "minimum": 1 },
+          "sequence_number": { "type": "integer", "minimum": 0 },
           "action": { "enum": ["ALLOW", "DROP", "REJECT", "JUMP_TO_APPLICATION"] },
           "direction": { "enum": ["IN", "OUT", "IN_OUT"] },
           "ip_version": { "enum": ["IPV4", "IPV6", "IPV4_IPV6"] },
@@ -2971,6 +3002,14 @@ write_file data/schema/service.schema.json <<'SCAFFOLD_EOF'
         "description": "display_name of a service that already exists in NSX; looked up, not created."
       }
     },
+    "predefined_ids": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[^/]{1,255}$" },
+      "additionalProperties": {
+        "type": "string",
+        "description": "A service NSX ships with, by its id (the key); the value is its display name, for the reader. Used by its path on the manager, never looked up by name."
+      }
+    },
     "custom": {
       "type": "object",
       "propertyNames": { "pattern": "^[^/]{1,255}$" },
@@ -3012,6 +3051,52 @@ write_file data/schema/service.schema.json <<'SCAFFOLD_EOF'
                 "protocol": { "enum": ["ICMPv4", "ICMPv6"] },
                 "icmp_type": { "type": "string" },
                 "icmp_code": { "type": "string" }
+              }
+            }
+          },
+          "ip_protocol": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["protocol"],
+              "additionalProperties": false,
+              "properties": {
+                "display_name": { "type": "string" },
+                "protocol": { "type": "integer", "minimum": 0 }
+              }
+            }
+          },
+          "algorithm": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["algorithm", "destination_port"],
+              "additionalProperties": false,
+              "properties": {
+                "display_name": { "type": "string" },
+                "algorithm": { "enum": ["ORACLE_TNS", "FTP", "SUN_RPC_TCP", "SUN_RPC_UDP", "MS_RPC_TCP", "MS_RPC_UDP", "NBNS_BROADCAST", "NBDG_BROADCAST", "TFTP"] },
+                "destination_port": { "type": "string" },
+                "source_ports": { "type": "array", "items": { "type": "string" } }
+              }
+            }
+          },
+          "igmp": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": { "display_name": { "type": "string" } }
+            }
+          },
+          "ether_type": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["ether_type"],
+              "additionalProperties": false,
+              "properties": {
+                "display_name": { "type": "string" },
+                "ether_type": { "type": "integer", "minimum": 0 }
               }
             }
           }
@@ -3325,6 +3410,7 @@ resource "nsxt_policy_group" "this" {
   display_name = each.value.display_name
   description  = try(each.value.description, null)
   domain       = try(each.value.domain, var.domain)
+  group_type   = try(each.value.group_type, null)
 
   dynamic "criteria" {
     for_each = try(each.value.criteria, [])
@@ -3346,6 +3432,14 @@ resource "nsxt_policy_group" "this" {
 
         content {
           ip_addresses = criteria.value.ip_addresses
+        }
+      }
+
+      dynamic "macaddress_expression" {
+        for_each = length(try(criteria.value.mac_addresses, [])) > 0 ? [1] : []
+
+        content {
+          mac_addresses = criteria.value.mac_addresses
         }
       }
 
@@ -3391,8 +3485,8 @@ resource "nsxt_policy_group" "this" {
 
   lifecycle {
     precondition {
-      condition     = length(try(each.value.criteria, [])) > 0
-      error_message = "Group ${each.key} has no criteria. A group with no membership matches nothing and silently drops traffic."
+      condition     = length(try(each.value.criteria, [])) > 0 || try(each.value.why_empty, "") != ""
+      error_message = "Group ${each.key} has no criteria. A group with no membership matches nothing and silently drops traffic; give it criteria, or a why_empty note saying why it exists."
     }
 
     precondition {
@@ -3499,6 +3593,43 @@ resource "nsxt_policy_service" "this" {
       protocol     = icmp_entry.value.protocol
       icmp_type    = try(icmp_entry.value.icmp_type, null)
       icmp_code    = try(icmp_entry.value.icmp_code, null)
+    }
+  }
+
+  dynamic "ip_protocol_entry" {
+    for_each = try(each.value.ip_protocol, [])
+
+    content {
+      display_name = try(ip_protocol_entry.value.display_name, "${each.key}-ip-${ip_protocol_entry.key}")
+      protocol     = ip_protocol_entry.value.protocol
+    }
+  }
+
+  dynamic "algorithm_entry" {
+    for_each = try(each.value.algorithm, [])
+
+    content {
+      display_name     = try(algorithm_entry.value.display_name, "${each.key}-alg-${algorithm_entry.key}")
+      algorithm        = algorithm_entry.value.algorithm
+      destination_port = algorithm_entry.value.destination_port
+      source_ports     = try(algorithm_entry.value.source_ports, null)
+    }
+  }
+
+  dynamic "igmp_entry" {
+    for_each = try(each.value.igmp, [])
+
+    content {
+      display_name = try(igmp_entry.value.display_name, "${each.key}-igmp-${igmp_entry.key}")
+    }
+  }
+
+  dynamic "ether_type_entry" {
+    for_each = try(each.value.ether_type, [])
+
+    content {
+      display_name = try(ether_type_entry.value.display_name, "${each.key}-ether-${ether_type_entry.key}")
+      ether_type   = ether_type_entry.value.ether_type
     }
   }
 }
@@ -3682,7 +3813,9 @@ resource "nsxt_policy_parent_security_policy" "this" {
     prevent_destroy = true
 
     precondition {
-      condition     = length(local.sequence_numbers) == length(distinct(local.sequence_numbers))
+      # allow_duplicate_sequence: set by the importer on a policy whose rules
+      # NSX itself numbered with duplicates; adopted as they are.
+      condition     = try(var.policy.allow_duplicate_sequence, false) || length(local.sequence_numbers) == length(distinct(local.sequence_numbers))
       error_message = "Duplicate sequence_number in policy ${var.policy.id}. Sequence numbers are allocated, not guessed."
     }
   }
@@ -4408,10 +4541,14 @@ locals {
   service_docs  = [for f in local.service_files : yamldecode(file("${local.data_root}/services/${f}"))]
 
   predefined_services = merge([for d in local.service_docs : try(d.predefined, {})]...)
-  custom_services_all = merge([for d in local.service_docs : try(d.custom, {})]...)
-  custom_services     = { for k, v in local.custom_services_all : k => v if try(v.owner, "gm") == "gm" }
+  # Services NSX ships with, by id: their path is known, so nothing is looked up
+  # (a lookup by display name can match more than one).
+  predefined_service_ids = merge([for d in local.service_docs : try(d.predefined_ids, {})]...)
+  custom_services_all    = merge([for d in local.service_docs : try(d.custom, {})]...)
+  custom_services        = { for k, v in local.custom_services_all : k => v if try(v.owner, "gm") == "gm" }
 
   service_paths = merge(
+    { for k, _ in local.predefined_service_ids : k => "/global-infra/services/${k}" },
     { for k, s in data.nsxt_policy_service.predefined : k => s.path },
     module.services.paths,
   )
@@ -4597,7 +4734,10 @@ locals {
   service_docs  = [for f in local.service_files : yamldecode(file("${local.data_root}/services/${f}"))]
 
   predefined_services = merge([for d in local.service_docs : try(d.predefined, {})]...)
-  custom_services_all = merge([for d in local.service_docs : try(d.custom, {})]...)
+  # Services NSX ships with, by id: their path is known, so nothing is looked up
+  # (a lookup by display name can match the Global Manager's copy too).
+  predefined_service_ids = merge([for d in local.service_docs : try(d.predefined_ids, {})]...)
+  custom_services_all    = merge([for d in local.service_docs : try(d.custom, {})]...)
   # A site-local service is created only on the Local Managers it lists. One with
   # no sites keeps the old meaning, every Local Manager; the validator asks for
   # the list to be explicit.
@@ -4614,6 +4754,7 @@ locals {
 
   service_paths = merge(
     local.global_service_paths,
+    { for k, _ in local.predefined_service_ids : k => "/infra/services/${k}" },
     { for k, s in data.nsxt_policy_service.predefined : k => s.path },
     module.services.paths,
   )
@@ -5736,20 +5877,29 @@ mark_executable scripts/ci-matrix.py
 write_file scripts/yamlcompat.py <<'SCAFFOLD_EOF'
 """YAML loading with no mandatory third-party dependency.
 
-PyYAML is used when it is importable. When it is not, a parser for the subset of
-YAML this repository actually commits takes over: block mappings, block and flow
-sequences, quoted and plain scalars, folded and literal block scalars, comments.
+In order of preference:
 
-The fallback exists so that 'make validate' works on a laptop with nothing
-installed. Terraform itself parses these files with yamldecode, which is a full
-YAML implementation, so the fallback never has to be authoritative — it only has
-to agree on the subset we write.
+  1. PyYAML, when it is importable (the CI image has it).
+  2. Terraform's own yamldecode, when terraform is on PATH: a full YAML parser,
+     and the one the stacks use, so what validates here is what Terraform reads.
+     Many documents are decoded in one terraform call (load_all), and the data
+     files of this repository are all decoded on the first call.
+  3. A reader for the subset of YAML this repository writes: block mappings,
+     block and flow sequences, quoted and plain scalars, block scalars, comments.
+
+NSX_YAML_FALLBACK=1 skips PyYAML, as on an image without it.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import Any
 
 try:  # pragma: no cover - environment dependent
@@ -5758,16 +5908,120 @@ except ImportError:  # pragma: no cover
     _pyyaml = None
 
 
-def load_yaml(text: str) -> Any:
-    # NSX_YAML_FALLBACK=1 uses the built-in parser even where PyYAML exists, as
-    # on a CI image without it: tests hold the two to the same answers.
+def reader() -> str:
+    """Which reader load_yaml uses here: pyyaml, terraform or subset."""
     if _pyyaml is not None and os.environ.get("NSX_YAML_FALLBACK") != "1":
-        return _pyyaml.safe_load(text)
-    return _Parser(text).parse()
+        return "pyyaml"
+    if shutil.which("terraform") and os.environ.get("NSX_YAML_NO_TERRAFORM") != "1" and not _TERRAFORM_BROKEN:
+        return "terraform"
+    return "subset"
+
+
+def load_yaml(text: str) -> Any:
+    return load_all([text])[0]
+
+
+def load_all(texts: list[str]) -> list[Any]:
+    """Several documents at once: one terraform call where terraform reads them."""
+    how = reader()
+    if how == "pyyaml":
+        return [_pyyaml.safe_load(t) for t in texts]
+    if how == "subset":
+        return [_Parser(t).parse() for t in texts]
+    try:
+        return _load_with_terraform(texts)
+    except _Unusable:
+        # terraform is there but does not decode (a wrapper, a broken install):
+        # the subset reader instead, never a false "not valid YAML".
+        _TERRAFORM_BROKEN.append(True)
+        return [_Parser(t).parse() for t in texts]
+
+
+class _Unusable(Exception):
+    pass
+
+
+_TERRAFORM_BROKEN: list[bool] = []
+
+
+def _load_with_terraform(texts: list[str]) -> list[Any]:
+    if not _PRELOADED:
+        _PRELOADED.append(True)
+        root = Path(__file__).resolve().parent.parent
+        _decode([p.read_text() for d in ("data", "inventory") for p in sorted((root / d).rglob("*.yaml"))])
+    _decode([t for t in texts if _key(t) not in _DECODED])
+    out = []
+    for t in texts:
+        value = _DECODED[_key(t)]
+        if isinstance(value, YamlError):
+            raise value
+        out.append(value)
+    return out
 
 
 class YamlError(ValueError):
     pass
+
+
+_DECODED: dict[str, Any] = {}
+_PRELOADED: list[bool] = []
+
+
+def _key(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _decode(texts: list[str]) -> None:
+    """Decode with terraform's yamldecode, all in one call; on a failure, file by
+    file, so each bad document gets its own error."""
+    todo = list(dict.fromkeys(t for t in texts if _key(t) not in _DECODED))
+    if not todo:
+        return
+    values = _terraform(todo)
+    if values is None:
+        if len(todo) == 1:
+            _DECODED[_key(todo[0])] = YamlError(_LAST_ERROR[0] or "not valid YAML")
+            return
+        for t in todo:
+            _decode([t])
+        return
+    for t, v in zip(todo, values):
+        _DECODED[_key(t)] = v
+
+
+_LAST_ERROR: list[str] = [""]
+
+
+def _terraform(texts: list[str]) -> list[Any] | None:
+    with tempfile.TemporaryDirectory() as work:
+        for i, t in enumerate(texts):
+            Path(work, f"{i:08d}.yaml").write_text(t)
+        # fileset, not range(): range stops at 1024 values. Its order is the
+        # files' names, which the zero padding makes the texts' order.
+        expression = 'jsonencode([for f in sort(fileset(path.cwd, "*.yaml")) : yamldecode(file("${path.cwd}/${f}"))])'
+        env = {k: v for k, v in os.environ.items() if not k.startswith("TF_CLI_ARGS")}
+        env.update(CHECKPOINT_DISABLE="1", TF_IN_AUTOMATION="1")
+        run = subprocess.run(["terraform", "console"], input=expression, cwd=work, env=env,
+                             capture_output=True, text=True)
+    if run.returncode != 0:
+        # Terraform frames its message in box-drawing characters and wraps it.
+        detail = re.sub(r"\x1b\[[0-9;]*m", "", run.stderr)
+        detail = " ".join(re.sub(r"[│╷╵]", " ", detail).split())
+        found = re.search(r'Call to function "(yamldecode|jsonencode)" failed: (.*?)(?:\.\s|\.$|$)', detail)
+        if not found:
+            raise _Unusable(detail)  # not about a document: terraform itself is unusable
+        # A document that is not YAML, or holds what Terraform cannot carry (.inf, .nan).
+        _LAST_ERROR[0] = found.group(2).strip() or "not valid YAML"
+        return None
+    literal = run.stdout.strip()
+    # The console prints an HCL string: JSON's escapes, plus $${ and %%{.
+    try:
+        values = json.loads(json.loads(literal.replace("$${", "${").replace("%%{", "%{")))
+    except ValueError as exc:
+        raise _Unusable(literal[:200]) from exc
+    if not isinstance(values, list) or len(values) != len(texts):
+        raise _Unusable(literal[:200])
+    return values
 
 
 _INT = re.compile(r"^[+-]?\d+$")
@@ -5878,7 +6132,14 @@ class _Parser:
             return self._parse_block_scalar(rest, indent)
         if rest == "":
             entry = self._peek()
-            if entry is None or entry[0] <= indent:
+            if entry is None or entry[0] < indent:
+                return None
+            if entry[0] == indent:
+                # A sequence may sit at its key's own indent ("key:" then "- x"),
+                # as many editors and PyYAML write it.
+                content = entry[1].strip()
+                if content == "-" or content.startswith("- "):
+                    return self._parse_sequence(indent)
                 return None
             return self._parse_block(entry[0])
         return _scalar(rest)
@@ -6091,6 +6352,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import os
 import re
 import sys
 from datetime import date, datetime, timezone
@@ -6384,6 +6646,19 @@ def check_inventory(report: Report) -> dict:
     return managers
 
 
+def as_date(value) -> date:
+    """A YAML date as any reader gives it: a date (PyYAML), or a string, with a
+    time (Terraform's yamldecode: 2026-11-01T00:00:00Z) or without."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value)
+    if not re.match(r"^\d{4}-\d{2}-\d{2}(T00:00:00(Z|[+-]00:00)?)?$", text):
+        raise ValueError(text)
+    return date.fromisoformat(text[:10])
+
+
 def check_delegations(managers: dict, report: Report) -> None:
     """inventory/delegations.yaml: standby approvals for change control
     (scripts/change-control.py). Each hands one Maintainer's approval to another
@@ -6411,7 +6686,7 @@ def check_delegations(managers: dict, report: Report) -> None:
         elif d["from"] == d["to"]:
             report.error(where, f"{label}: {d['from']} cannot stand in for themselves")
         try:
-            until = date.fromisoformat(str(d.get("until")))
+            until = as_date(d.get("until"))
         except ValueError:
             report.error(where, f"{label}: until must be a date, YYYY-MM-DD (the last day it applies, UTC)")
             continue
@@ -6437,7 +6712,11 @@ def check_tag_scopes(report: Report) -> dict:
     return doc.get("scopes") or {}
 
 
-def check_tag_value(where: str, label: str, member_type: str, value: str, scopes: dict, report: Report) -> None:
+def check_tag_value(where: str, label: str, member_type: str, value: str, scopes: dict, report: Report,
+                    imported: bool = False) -> None:
+    # In a file adopted from NSX the tag is a fact of the estate: what it does
+    # not match in the vocabulary is reported, and the copy still validates.
+    flag = report.warn if imported else report.error
     if "|" not in value:
         report.warn(
             where,
@@ -6447,7 +6726,7 @@ def check_tag_value(where: str, label: str, member_type: str, value: str, scopes
         return
     scope, _, tag_value = value.partition("|")
     if scope not in scopes:
-        report.error(
+        flag(
             where,
             f"{label}: tag scope {scope!r} is not in data/schema/tag-scopes.yaml. Adding a "
             "scope is a reviewed change; a typo here silently empties the group.",
@@ -6456,7 +6735,7 @@ def check_tag_value(where: str, label: str, member_type: str, value: str, scopes
     spec = scopes[scope] or {}
     allowed = spec.get("values")
     if allowed and tag_value not in allowed:
-        report.error(where, f"{label}: {tag_value!r} is not a permitted value for scope {scope!r} ({', '.join(allowed)})")
+        flag(where, f"{label}: {tag_value!r} is not a permitted value for scope {scope!r} ({', '.join(allowed)})")
     applies = spec.get("applies_to")
     if applies and member_type and member_type not in applies:
         report.warn(where, f"{label}: scope {scope!r} is documented for {', '.join(applies)}, not {member_type}")
@@ -6494,7 +6773,9 @@ def check_groups(docs: dict[Path, dict], scopes: dict, sites: set[str], imported
                     report.error(where, f"{name}: site {site!r} is not in inventory/managers.yaml")
 
             criteria = group.get("criteria") or []
-            static = any(c.get("ip_addresses") or c.get("external_ids") for c in criteria if isinstance(c, dict))
+            static = any(c.get("ip_addresses") or c.get("external_ids") or c.get("mac_addresses") for c in criteria if isinstance(c, dict))
+            if not criteria and not group.get("why_empty"):
+                report.error(where, f"{name}: no criteria. A group with no membership matches nothing; give it criteria, or a why_empty note saying why it exists.")
             for i, criterion in enumerate(criteria):
                 if isinstance(criterion, dict) and bool(criterion.get("external_ids")) != bool(criterion.get("member_type")):
                     report.error(where, f"{name}.criteria[{i}]: external_ids and member_type go together: the ids name members of that type.")
@@ -6520,7 +6801,8 @@ def check_groups(docs: dict[Path, dict], scopes: dict, sites: set[str], imported
                             "'app|payments' also matches 'app|payments-test'. Prefer EQUALS.",
                         )
                     if condition.get("key") == "Tag":
-                        check_tag_value(where, label, condition.get("member_type", ""), str(condition.get("value", "")), scopes, report)
+                        check_tag_value(where, label, condition.get("member_type", ""), str(condition.get("value", "")), scopes, report,
+                                        imported=where in imported)
 
     # Nested membership: the stacks resolve groups in two passes, so a composite
     # group may only reference a base group.
@@ -6573,11 +6855,21 @@ def check_services(docs: dict[Path, dict], sites: set[str], imported: set[str], 
             origin[name] = where
             check_key_style(where, "service", name, imported, report)
 
+        for name, display in (doc.get("predefined_ids") or {}).items():
+            known = services.get(name)
+            if known and known["kind"] == "predefined":
+                continue  # the same service NSX ships with, named by several adoptions
+            if name in services:
+                report.error(where, f"service {name!r} is also defined in {origin[name]}")
+                continue
+            services[name] = {"kind": "predefined", "display_name": display, "owner": None}
+            origin[name] = where
+
         for name, service in (doc.get("custom") or {}).items():
             if name in services:
                 report.error(where, f"service {name!r} is also defined in {origin[name]}")
                 continue
-            if not (service.get("l4_port_set") or service.get("icmp")):
+            if not any(service.get(k) for k in ("l4_port_set", "icmp", "ip_protocol", "algorithm", "igmp", "ether_type")):
                 report.error(where, f"service {name!r} has no entries — it would match nothing.")
             service_sites = service.get("sites") or []
             if service.get("owner", "gm") == "lm" and not service_sites:
@@ -6705,7 +6997,9 @@ def check_policies(
             seq = rule.get("sequence_number")
             if isinstance(seq, int):
                 if seq in sequence_numbers:
-                    report.error(where, f"{label}: sequence_number {seq} already used by {sequence_numbers[seq]}. Sequence numbers are allocated, not guessed.")
+                    # NSX orders equal numbers itself; adopted as they are, they are noted.
+                    (report.warn if where in imported else report.error)(
+                        where, f"{label}: sequence_number {seq} already used by {sequence_numbers[seq]}. Sequence numbers are allocated, not guessed.")
                 sequence_numbers[seq] = label
                 if seq % 100 != 0 and where not in imported:
                     report.warn(where, f"{label}: sequence_number {seq} is not a multiple of 100. Gaps are what let a rule be inserted later without renumbering.")
@@ -6960,6 +7254,14 @@ def main() -> int:
         f"{tagged_vms} tagged VM(s): "
         f"{len(report.errors)} error(s), {len(report.warnings)} warning(s)"
     )
+
+    import yamlcompat  # noqa: PLC0415
+    how = yamlcompat.reader()
+    if how == "terraform":
+        print("note: PyYAML is not installed here: YAML was read with Terraform's yamldecode, as the stacks read it.")
+    elif how == "subset":
+        print("note: neither PyYAML nor terraform is here: YAML was read with the built-in reader, which accepts the "
+              "YAML this repository writes but not every form YAML allows.")
 
     if report.errors:
         return 1
@@ -7730,6 +8032,9 @@ def convert_group(group: dict, path_to_name: dict, owner: str, sites: list[str])
         elif kind == "IPAddressExpression":
             criteria.append({"ip_addresses": expression.get("ip_addresses", [])})
             static = True
+        elif kind == "MACAddressExpression":
+            criteria.append({"mac_addresses": expression.get("mac_addresses", [])})
+            static = True
         elif kind == "ExternalIDExpression":
             # Members picked one by one in the UI: virtual machines by instance UUID.
             criteria.append({"member_type": expression.get("member_type", "VirtualMachine"),
@@ -7752,10 +8057,17 @@ def convert_group(group: dict, path_to_name: dict, owner: str, sites: list[str])
             "IMPORTED AS-IS from the live manager. Replace this note with the real reason "
             "the membership is static, and what would let it become dynamic."
         )
+    if (group.get("group_type") or []) == ["IPAddress"]:
+        out["group_type"] = "IPAddress"  # "IP Addresses Only" in the UI
     if conjunction and len(criteria) > 1:
         out["conjunction"] = conjunction
     if criteria:
         out["criteria"] = criteria
+    else:
+        out["why_empty"] = (
+            "IMPORTED AS-IS: this group has no membership criteria in NSX, so it matches nothing "
+            "(or its members are managed elsewhere). Replace this note with the reason, or delete the group."
+        )
     if tags_of(group):
         out["tags"] = tags_of(group)
     return out
@@ -7842,6 +8154,9 @@ def convert_policy(policy: dict, group_paths: dict, service_paths: dict, owner: 
     rules = {}
     for rule in policy.get("rules", []):
         rules[rule["id"]] = convert_rule(rule, group_paths, service_paths)
+    numbers = [r["sequence_number"] for r in rules.values()]
+    if len(numbers) != len(set(numbers)):
+        header["allow_duplicate_sequence"] = True
 
     return {"policy": header, "rules": rules}
 
@@ -7852,6 +8167,7 @@ def convert_service(service: dict) -> dict:
         out["description"] = service["description"]
     l4: list[dict] = []
     icmp: list[dict] = []
+    other: dict[str, list[dict]] = {}
     for entry in service.get("service_entries", []):
         kind = entry.get("resource_type")
         if kind == "L4PortSetServiceEntry":
@@ -7873,19 +8189,70 @@ def convert_service(service: dict) -> dict:
             if entry.get("icmp_code") is not None:
                 item["icmp_code"] = str(entry["icmp_code"])
             icmp.append(item)
+        elif kind == "IPProtocolServiceEntry":
+            item = {"protocol": int(entry["protocol_number"])}
+            if entry.get("display_name"):
+                item["display_name"] = entry["display_name"]
+            other.setdefault("ip_protocol", []).append(item)
+        elif kind == "ALGTypeServiceEntry":
+            item = {"algorithm": entry["alg"], "destination_port": str((entry.get("destination_ports") or [""])[0])}
+            if entry.get("display_name"):
+                item["display_name"] = entry["display_name"]
+            if entry.get("source_ports"):
+                item["source_ports"] = [str(p) for p in entry["source_ports"]]
+            other.setdefault("algorithm", []).append(item)
+        elif kind == "IGMPTypeServiceEntry":
+            other.setdefault("igmp", []).append({"display_name": entry["display_name"]} if entry.get("display_name") else {})
+        elif kind == "EtherTypeServiceEntry":
+            item = {"ether_type": int(entry["ether_type"])}
+            if entry.get("display_name"):
+                item["display_name"] = entry["display_name"]
+            other.setdefault("ether_type", []).append(item)
     if l4:
         out["l4_port_set"] = l4
     if icmp:
         out["icmp"] = icmp
+    out.update(other)
     return out
 
 
 # What this converter and the modules represent exactly. Anything else would be
 # lost on the first apply (an unset attribute is cleared), so such objects are
 # never adopted: they stay in the UI and are reported.
-GROUP_EXPRESSIONS = {"Condition", "NestedExpression", "IPAddressExpression", "ExternalIDExpression", "PathExpression", "ConjunctionOperator"}
+GROUP_EXPRESSIONS = {"Condition", "NestedExpression", "IPAddressExpression", "MACAddressExpression",
+                     "ExternalIDExpression", "PathExpression", "ConjunctionOperator"}
 EXTERNAL_ID_TYPES = {"VirtualMachine", "VirtualNetworkInterface", "CloudNativeServiceInstance", "PhysicalServer"}
-SERVICE_ENTRIES = {"L4PortSetServiceEntry", "ICMPTypeServiceEntry"}
+SERVICE_ENTRIES = {"L4PortSetServiceEntry", "ICMPTypeServiceEntry", "IPProtocolServiceEntry", "ALGTypeServiceEntry",
+                   "IGMPTypeServiceEntry", "EtherTypeServiceEntry"}
+ALGORITHMS = {"ORACLE_TNS", "FTP", "SUN_RPC_TCP", "SUN_RPC_UDP", "MS_RPC_TCP", "MS_RPC_UDP", "NBNS_BROADCAST", "NBDG_BROADCAST", "TFTP"}
+
+
+def condition_values() -> dict[str, set[str]]:
+    """What data/schema/group.schema.json accepts in a condition: a condition
+    with anything else is not adopted, so the copy always validates."""
+    schema = json.loads((DATA / "schema" / "group.schema.json").read_text())
+    item = schema["properties"]["groups"]["additionalProperties"]["properties"]["criteria"]["items"]
+    fields = item["properties"]["conditions"]["items"]["properties"]
+    return {k: set(fields[k]["enum"]) for k in ("key", "member_type", "operator")}
+
+
+CONDITION_VALUES: dict[str, set[str]] = {}
+
+
+def condition_unsupported(expression: dict) -> str | None:
+    if not CONDITION_VALUES:
+        CONDITION_VALUES.update(condition_values())
+    for field, default in (("key", "Tag"), ("member_type", "VirtualMachine"), ("operator", "EQUALS")):
+        value = expression.get(field, default)
+        if value not in CONDITION_VALUES[field]:
+            return f"a condition with {field} {value}"
+    if expression.get("scope_operator", "EQUALS") != "EQUALS":
+        # The provider has no scope_operator: written without it, the condition
+        # would match a different set of members.
+        return f"a condition with scope_operator {expression['scope_operator']}"
+    if not str(expression.get("value", "")):
+        return "a condition with an empty value"
+    return None
 
 
 def group_unsupported(group: dict) -> str | None:
@@ -7901,16 +8268,32 @@ def group_unsupported(group: dict) -> str | None:
     for expression in group.get("expression", []):
         if expression.get("resource_type") == "ExternalIDExpression" and expression.get("member_type", "VirtualMachine") not in EXTERNAL_ID_TYPES:
             return f"external ids of {expression.get('member_type')}"
+        conditions = [expression] if expression.get("resource_type") == "Condition" else [
+            e for e in expression.get("expressions", []) if e.get("resource_type") == "Condition"]
+        for c in conditions:
+            if why := condition_unsupported(c):
+                return why
     if group.get("extended_expression"):
         return "extended criteria (identity firewall)"
-    if group.get("group_type"):
-        return "group_type " + ", ".join(group["group_type"])
+    group_type = group.get("group_type") or []
+    if group_type and group_type != ["IPAddress"]:
+        return "group_type " + ", ".join(group_type)
     return None
 
 
 def service_unsupported(service: dict) -> str | None:
-    kinds = {e.get("resource_type") for e in service.get("service_entries", [])} - SERVICE_ENTRIES
-    return ("service entries of type " + ", ".join(sorted(str(k) for k in kinds))) if kinds else None
+    entries = service.get("service_entries", [])
+    kinds = {e.get("resource_type") for e in entries} - SERVICE_ENTRIES
+    if kinds:
+        return "service entries of type " + ", ".join(sorted(str(k) for k in kinds))
+    for e in entries:
+        if e.get("resource_type") == "ALGTypeServiceEntry" and (e.get("alg") not in ALGORITHMS or len(e.get("destination_ports") or []) != 1):
+            return f"an ALG entry {e.get('alg')} with {len(e.get('destination_ports') or [])} destination port(s)"
+        if e.get("resource_type") == "IPProtocolServiceEntry" and e.get("protocol_number") is None:
+            return "an IP protocol entry without a protocol number"
+        if e.get("resource_type") == "EtherTypeServiceEntry" and e.get("ether_type") is None:
+            return "an EtherType entry without an ether type"
+    return None
 
 
 def unsupported_objects(groups: list[dict], services: list[dict], start: dict[str, str] | None = None) -> dict[str, str]:
@@ -8006,12 +8389,14 @@ def import_file(site: str, tranche: str, role: str, kinds: list[tuple[str, str, 
     lines = [header, "locals {"]
     for kind, _, entries in kinds:
         lines.append(f"  {name}_{kind} = {{")
+        # Aligned on '=' as terraform fmt aligns it, so 'fmt -check' passes as written.
+        width = max((len(hcl_string(k)) for k in entries), default=0)
         for key, value in entries.items():
             if isinstance(value, dict):
                 inner = ", ".join(f"{k} = {hcl_string(v)}" for k, v in value.items())
-                lines.append(f"    {hcl_string(key)} = {{ {inner} }}")
+                lines.append(f"    {hcl_string(key).ljust(width)} = {{ {inner} }}")
             else:
-                lines.append(f"    {hcl_string(key)} = {hcl_string(value)}")
+                lines.append(f"    {hcl_string(key).ljust(width)} = {hcl_string(value)}")
         lines.append("  }")
     lines.append("}")
     lines.append("")
@@ -8418,7 +8803,9 @@ def main() -> int:
     if custom or predefined:
         document: dict = {}
         if predefined:
-            document["predefined"] = predefined
+            # By id, never by display name: names are not unique (a federated
+            # Local Manager lists its own HTTPS and the Global Manager's).
+            document["predefined_ids"] = predefined
         if custom:
             for definition in custom.values():
                 definition["owner"] = owner
@@ -9342,7 +9729,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from yamlcompat import load_yaml  # noqa: E402
+from yamlcompat import load_all  # noqa: E402
 
 LABEL = "nsx-drift"
 MIRROR_MARK = "# nsx-mirror: "
@@ -9413,10 +9800,10 @@ class GitLab:
 def mirror_objects(files: dict[str, str], site: str) -> dict[tuple[str, str], dict]:
     """(kind, id) -> definition, from this site's mirror files."""
     out: dict[tuple[str, str], dict] = {}
-    for path, text in files.items():
-        if text.split("\n", 1)[0].strip() != f"{MIRROR_MARK}{site}":
-            continue
-        doc = load_yaml(text) or {}
+    mine = {path: text for path, text in files.items() if text.split("\n", 1)[0].strip() == f"{MIRROR_MARK}{site}"}
+    # In one go: without PyYAML that is one terraform call, not one per file.
+    for (path, text), doc in zip(mine.items(), load_all(list(mine.values()))):
+        doc = doc or {}
         if path.startswith("data/groups/"):
             for key, value in (doc.get("groups") or {}).items():
                 out[("group", str(key))] = value
@@ -11115,7 +11502,9 @@ write_file deploy/ci-image/Dockerfile <<'SCAFFOLD_EOF'
 #
 # The NSX provider pinned in providers.tf is in the image too, so a plan never
 # downloads it. ci-image.sh fetches it into plugins/ on the host before the
-# build, the way jobs reach the internet. Terraform uses
+# build, the way jobs reach the internet. Likewise the Python packages pinned in
+# requirements.txt (PyYAML, so validation reads YAML with a full parser), into
+# wheels/, installed here from those files alone. Terraform uses
 # /usr/local/share/terraform/plugins on its own (an implied local mirror):
 # providers found there are never looked up anywhere else. A job that sets
 # NSX_TF_NETWORK_MIRROR or NSX_TF_FS_MIRROR uses that instead.
@@ -11125,6 +11514,10 @@ FROM python:3.12-bookworm
 
 COPY --from=terraform /bin/terraform /usr/local/bin/terraform
 COPY plugins/ /usr/local/share/terraform/plugins/
+COPY wheels/ /tmp/wheels/
+RUN if ls /tmp/wheels/*.whl >/dev/null 2>&1; then \
+      pip install --no-index --no-deps --no-cache-dir --disable-pip-version-check /tmp/wheels/*.whl; \
+    fi && rm -rf /tmp/wheels
 
 ENV TF_IN_AUTOMATION=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -11138,6 +11531,14 @@ CMD ["bash"]
 
 RUN terraform version && python3 --version && bash --version >/dev/null \
     && curl --version >/dev/null && git --version && make --version >/dev/null
+SCAFFOLD_EOF
+
+write_file deploy/ci-image/requirements.txt <<'SCAFFOLD_EOF'
+# Python packages built into the CI image (see Dockerfile), exact versions.
+# PyYAML: scripts/validate-data.py and the pipeline scripts read YAML with it.
+# Without it they fall back to a reader for a subset of YAML, which refuses
+# valid YAML outside that subset.
+PyYAML==6.0.2
 SCAFFOLD_EOF
 
 write_file deploy/ci-image/providers.tf <<'SCAFFOLD_EOF'
@@ -11291,6 +11692,12 @@ write_file scripts/ci-image.sh <<'SCAFFOLD_EOF'
 # and this exits 2: jobs then download it themselves, and the next run tries
 # again.
 #
+# The Python packages pinned in deploy/ci-image/requirements.txt (PyYAML) are
+# fetched the same way, with pip in the Python base image: from PyPI through the
+# job proxy, or from NSX_PIP_INDEX_URL (your own PyPI mirror) when set. If that
+# fails the image is still built, validation falls back to its built-in YAML
+# reader, and this exits 2 and tries again next time.
+#
 # NSX_CI_IMAGE (default nsx-ci:1). A name that does not start with 'nsx-ci:' is
 # treated as an image from your own registry: it is pulled, not built.
 
@@ -11321,7 +11728,9 @@ verify() {
 }
 
 PLUGINS="$CONTEXT/plugins"
+WHEELS="$CONTEXT/wheels"
 PROVIDER_DIR="registry.terraform.io/vmware/nsxt"
+pyyaml_inside() { docker run --rm "$IMAGE" python3 -c 'import yaml' >/dev/null 2>&1; }
 baked() { # the image holds the pinned provider for this host's platform
 	docker run --rm "$IMAGE" sh -c "ls /usr/local/share/terraform/plugins/$PROVIDER_DIR/terraform-provider-nsxt_$(provider_version)_linux_$(platform)*.zip" >/dev/null 2>&1
 }
@@ -11365,6 +11774,36 @@ fetch_providers() {
 	return 1
 }
 
+# Fetch the pinned Python packages into $WHEELS with pip, as a job would reach
+# the internet. Returns 1, with the reason in $log, if it could not.
+fetch_wheels() {
+	local envfile bundle=() attempt pyimg index=()
+	pyimg="$(bases | sed -n 2p)"
+	rm -rf "$WHEELS"
+	mkdir -p "$WHEELS"
+	envfile="$(mktemp)"
+	[ -x "$REPO_ROOT/scripts/gitlab-runner.sh" ] && "$REPO_ROOT/scripts/gitlab-runner.sh" --print-env >"$envfile" 2>/dev/null
+	for ca in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt; do
+		[ -f "$ca" ] && bundle=(-v "$ca:/etc/ssl/certs/ca-certificates.crt:ro" -e PIP_CERT=/etc/ssl/certs/ca-certificates.crt) && break
+	done
+	[ -z "${NSX_PIP_INDEX_URL:-}" ] || index=(-e "PIP_INDEX_URL=$NSX_PIP_INDEX_URL")
+	for attempt in 1 2 3; do
+		say "fetching Python packages for the CI image (attempt $attempt of 3)..."
+		if docker run --rm --network host --env-file "$envfile" ${bundle[@]+"${bundle[@]}"} ${index[@]+"${index[@]}"} \
+			--user "$(id -u):$(id -g)" -e HOME=/tmp -e PIP_DISABLE_PIP_VERSION_CHECK=1 \
+			-v "$CONTEXT:/ctx" -w /ctx "$pyimg" pip download --only-binary=:all: --no-deps -r /ctx/requirements.txt -d /ctx/wheels >>"$log" 2>&1 &&
+			ls "$WHEELS"/*.whl >/dev/null 2>&1; then
+			rm -f "$envfile"
+			return 0
+		fi
+		[ "$attempt" -lt 3 ] && sleep $((attempt * ${NSX_PULL_RETRY_SLEEP:-15}))
+	done
+	rm -f "$envfile"
+	rm -rf "$WHEELS"
+	mkdir -p "$WHEELS"
+	return 1
+}
+
 why_build_failed() {
 	local log="$1"
 	if grep -Eqi 'toomanyrequests|too many requests|rate limit|\b429\b' "$log"; then
@@ -11396,20 +11835,22 @@ fi
 
 [ -f "$CONTEXT/Dockerfile" ] || die "$CONTEXT/Dockerfile is missing. Bring the tree up to date with update.sh."
 [ -f "$CONTEXT/providers.tf" ] || die "$CONTEXT/providers.tf is missing. Bring the tree up to date with update.sh."
-want="$(cat "$CONTEXT/Dockerfile" "$CONTEXT/providers.tf" | sha256sum | cut -c1-12)"
+[ -f "$CONTEXT/requirements.txt" ] || die "$CONTEXT/requirements.txt is missing. Bring the tree up to date with update.sh."
+want="$(cat "$CONTEXT/Dockerfile" "$CONTEXT/providers.tf" "$CONTEXT/requirements.txt" | sha256sum | cut -c1-12)"
 have="$(docker image inspect -f '{{ index .Config.Labels "nsx.dockerfile" }}' "$IMAGE" 2>/dev/null || true)"
 
-# An image built without the provider is labelled <hash>-noprovider, and is
-# rebuilt (the fetch tried again) on every run until the fetch works.
+# An image built without the provider or the Python packages is labelled
+# <hash>-noprovider and/or -nopython, and is rebuilt (the fetch tried again)
+# on every run until the fetch works.
 if [ "$have" = "$want" ]; then
-	if verify && baked; then
-		say "CI image $IMAGE is current (vmware/nsxt $(provider_version) inside)."
+	if verify && baked && pyyaml_inside; then
+		say "CI image $IMAGE is current (vmware/nsxt $(provider_version) and PyYAML inside)."
 		exit 0
 	fi
 	say "CI image $IMAGE is present but does not pass its checks; rebuilding."
-elif [ "$have" = "$want-noprovider" ]; then
-	[ "$CHECK" = 1 ] && { say "CI image $IMAGE has no NSX provider inside: jobs download it. Run scripts/converge.sh to try again."; exit 2; }
-	say "CI image $IMAGE has no NSX provider inside; trying again."
+elif [[ "$have" == "$want"-no* ]]; then
+	[ "$CHECK" = 1 ] && { say "CI image $IMAGE is incomplete (${have#"$want"-}): run scripts/converge.sh to try again."; exit 2; }
+	say "CI image $IMAGE is incomplete (${have#"$want"-}); trying again."
 elif [ -n "$have" ]; then
 	say "CI image $IMAGE is out of date; rebuilding."
 fi
@@ -11444,6 +11885,13 @@ if ! fetch_providers; then
 	label="$want-noprovider"
 	fetch_failed="$(grep -Ei 'error|failed|could not|timeout|x509|proxy' "$log" | tail -6)"
 fi
+: >"$log.pip"
+if ! log="$log.pip" fetch_wheels; then
+	[ "$label" = "$want" ] && label="$want-nopython" || label="$label-nopython"
+	pip_failed="$(grep -Ei 'error|failed|could not|timeout|x509|proxy|ssl' "$log.pip" | tail -4)"
+fi
+cat "$log.pip" >>"$log"
+rm -f "$log.pip"
 say "building CI image $IMAGE (a minute or two the first time)..."
 if ! docker build --pull=false --label "nsx.dockerfile=$label" -t "$IMAGE" "$CONTEXT" >>"$log" 2>&1; then
 	# Registry metadata lookups can fail where a plain build of cached images still works.
@@ -11458,16 +11906,27 @@ verify || {
 	die "built $IMAGE but it failed its own checks."
 }
 if [ "$label" != "$want" ]; then
-	printf '%s\n' "${fetch_failed:-(no error text)}" | sed 's/^/    /'
-	say "  The NSX provider could not be fetched from this host the way jobs reach the internet, so"
-	say "  jobs will download it themselves. Fix the network (NSX_HTTPS_PROXY in deploy/gitlab/ci-network.env,"
-	say "  the proxy allowing registry.terraform.io, releases.hashicorp.com and release-assets.githubusercontent.com),"
-	say "  or set the CI/CD variable NSX_TF_NETWORK_MIRROR, then run scripts/converge.sh again."
-	say "CI image $IMAGE built and verified, WITHOUT the NSX provider."
+	if [[ "$label" == *-noprovider* ]]; then
+		printf '%s\n' "${fetch_failed:-(no error text)}" | sed 's/^/    /'
+		say "  The NSX provider could not be fetched from this host the way jobs reach the internet, so"
+		say "  jobs will download it themselves. Fix the network (NSX_HTTPS_PROXY in deploy/gitlab/ci-network.env,"
+		say "  the proxy allowing registry.terraform.io, releases.hashicorp.com and release-assets.githubusercontent.com),"
+		say "  or set the CI/CD variable NSX_TF_NETWORK_MIRROR, then run scripts/converge.sh again."
+		say "CI image $IMAGE built and verified, WITHOUT the NSX provider."
+	fi
+	if [[ "$label" == *-nopython* ]]; then
+		printf '%s\n' "${pip_failed:-(no error text)}" | sed 's/^/    /'
+		say "  PyYAML could not be fetched from this host the way jobs reach the internet, so validation"
+		say "  uses its built-in reader, which accepts only the YAML this repository writes. Let the proxy"
+		say "  reach pypi.org and files.pythonhosted.org, or set NSX_PIP_INDEX_URL to your own PyPI mirror,"
+		say "  then run scripts/converge.sh again."
+		say "CI image $IMAGE built and verified, WITHOUT PyYAML."
+	fi
 	exit 2
 fi
 baked || die "built $IMAGE but vmware/nsxt $(provider_version) is not inside it."
-say "CI image $IMAGE built and verified (vmware/nsxt $(provider_version) inside)."
+pyyaml_inside || die "built $IMAGE but PyYAML is not inside it."
+say "CI image $IMAGE built and verified (vmware/nsxt $(provider_version) and PyYAML inside)."
 SCAFFOLD_EOF
 mark_executable scripts/ci-image.sh
 
@@ -11865,7 +12324,14 @@ img_args=()
 out="$("$REPO_ROOT/scripts/ci-image.sh" ${img_args[@]+"${img_args[@]}"} 2>&1)"
 case $? in
 0) ok "$(printf '%s' "$out" | tail -1)" ;;
-2) warn "CI image $CI_IMAGE has no NSX provider inside" "$(printf '%s' "$out" | tail -12 | sed 's/^/ /')" ;;
+2)
+	# Built and working, but without the NSX provider and/or PyYAML: say which.
+	missing=()
+	grep -q "WITHOUT the NSX provider\|no NSX provider inside\|incomplete (noprovider" <<<"$out" && missing+=("no NSX provider inside")
+	grep -q "WITHOUT PyYAML\|nopython" <<<"$out" && missing+=("no PyYAML inside (validation reads YAML with Terraform instead)")
+	[ "${#missing[@]}" -gt 0 ] || missing=("incomplete")
+	warn "CI image $CI_IMAGE has $(IFS=';'; printf '%s' "${missing[*]}" | sed 's/;/; /g')" "$(printf '%s' "$out" | tail -16 | sed 's/^/ /')"
+	;;
 *) fail "CI image $CI_IMAGE" "$(printf '%s' "$out" | tail -12 | sed 's/^/ /')" ;;
 esac
 
@@ -13326,6 +13792,19 @@ def members(gl: GitLab) -> dict[str, int]:
             if not BOT.match(m.get("username", ""))}
 
 
+def as_date(value) -> date:
+    """A YAML date as any reader gives it: a date (PyYAML), or a string, with a
+    time (Terraform's yamldecode: 2026-11-01T00:00:00Z) or without."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value)
+    if not re.match(r"^\d{4}-\d{2}-\d{2}(T00:00:00(Z|[+-]00:00)?)?$", text):
+        raise ValueError(text)
+    return date.fromisoformat(text[:10])
+
+
 def delegations(today: date) -> list[dict]:
     """The standby approvals in force today: a Maintainer's approval handed to
     another engineer until a date (inclusive, UTC)."""
@@ -13335,7 +13814,7 @@ def delegations(today: date) -> list[dict]:
     active = []
     for d in doc.get("delegations") or []:
         try:
-            until = date.fromisoformat(str(d.get("until")))
+            until = as_date(d.get("until"))
         except ValueError:
             continue
         if d.get("from") and d.get("to") and today <= until:
