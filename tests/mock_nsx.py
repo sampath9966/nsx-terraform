@@ -31,7 +31,7 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
     def do_GET(self):
         load()
-        path = self.path.split("?")[0]; log.write(f"GET {self.path}\n"); log.flush()
+        path = urllib.parse.unquote(self.path.split("?")[0]); log.write(f"GET {self.path}\n"); log.flush()
         if path in ("/api/v1/node", "/api/v1/node/version"): return self.send(200, {"node_version": "4.1.2.0.0", "product_version": "4.1.2.0.0"})
         if path in objs: return self.send(200, objs[path])
         if path == "/policy/api/v1/infra/services":

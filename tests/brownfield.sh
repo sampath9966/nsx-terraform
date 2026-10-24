@@ -612,6 +612,7 @@ check "it all validates" python3 scripts/validate-data.py
 check "the group module builds external ids" grep -q "external_id_expression" modules/group/main.tf
 check "the policy module takes an address in a rule without looking it up as a group" bash -c 'grep -q "ip_literal" modules/dfw-policy/main.tf'
 cp data/policies/g-pol.yaml "$SCRATCH/g-pol.yaml"
+cp data/groups/imported-gm1-mirror.yaml "$SCRATCH/gm1-groups.yaml"
 python3 - <<'PY'
 import yaml
 d = yaml.safe_load(open("data/policies/g-pol.yaml")); d["rules"]["ips"]["scope"] = ["10.9.9.9"]
@@ -622,6 +623,29 @@ PY
 out="$(python3 scripts/validate-data.py 2>&1)"
 check "an address in an Apply To is refused, and says where addresses are allowed" grep -q "not in its Apply To" <<<"$out"
 check "external ids without a member_type are refused" grep -q "external_ids and member_type go together" <<<"$out"
+cp "$SCRATCH/g-pol.yaml" data/policies/g-pol.yaml
+cp "$SCRATCH/gm1-groups.yaml" data/groups/imported-gm1-mirror.yaml
+python3 - <<'PY'
+import json
+GD = "/global-infra/domains/default"
+vm = [{"resource_type": "ExternalIDExpression", "member_type": "VirtualMachine", "external_ids": ["502e6f1a-0000-0000-0000-000000000009"]}]
+ids = ["_h-cis-np-ansi02", "_Exchange-GW_VM's", "WIN11 IC SI H 2025"]
+groups = [{"id": i, "path": f"{GD}/groups/{i}", "display_name": i, "expression": vm} for i in ids]
+rules = [{"id": f"r {n}", "path": f"{GD}/security-policies/_My Policy/rules/r {n}", "display_name": "r", "sequence_number": 100 * (n + 1),
+          "action": "ALLOW", "direction": "IN_OUT", "logged": True, "source_groups": [g["path"]], "destination_groups": ["ANY"],
+          "services": ["ANY"], "scope": ["ANY"], "profiles": ["ANY"]} for n, g in enumerate(groups)]
+d = json.load(open("reports/gm1.json"))
+d["groups"] += groups
+d["policies"].append({"id": "_My Policy", "path": f"{GD}/security-policies/_My Policy", "display_name": "My Policy",
+                      "category": "Application", "sequence_number": 50, "scope": ["ANY"], "rules": rules})
+json.dump(d, open("reports/gm1.json", "w"))
+PY
+out="$(mir gm1)"
+check "ids made in the UI ('_h-…', apostrophes, spaces) are adopted verbatim" bash -c '! grep -q "NOT ADOPTED  group _\|NOT ADOPTED  group WIN11" <<<"$1" && test -f "data/policies/_My Policy.yaml" && grep -q "_Exchange-GW_VM" data/groups/imported-gm1-mirror.yaml' _ "$out"
+check "...and validate: an adopted object keeps its own id" bash -c '! python3 scripts/validate-data.py 2>&1 | grep -q "^ERROR"'
+printf 'groups:\n  _new one:\n    display_name: x\n    owner: gm\n    criteria:\n      - conditions:\n          - {key: Tag, member_type: VirtualMachine, operator: EQUALS, value: "app|x"}\n' >data/groups/authored.yaml
+check "a new object written here is still held to letters, digits, '.', '_' and '-'" bash -c 'python3 scripts/validate-data.py 2>&1 | grep -q "a new object.s id is letters, digits"'
+rm data/groups/authored.yaml
 python3 - <<'PY'
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("ie", "scripts/import-estate.py"); ie = importlib.util.module_from_spec(spec); spec.loader.exec_module(ie)

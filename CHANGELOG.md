@@ -19,6 +19,7 @@ cannot fix itself. Run it again after fixing whatever it reported.
 
 - **Groups of VMs picked one by one** (the UI's Members tab, `ExternalIDExpression`). Written as `member_type: VirtualMachine` and `external_ids:` (each VM's instance UUID), with a `why_static` note like any static group. The group module builds them; the validator wants `member_type` with `external_ids`.
 - **IP addresses written in a rule.** A rule's source or destination may name addresses, CIDRs and ranges directly, next to groups. They are kept as written. The validator accepts them in sources and destinations, and refuses them in an Apply To.
+- **Ids as NSX allows them.** Objects made in the UI have ids like `_h-cis-np-ansi02`, `_Exchange-GW_VM's` or `WIN11 IC SI H 2025`. The schemas refused them, so the mirror's merge request would have failed validation, and the importer could not read a policy whose id held a space. An adopted object now keeps its own id, whatever NSX allowed (anything but `/`), and ids are encoded when read. An id written by hand in this repository is still held to letters, digits, `.`, `_` and `-`.
 - **A Global Manager's location domains.** The GM is now read in every domain, not only `default`. A group or policy in a location domain such as `WL-Mum` keeps its `domain:`, so a global rule using it, and a Local Manager rule using it, are taken. An id that exists in two domains is taken from the first (the global domain) and left in the UI in the other, with the reason.
 
 ## 1.4.2

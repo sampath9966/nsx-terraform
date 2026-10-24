@@ -2737,7 +2737,7 @@ write_file data/schema/group.schema.json <<'SCAFFOLD_EOF'
   "properties": {
     "groups": {
       "type": "object",
-      "propertyNames": { "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$" },
+      "propertyNames": { "pattern": "^[^/]{1,255}$" },
       "additionalProperties": {
         "type": "object",
         "required": ["display_name", "owner"],
@@ -2851,7 +2851,7 @@ write_file data/schema/policy.schema.json <<'SCAFFOLD_EOF'
       "properties": {
         "id": {
           "type": "string",
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$",
+          "pattern": "^[^/]{1,255}$",
           "description": "Deterministic nsx_id, adopted verbatim when imported. Never changes; renaming display_name stays metadata-only."
         },
         "name": { "type": "string", "minLength": 1 },
@@ -2883,7 +2883,7 @@ write_file data/schema/policy.schema.json <<'SCAFFOLD_EOF'
     "rules": {
       "type": "object",
       "minProperties": 1,
-      "propertyNames": { "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$" },
+      "propertyNames": { "pattern": "^[^/]{1,255}$" },
       "additionalProperties": {
         "type": "object",
         "required": ["sequence_number", "action", "direction", "scope"],
@@ -2929,7 +2929,7 @@ write_file data/schema/service.schema.json <<'SCAFFOLD_EOF'
   "properties": {
     "predefined": {
       "type": "object",
-      "propertyNames": { "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$" },
+      "propertyNames": { "pattern": "^[^/]{1,255}$" },
       "additionalProperties": {
         "type": "string",
         "description": "display_name of a service that already exists in NSX; looked up, not created."
@@ -2937,7 +2937,7 @@ write_file data/schema/service.schema.json <<'SCAFFOLD_EOF'
     },
     "custom": {
       "type": "object",
-      "propertyNames": { "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$" },
+      "propertyNames": { "pattern": "^[^/]{1,255}$" },
       "additionalProperties": {
         "type": "object",
         "required": ["display_name"],
@@ -6037,6 +6037,7 @@ FUZZY_OPERATORS = {"CONTAINS", "STARTSWITH", "ENDSWITH", "MATCHES"}
 # and must be adopted verbatim, so the convention is only enforced on files this
 # repository authored, not on anything listed in the import manifest.
 CONVENTIONAL_KEY = re.compile(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$")
+AUTHORED_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$")
 
 
 def imported_files() -> set[str]:
@@ -6050,7 +6051,19 @@ def imported_files() -> set[str]:
 
 
 def check_key_style(where: str, kind: str, key: str, imported: set[str], report: Report) -> None:
-    if where in imported or CONVENTIONAL_KEY.match(str(key)):
+    # An imported key is the object's real nsx_id, as NSX allows it: anything
+    # but '/', so '_h-app01', "VM's" and spaces too. An id this repository
+    # authors is held to letters, digits, '.', '_' and '-'.
+    if where in imported:
+        return
+    if not AUTHORED_KEY.match(str(key)):
+        report.error(
+            where,
+            f"{kind} key {key!r}: a new object's id is letters, digits, '.', '_' and '-', starting "
+            "with a letter or digit. (An object adopted from NSX keeps its own id, whatever it is.)",
+        )
+        return
+    if CONVENTIONAL_KEY.match(str(key)):
         return
     report.warn(
         where,
@@ -7471,15 +7484,16 @@ def fetch_estate(host: str, user: str, password: str, base: str, domain: str, in
     groups: list = []
     policies: list = []
     for d in domains:
-        found = results(f"{base}/domains/{d}/groups")
+        found = results(f"{base}/domains/{urllib.parse.quote(d, safe='')}/groups")
         groups += found
         count = 0
-        for summary in results(f"{base}/domains/{d}/security-policies"):
+        for summary in results(f"{base}/domains/{urllib.parse.quote(d, safe='')}/security-policies"):
             # The list endpoint omits rules; fetch each policy in full.
             policies.append(
                 api_get(
                     host,
-                    f"{base}/domains/{d}/security-policies/{summary['id']}",
+                    # Ids made in the UI may hold spaces, quotes or '#'.
+                    f"{base}/domains/{urllib.parse.quote(d, safe='')}/security-policies/{urllib.parse.quote(summary['id'], safe='')}",
                     user,
                     password,
                     insecure,
