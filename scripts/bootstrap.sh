@@ -11872,7 +11872,7 @@ def main() -> int:
             out.append("    NSX_CRED_SCOPE: plan")
             out.append("    APPROVE: \"yes\"")
             out.append("  script:")
-            out.append('    - test -f "stacks/$STACK/tfplan" || { echo "no saved plan: its plan job failed; the next sync tries again" >&2; exit 1; }')
+            out.append('    - test -f "stacks/$STACK/tfplan" || { echo "no saved plan, as its plan job failed; the next sync tries again" >&2; exit 1; }')
             out.append('    - scripts/with-credentials.sh "$SITE" -- scripts/tf.sh apply "$STACK" "$SITE"')
             out.append("")
             continue

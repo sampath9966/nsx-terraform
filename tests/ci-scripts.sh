@@ -389,6 +389,14 @@ own_mr="$(cd "$T" && CI_MERGE_REQUEST_SOURCE_BRANCH_NAME=mirror/hyd-gm01 python3
 check "in its own mirror merge request, a mirror manager's plan must pass" python3 -c "import json,sys;sys.exit(0 if json.loads(sys.argv[1])['allow_failure'] is False else 1)" "$(job "plan global-security @ hyd-gm01" <<<"$own_mr")"
 check "...and no merge request pipeline has sync-state or apply jobs" bash -c '! grep -qE "^\"(sync-state|apply) " <<<"$1"' _ "$own_mr"
 var_child="$(cd "$T" && NSX_MODE_HYD_NP01=mirror NSX_MODE_HYD_GM01=managed CI_COMMIT_BRANCH=main CI_DEFAULT_BRANCH=main python3 scripts/gitlab-child-pipeline.py)"
+# GitLab rejects a script line YAML reads as anything but a string (": " in an
+# unquoted line makes it a mapping). Python's parser accepts that silently, so
+# check every job's script, in every mode, for strings only.
+check "every generated script line is a string GitLab accepts, in every apply mode" bash -c 'cd "$1" && for mode in manual auto; do NSX_APPLY_MODE=$mode CI_COMMIT_BRANCH=main CI_DEFAULT_BRANCH=main python3 scripts/gitlab-child-pipeline.py | python3 -c "
+import sys, yaml
+d = yaml.safe_load(sys.stdin)
+bad = [(n, l) for n, j in d.items() if isinstance(j, dict) for l in j.get(\"script\", []) if not isinstance(l, str)]
+sys.exit(1 if bad else 0)" || exit 1; done' _ "$T"
 check "NSX_MODE_<SITE> overrides the inventory, both ways, without a commit" bash -c 'grep -q "^\"sync-state local-security @ hyd-np01\":" <<<"$1" && ! grep -q "^\"apply local-security @ hyd-np01\":" <<<"$1" && grep -q "^\"apply global-security @ hyd-gm01\":" <<<"$1"' _ "$var_child"
 check "...and an unknown value stops the pipeline, naming the variable" bash -c 'cd "$1" && ! out="$(NSX_MODE_HYD_NP01=Mirror python3 scripts/gitlab-child-pipeline.py 2>&1)" && grep -q "NSX_MODE_HYD_NP01 must be one of: managed, mirror" <<<"$out"' _ "$T"
 check "the inventory schema accepts mode" bash -c 'cd "$1" && ! python3 scripts/validate-data.py 2>&1 | grep -q "\.mode:"' _ "$T"
