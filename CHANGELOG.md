@@ -13,6 +13,12 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.5.2
+
+**Each stack of a manager has its own GitLab state.** `envs/<site>.backend.hcl` names one state per manager, but a manager has several stacks (a Local Manager: local-security, local-network, local-tags, platform). With GitLab-managed state they all used that one state: one stack's sync changed it under the others (`Error: Saved plan is stale` in their sync-state jobs), and once objects were imported each stack's plan would have seen the others' objects as its own, to destroy (plan-guard would have refused, every time). `scripts/tf.sh` now gives each stack its own state beside the manager's, `<name>-<stack>`; a name that already ends in a stack (`hyd-np01-local-security`, as in the example) stays that stack's own, unchanged. A state that every stack shared and that still holds objects stops every plan and apply of that manager, saying how many and how to move them, instead of being left behind: untracked, they would be created again over the live ones. An empty one is simply left behind.
+
+**sync-state plans in its own job.** It used the plan from the plan stage, which another pipeline's sync could make stale before it ran. `scripts/sync-state.sh` plans and applies in one job (still `plan-guard --observe`, the read-only credential, one sync per manager and stack at a time).
+
 ## 1.5.1
 
 A production-readiness pass over the whole path from mirror to apply, run as the pipeline runs it: on a CI image without PyYAML, with `terraform fmt -check`, and with the real NSX provider against a manager shaped like a production one. Each item below would otherwise have stopped the first real mirror at a later step.
