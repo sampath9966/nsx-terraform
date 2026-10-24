@@ -314,6 +314,27 @@ check "a policy and a group deleted in the UI are deleted from the repository" b
 check "...and from the import blocks" bash -c '! git -C "$1" show mirror/lon1:stacks/local-security/import-lon1-mirror.tf | grep -q "New-G\|new-app"' _ "$SCRATCH/remote.git"
 check "...and from the manifest" bash -c '! git -C "$1" show mirror/lon1:data/.import-manifest.json | grep -q new-app' _ "$SCRATCH/remote.git"
 
+# A large manager: its file list and report are over the kernel's 128 KiB limit
+# for one environment variable or argument, and over what a description holds.
+python3 - <<'PY'
+import json
+d = json.load(open("reports/lon1-raw.json"))
+fresh = next(p for p in d["policies"] if p["id"] == "fresh-app")
+for i in range(4000):
+    d["policies"].append(json.loads(json.dumps(fresh).replace("fresh-app", f"bulk-application-policy-{i:04d}")))
+json.dump(d, open("reports/lon1-raw.json", "w"))
+PY
+out="$(mirror)"
+printf '%s\n' "$out" >"$SCRATCH/large.out"
+check "a large manager is mirrored: its text reaches the merge request through files, not the environment" bash -c '! grep -q "Argument list too long" "$1" && grep -q "updated merge request" "$1" && git -C "$2" show mirror/lon1:data/policies/bulk-application-policy-3999.yaml >/dev/null' _ "$SCRATCH/large.out" "$SCRATCH/remote.git"
+check "...and the merge request lists the first 400 files, pointing at the job log for the rest" python3 -c "import json,sys;l=[json.loads(x) for x in open(sys.argv[1])];b=[x for x in l if x['method'] in ('POST','PUT') and 'description' in (x.get('body') or {})][-1]['body']['description'];sys.exit(0 if 'more: see the mirror job' in b and len(b) < 1000000 else 1)" "$SCRATCH/gl.log"
+python3 - <<'PY'
+import json
+d = json.load(open("reports/lon1-raw.json"))
+d["policies"] = [p for p in d["policies"] if not p["id"].startswith("bulk-application-policy-")]
+json.dump(d, open("reports/lon1-raw.json", "w"))
+PY
+
 out="$(mirror MIRROR_SITE=nyc1)"
 rc=$?
 check "a manager in mode: managed is refused, and the job fails" bash -c '[ "$2" -ne 0 ] && grep -q "nyc1 is in mode: managed" <<<"$1" && ! git -C "$3" rev-parse -q --verify refs/heads/mirror/nyc1' _ "$out" "$rc" "$SCRATCH/remote.git"

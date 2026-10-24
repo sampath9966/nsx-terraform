@@ -13,6 +13,12 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.4.2
+
+**The mirror job works on large managers.** A manager with thousands of objects made the mirror job fail with `python3: Argument list too long` just after pushing `mirror/<site>`, so the merge request was never opened. The list of changed files and the importer's report went to Python in environment variables, and Linux limits one variable to 128 KiB. They now go through files. The adopt job had the same limit, and is fixed the same way.
+
+**A merge request's description stays within GitLab's limit.** The mirror and adopt merge requests list at most 400 files and 400 "left in the UI" lines; past that they say how many more there are and point at the job's log, which has them all.
+
 ## 1.4.1
 
 **A manager's mode comes from `inventory/managers.yaml` only.** The CI/CD variable `NSX_MODE_<SITE>` added in 1.3.0 is gone. Entering and leaving mirror mode is now always a reviewed merge request, and the mode can no longer differ between a merge request's pipeline and the default branch's, as it could with a protected variable. A leftover `NSX_MODE_*` variable stops the pipeline, `tf.sh`, the mirror job and change control, and says to set `mode:` in the inventory instead, so it never looks as if it works.

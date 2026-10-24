@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.4.1"
+VERSION="1.4.2"
 
 ROOT="$PWD"
 FORCE=0
@@ -8767,12 +8767,19 @@ env "${push_env[@]}" git "${auth[@]}" push -q "$remote" "HEAD:refs/heads/$branch
 echo "== opening the merge request"
 api="${CI_API_V4_URL:?CI_API_V4_URL is not set}"
 body="$work/mr.json"
-REPORT="$report" VALIDATION="$validation" BRANCH="$branch" TARGET="${CI_DEFAULT_BRANCH:-main}" \
-	SITE="$SITE" POLICIES="$POLICIES" python3 - "$body" <<'PY'
+# Through files: a large report is over the kernel's limit for one environment
+# variable or argument (128 KiB).
+printf '%s\n' "$report" >"$work/report.txt"
+printf '%s\n' "$validation" >"$work/validation.txt"
+BRANCH="$branch" TARGET="${CI_DEFAULT_BRANCH:-main}" SITE="$SITE" POLICIES="$POLICIES" \
+	python3 - "$body" "$work/report.txt" "$work/validation.txt" <<'PY'
 import json, os, sys
 e = os.environ
-lines = [l for l in e["REPORT"].splitlines() if l.strip() and not l.startswith(("next:", "  1.", "  2.", "  3.", "  4.", "  5."))]
-summary = [l for l in e["VALIDATION"].splitlines() if l.startswith(("ERROR", "checked"))]
+MAX = 400  # lines per list; GitLab caps a description at 1 MB, and the job log has them all
+def capped(lines):
+    return lines if len(lines) <= MAX else lines[:MAX] + [f"... and {len(lines) - MAX} more: see the adopt job's log"]
+lines = capped([l for l in open(sys.argv[2]).read().splitlines() if l.strip() and not l.startswith(("next:", "  1.", "  2.", "  3.", "  4.", "  5."))])
+summary = capped([l for l in open(sys.argv[3]).read().splitlines() if l.startswith(("ERROR", "checked"))])
 description = "\n".join([
     f"Adopts `{e['POLICIES']}` from **{e['SITE']}**, as converted by the `adopt` pipeline job.",
     "",
@@ -8969,18 +8976,26 @@ is applied to NSX; once merged, its state follows by import and refresh."
 		continue
 	fi
 
-	CHANGES="$changes" REPORT="$report" SITE="$site" BRANCH="$branch" TARGET="$target" NEW="${open_mr:-}" \
-		python3 - "$work/mr.json" <<'PY'
+	# Through files: a large manager's text is over the kernel's limit for one
+	# environment variable or argument (128 KiB).
+	printf '%s\n' "$changes" >"$work/changes.txt"
+	printf '%s\n' "$report" >"$work/report.txt"
+	SITE="$site" BRANCH="$branch" TARGET="$target" NEW="${open_mr:-}" \
+		python3 - "$work/mr.json" "$work/changes.txt" "$work/report.txt" <<'PY'
 import json, os, sys
 e = os.environ
+MAX = 400  # lines per list; GitLab caps a description at 1 MB, and the job log has them all
+def capped(lines):
+    return lines if len(lines) <= MAX else lines[:MAX] + [f"... and {len(lines) - MAX} more: see the mirror job's log"]
 kinds = {"A": "added", "M": "changed", "D": "deleted"}
 rows = []
-for line in e["CHANGES"].splitlines():
+for line in open(sys.argv[2]).read().splitlines():
     status, _, path = line.partition("\t")
-    if path.endswith(".import-manifest.json"):
+    if not path or path.endswith(".import-manifest.json"):
         continue
     rows.append(f"| {kinds.get(status[:1], status)} | `{path}` |")
-kept = [l.strip() for l in e["REPORT"].splitlines() if "NOT ADOPTED" in l or "  MANAGED" in l]
+rows = capped(rows)
+kept = capped([l.strip() for l in open(sys.argv[3]).read().splitlines() if "NOT ADOPTED" in l or "  MANAGED" in l])
 description = "\n".join([
     f"**{e['SITE']}** is in mirror mode: engineers change it in the NSX UI, and this merge request",
     "brings the repository up to date with what it holds now. It is regenerated on every sync until merged.",
