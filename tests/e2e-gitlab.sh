@@ -109,6 +109,11 @@ echo "step 4b: bring the host to this release, on a network with no outside acce
 # else: every outside address is sent to a dead proxy, as on a locked-down network.
 export NSX_TEST_BLOCK_EGRESS=1
 if [ "$MODE" = upgrade ]; then
+	# The previous release may already have built the image with the provider
+	# inside (with outside access, in step 1). Remove it, so this release builds
+	# it here, with none: the path where the provider cannot be fetched is then
+	# tested on every upgrade run, whatever the previous release did.
+	docker rmi -f nsx-ci:1 >/dev/null 2>&1 || true
 	# What a consumer does: the tree is from the previous release; pull, run one command.
 	"$REPO/scripts/update.sh" --no-pull --dir "$T" --yes >"$SCRATCH/update.log" 2>&1
 	rc=$?
@@ -129,7 +134,7 @@ check "the runner passes the (blocked) proxy into jobs" docker exec nsx-gitlab-r
 check "the runner excludes every private range from that proxy" bash -c 't=$(docker exec nsx-gitlab-runner cat /etc/gitlab-runner/config.toml); printf "%s" "$t" | grep -q "10.0.0.0/8" && printf "%s" "$t" | grep -q "172.16.0.0/12" && printf "%s" "$t" | grep -q "192.168.0.0/16"'
 check "the clone script does not clear the host proxy" bash -c '! docker exec nsx-gitlab-runner cat /etc/gitlab-runner/config.toml | grep -F -q ".proxy"'
 # fresh: the image was first built in step 1, with outside access, so the NSX
-# provider is inside it. upgrade: this release's image is first built here,
+# provider is inside it. upgrade: the image was removed above and is built here,
 # with none, so the provider cannot be fetched and the image is built without.
 if [ "$MODE" = fresh ]; then
 	check "the NSX provider is in the CI image" docker run --rm nsx-ci:1 sh -c 'ls /usr/local/share/terraform/plugins/registry.terraform.io/vmware/nsxt/*.zip'
