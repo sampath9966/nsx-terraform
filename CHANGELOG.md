@@ -13,6 +13,38 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.4.0
+
+**Change control: two approvals, enforced by the pipeline, and a change log.** GitLab Community Edition has no enforced approval rules or deployment approvals, so `NSX_APPLY_MODE=approval` enforces them in the pipeline (`scripts/change-control.py`, `scripts/approve-apply.sh`; `docs/GITOPS.md`, "Change control"):
+
+- **Change Request.** After the plans on the default branch, a `change request` job opens an issue with what each plan changes in NSX, the merge requests in the change, their authors and reviewers, and the plans in full.
+- **Review check.** Every merge since the last applied change must have been merged or approved by someone other than its author. A self-merged change, or a commit pushed without a merge request, blocks the change request and fails the pipeline.
+- **Approvals.** It needs `NSX_REQUIRED_APPROVALS` (default 2) :thumbsup: on the issue, from Maintainers, never from an author of a change in it.
+- **Standby approvals.** `inventory/delegations.yaml` hands a Maintainer's approval to another engineer until a date, reviewed like any change. A stand-in and their Maintainer count once.
+- **One apply per change.** A single `approve and apply` job applies every manager's saved plan and stops at the first failure. A Maintainer or the approvals schedule (`APPROVAL_SWEEP=1`) starts it, and it checks the approvals again before touching anything. It is manual and non-blocking, so the pipeline shows passed while the change waits.
+- **Record.** The result is written on the Change Request, which is closed or marked failed, and a line is added to the wiki page "NSX Change Log".
+- **Supersession.** A newer change request supersedes an older one still waiting.
+- **Plans per manager.** Plan jobs now also keep their plan under `plans/<site>/<stack>/`, so a job taking several plans gets each manager's own even when two share a stack.
+
+`make validate` checks the standby approvals file and warns about a Global Manager `domain` other than `default`.
+
+**Tests:**
+- `tests/change-control.sh`, against a stand-in GitLab API (`tests/fake_gitlab_cc.py`), covers:
+  - nothing to approve;
+  - the change request's contents;
+  - who counts: author, bot, Developer, Maintainer, ended, foreign and active standby approvals, a stand-in and their Maintainer once;
+  - the approve job applying each manager's own plan, skipping no-ops and mirror managers, stopping at a failure, and recording both results;
+  - the wiki log;
+  - blocking on a self-merged change or a push without a merge request, across every merge since the last applied change;
+  - supersession;
+  - the sweep starting only approved changes, once;
+  - token hygiene;
+  - the validator.
+- `tests/ci-scripts.sh` covers the pipeline structure.
+- `tests/change-control-gitlab.sh` runs the same flow against a **real GitLab**. It verified every API call on GitLab CE 17.5.2: merge requests of a commit, approvals, members, project access tokens, issues, award emoji, wiki, pipeline jobs and job play. `tests/e2e-gitlab.sh` now runs it.
+- The end-to-end test also runs GitLab's own CI lint on every generated pipeline, in every apply mode.
+- On a real GitLab with a runner, a pipeline whose approve job waits shows **success**, and the change request's number reaches that job.
+
 ## 1.3.1
 
 **Pipelines on the default branch end "passed", not "blocked".** A manual apply job used to hold the whole pipeline "blocked" until someone ran or cancelled it, so every merge left a blocked pipeline behind. Manual apply jobs are now non-blocking: the pipeline finishes "passed" once its plans pass, and each apply stays available behind its ▶ button with the same gate as before (manual, the saved plan only, plan-guard again, the protected write credential). An apply that is run and fails shows as failed on the job and as a warning on the pipeline. With `NSX_APPLY_MODE=auto`, applies still fail the pipeline outright.

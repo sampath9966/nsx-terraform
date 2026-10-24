@@ -258,6 +258,31 @@ if [ "$MODE" = fresh ]; then
 	GITLAB_WAIT_MINUTES=20 "$T/scripts/converge.sh" >"$SCRATCH/repair3.log" 2>&1
 	check "converge brings a stopped GitLab back and it answers over HTTPS" curl -sf -o /dev/null --max-time 20 --cacert "$CA" https://127.0.0.1:8443/users/sign_in
 	check "...and the runner is still valid afterwards" bash -c 'docker exec nsx-gitlab-runner gitlab-runner verify 2>&1 | grep -qi "is valid"'
+
+	echo "step 8: GitLab's own CI lint accepts every pipeline the tree generates"
+	# Python's YAML parser accepts lines GitLab refuses (an unquoted ': ' in a
+	# script). So the real lint, on every mode, with a GM, an LM and a mirror LM.
+	L="$SCRATCH/lint"
+	cp -r "$T" "$L"
+	printf 'managers:\n  gm1:\n    role: gm\n    host: g\n    site: gm1\n    vcf_instance: v\n    vault_path: s\n    tier: prod\n  lon1:\n    role: lm\n    host: l\n    site: lon1\n    vcf_instance: v\n    vault_path: s\n    tier: prod\n  nyc1:\n    role: lm\n    host: n\n    site: nyc1\n    vcf_instance: v\n    vault_path: s\n    tier: prod\n    mode: mirror\n' >"$L/inventory/managers.yaml"
+	lint() { # lint <name> <file>
+		python3 -c "import json,sys;print(json.dumps({'content':open(sys.argv[1]).read()}))" "$2" >"$SCRATCH/lint.json"
+		check "GitLab's CI lint accepts $1" bash -c 'python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get(\"errors\"));sys.exit(0 if d.get(\"valid\") else 1)" <<<"$1"' _ \
+			"$(api -X POST -H "Content-Type: application/json" --data @"$SCRATCH/lint.json" "$API/ci/lint")"
+	}
+	lint "the parent pipeline" "$L/.gitlab-ci.yml"
+	for mode in manual auto approval; do
+		(cd "$L" && NSX_APPLY_MODE=$mode CI_COMMIT_BRANCH=main CI_DEFAULT_BRANCH=main python3 scripts/gitlab-child-pipeline.py >"$SCRATCH/child-$mode.yml")
+		lint "the default-branch child pipeline, NSX_APPLY_MODE=$mode" "$SCRATCH/child-$mode.yml"
+	done
+	(cd "$L" && NSX_APPLY_MODE=approval CI_MERGE_REQUEST_SOURCE_BRANCH_NAME=mirror/nyc1 python3 scripts/gitlab-child-pipeline.py >"$SCRATCH/child-mr.yml")
+	lint "a merge request's child pipeline" "$SCRATCH/child-mr.yml"
+
+	echo "step 9: change control against the real GitLab API"
+	GITLAB_CA="$CA" "$REPO/tests/change-control-gitlab.sh" https://127.0.0.1:8443 "Cc-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')-Pw!" nsx-gitlab >"$SCRATCH/cc.log" 2>&1
+	rc=$?
+	sed 's/^/  /' "$SCRATCH/cc.log"
+	check "change control works against the real GitLab API" test "$rc" -eq 0
 fi
 
 finish e2e-gitlab

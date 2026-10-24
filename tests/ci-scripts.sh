@@ -401,6 +401,15 @@ check "NSX_MODE_<SITE> overrides the inventory, both ways, without a commit" bas
 check "...and an unknown value stops the pipeline, naming the variable" bash -c 'cd "$1" && ! out="$(NSX_MODE_HYD_NP01=Mirror python3 scripts/gitlab-child-pipeline.py 2>&1)" && grep -q "NSX_MODE_HYD_NP01 must be one of: managed, mirror" <<<"$out"' _ "$T"
 check "the inventory schema accepts mode" bash -c 'cd "$1" && ! python3 scripts/validate-data.py 2>&1 | grep -q "\.mode:"' _ "$T"
 check "...and rejects anything but managed or mirror" bash -c 'cd "$1" && sed -i "s/mode: mirror/mode: mirrored/" inventory/managers.yaml && python3 scripts/validate-data.py 2>&1 | grep -q "hyd-gm01.mode: .mirrored. is not one of managed, mirror"; rc=$?; sed -i "s/mode: mirrored/mode: mirror/" inventory/managers.yaml; exit $rc' _ "$T"
+appr="$(cd "$T" && NSX_APPLY_MODE=approval CI_COMMIT_BRANCH=main CI_DEFAULT_BRANCH=main python3 scripts/gitlab-child-pipeline.py)"
+check "change control: no apply job per manager, one change request and one approve job" bash -c '! grep -q "^\"apply " <<<"$1" && grep -q "^\"change request\":" <<<"$1" && grep -q "^\"approve and apply\":" <<<"$1"' _ "$appr"
+check "...the change request takes every managed plan (not the mirror's), with full history, and hands on its issue" python3 -c "import json,sys;j=json.loads(sys.argv[1]);n=[x['job'] for x in j['needs']];sys.exit(0 if n==['plan local-security @ hyd-np01','plan local-tags @ hyd-np01','plan local-network @ hyd-np01','plan platform @ hyd-np01'] and j['variables']['GIT_DEPTH']=='0' and j['artifacts']['reports']['dotenv']=='change.env' and j['stage']=='review' else 1)" "$(job "change request" <<<"$appr")"
+check "...the approve job: manual, non-blocking, one at a time, write credential, every plan and the issue" python3 -c "import json,sys;j=json.loads(sys.argv[1]);n=[x['job'] for x in j['needs']];v=j['variables'];sys.exit(0 if j['when']=='manual' and j['allow_failure'] is True and j['resource_group']=='nsx-apply' and v['NSX_CRED_SCOPE']=='apply' and v['APPROVE']=='yes' and n[0]=='change request' and len(n)==5 and j['script']==['scripts/approve-apply.sh'] else 1)" "$(job "approve and apply" <<<"$appr")"
+check "...a mirror manager keeps its automatic read-only sync" grep -q '^"sync-state global-security @ hyd-gm01":' <<<"$appr"
+check "...every plan keeps a copy under its manager's name" python3 -c "import json,sys;j=json.loads(sys.argv[1]);sys.exit(0 if 'plans/hyd-np01/local-security/' in j['artifacts']['paths'] and any('plans/\$SITE/\$STACK' in l for l in j['script']) else 1)" "$(job "plan local-security @ hyd-np01" <<<"$appr")"
+appr_mr="$(cd "$T" && NSX_APPLY_MODE=approval python3 scripts/gitlab-child-pipeline.py)"
+check "...and a merge request pipeline has neither" bash -c '! grep -qE "^\"(change request|approve and apply)\":" <<<"$1"' _ "$appr_mr"
+check "an unknown NSX_APPLY_MODE names the three" bash -c 'cd "$1" && ! out="$(NSX_APPLY_MODE=approve python3 scripts/gitlab-child-pipeline.py 2>&1)" && grep -q "manual., .auto. or .approval." <<<"$out"' _ "$T"
 check "the GitHub apply matrix leaves mirror managers out" bash -c 'cd "$1" && m="$(python3 scripts/ci-matrix.py --format github --managed-only)" && ! grep -q hyd-gm01 <<<"$m" && grep -q hyd-np01 <<<"$m"' _ "$T"
 check "...and is exactly the empty form the apply job tests for when all are mirrors" bash -c 'cd "$1" && sed -i "/^    tier: nonprod$/a\    mode: mirror" inventory/managers.yaml && [ "$(python3 scripts/ci-matrix.py --format github --managed-only)" = "{\"include\": []}" ] && grep -q "apply_matrix != '"'"'{\"include\": \[\]}'"'"'" .github/workflows/apply.yml 2>/dev/null || [ ! -f .github/workflows/apply.yml ]' _ "$T"
 cp "$SCRATCH/managers.keep" "$T/inventory/managers.yaml"
@@ -411,6 +420,16 @@ d = yaml.safe_load(open(sys.argv[1]))
 rules = d["mirror"]["rules"]
 ok = len(rules) == 1 and "$MIRROR_SITE" in rules[0]["if"] and '"schedule"' in rules[0]["if"] and "$CI_DEFAULT_BRANCH" in rules[0]["if"]
 ok = ok and d["mirror"]["variables"]["NSX_CRED_SCOPE"] == "plan" and d["mirror"]["interruptible"] is False
+sys.exit(0 if ok else 1)
+PY
+check "the approvals sweep runs only from a schedule or Run pipeline, on the default branch, with full history" python3 - "$ci" <<'PY'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+j = d["approvals"]
+ok = len(j["rules"]) == 1 and "$APPROVAL_SWEEP" in j["rules"][0]["if"] and '"schedule"' in j["rules"][0]["if"]
+ok = ok and j["variables"]["GIT_DEPTH"] == "0" and j["script"] == ["python3 scripts/change-control.py sweep"]
+for job in ("data", "terraform", "matrix", "managers"):
+    ok = ok and any("$APPROVAL_SWEEP" in r.get("if", "") and r.get("when") == "never" for r in d[job]["rules"])
 sys.exit(0 if ok else 1)
 PY
 check "...and a mirror pipeline runs nothing else" python3 - "$ci" <<'PY'
