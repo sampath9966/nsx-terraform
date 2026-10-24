@@ -13,6 +13,25 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.5.0
+
+**Drift is raised as a GitLab issue, to investigate.** During the observation period, every sync that finds the manager changed in the UI raises an issue labelled `nsx-drift` and `site:<site>`: each object added, changed or deleted, what changed in it, who last changed it and when (from NSX), and a checklist (who and why, keep or revert, should it have been a merge request). A change is raised once, not on every sync. The first copy is the baseline, and objects nobody touched since the last copy (taken over by a newer importer) are not raised. After cutover the new `drift` job (schedule with `DRIFT_SITE`) does the same for managed managers from a refresh-only plan. `scripts/drift.sh` now plans through `tf.sh drift`, so the plan has the manager's variables, state and trust; before, it ran Terraform without them.
+
+**Cutover is one job and one merge request.** *Run pipeline* with `CUTOVER_SITE`: the `cutover` job checks the manager still matches the repository, turns its copy into ordinary data files (no "do not edit" header, `imported-<site>.yaml`, no import blocks), sets `mode: managed`, plans every stack of the manager and requires each plan to change nothing, then opens the merge request. After it is merged, engineers edit the imported objects in their files and add new ones on top, through merge requests. Proven with the real provider: an edited imported rule and an added one plan as exactly `1 to add, 1 to change`.
+
+**Mirror and adopt take three shapes a real estate is full of.** The first mirror of a production Global Manager left most of its rules in the UI for three reasons. All three are now taken over exactly, and proven with the real NSX provider to import with no change and no drift afterwards:
+
+- **Groups of VMs picked one by one** (the UI's Members tab, `ExternalIDExpression`). Written as `member_type: VirtualMachine` and `external_ids:` (each VM's instance UUID), with a `why_static` note like any static group. The group module builds them; the validator wants `member_type` with `external_ids`.
+- **IP addresses written in a rule.** A rule's source or destination may name addresses, CIDRs and ranges directly, next to groups. They are kept as written. The validator accepts them in sources and destinations, and refuses them in an Apply To.
+- **Ids as NSX allows them.** Objects made in the UI have ids like `_h-cis-np-ansi02`, `_Exchange-GW_VM's` or `WIN11 IC SI H 2025`. The schemas refused them, so the mirror's merge request would have failed validation, and the importer could not read a policy whose id held a space. An adopted object now keeps its own id, whatever NSX allowed (anything but `/`), and ids are encoded when read. An id written by hand in this repository is still held to letters, digits, `.`, `_` and `-`.
+- **A Global Manager's location domains.** The GM is now read in every domain, not only `default`. A group or policy in a location domain such as `WL-Mum` keeps its `domain:`, so a global rule using it, and a Local Manager rule using it, are taken. An id that exists in two domains is taken from the first (the global domain) and left in the UI in the other, with the reason.
+
+## 1.4.2
+
+**The mirror job works on large managers.** A manager with thousands of objects made the mirror job fail with `python3: Argument list too long` just after pushing `mirror/<site>`, so the merge request was never opened. The list of changed files and the importer's report went to Python in environment variables, and Linux limits one variable to 128 KiB. They now go through files. The adopt job had the same limit, and is fixed the same way.
+
+**A merge request's description stays within GitLab's limit.** The mirror and adopt merge requests list at most 400 files and 400 "left in the UI" lines; past that they say how many more there are and point at the job's log, which has them all.
+
 ## 1.4.1
 
 **A manager's mode comes from `inventory/managers.yaml` only.** The CI/CD variable `NSX_MODE_<SITE>` added in 1.3.0 is gone. Entering and leaving mirror mode is now always a reviewed merge request, and the mode can no longer differ between a merge request's pipeline and the default branch's, as it could with a protected variable. A leftover `NSX_MODE_*` variable stops the pipeline, `tf.sh`, the mirror job and change control, and says to set `mode:` in the inventory instead, so it never looks as if it works.

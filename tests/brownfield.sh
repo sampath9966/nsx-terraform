@@ -255,6 +255,7 @@ check "...with every adoptable object not declared anywhere else" bash -c 'grep 
 check "...each file marked as the mirror's own" bash -c 'git -C "$1" show mirror/lon1:data/policies/fresh-app.yaml | head -1 | grep -qx "# nsx-mirror: lon1"' _ "$SCRATCH/remote.git"
 check "objects another file declares are left to it" bash -c '! grep -q "other-app\|legacy-app\|data/groups" <<<"$1" && grep -q "MANAGED   policy other-app" <<<"$2" && grep -q "MANAGED   group App-Web" <<<"$2"' _ "$files" "$out"
 check "objects that cannot be represented stay in the UI, reported" grep -q "NOT ADOPTED  policy mac-scoped" <<<"$out"
+check "the first copy is the baseline: no drift issue" bash -c '! grep -q "/issues" "$1" && grep -q "first copy of lon1, the baseline" <<<"$2"' _ "$SCRATCH/gl.log" "$out"
 check "a merge request is opened for it" python3 -c "import json,sys;l=[json.loads(x) for x in open(sys.argv[1])];p=[x for x in l if x['method']=='POST'];sys.exit(0 if len(p)==1 and p[0]['body']['source_branch']=='mirror/lon1' and p[0]['body']['title']=='Mirror lon1 from NSX' and 'Nothing is applied' in p[0]['body']['description'] else 1)" "$SCRATCH/gl.log"
 check "...with the token in a header, never in the output" bash -c 'grep -q "\"token\": \"SECRET-ADOPT-TOKEN\"" "$1" && ! grep -q SECRET-ADOPT-TOKEN <<<"$2"' _ "$SCRATCH/gl.log" "$out"
 check "the capture is never committed" bash -c '! git -C "$1" log --all --name-only --format= | grep -qiE "capture|raw|dump"' _ "$SCRATCH/remote.git"
@@ -281,10 +282,19 @@ python3 - <<'PY'
 import json
 d = json.load(open("reports/lon1-raw.json"))
 D = "/infra/domains/default"
+import time
+now = int(time.time() * 1000)
 d["groups"].append({"id": "New-G", "path": f"{D}/groups/New-G", "display_name": "New-G",
+                    "_last_modified_user": "alice", "_last_modified_time": now,
                     "expression": [{"resource_type": "IPAddressExpression", "ip_addresses": ["10.9.9.9"]}]})
+# Untouched for years: an object only a newer importer can take is not drift.
+d["groups"].append({"id": "Old-G", "path": f"{D}/groups/Old-G", "display_name": "Old-G",
+                    "_last_modified_user": "admin", "_last_modified_time": 1500000000000,
+                    "expression": [{"resource_type": "IPAddressExpression", "ip_addresses": ["10.8.8.8"]}]})
 fresh = next(p for p in d["policies"] if p["id"] == "fresh-app")
 fresh["rules"][0]["action"] = "DROP"
+fresh["rules"][0]["_last_modified_user"] = "bob"
+fresh["rules"][0]["_last_modified_time"] = now
 new = json.loads(json.dumps(fresh).replace("fresh-app", "new-app"))
 new["rules"][0]["source_groups"] = [f"{D}/groups/New-G"]
 d["policies"].append(new)
@@ -295,24 +305,55 @@ files="$(remote_files)"
 check "a group and a policy added in the UI are added" bash -c 'grep -q "^A	data/groups/imported-lon1-mirror.yaml" <<<"$1" && grep -q "^A	data/policies/new-app.yaml" <<<"$1"' _ "$files"
 check "...with their import blocks" bash -c 'f="$(git -C "$1" show mirror/lon1:stacks/local-security/import-lon1-mirror.tf)"; grep -q New-G <<<"$f" && grep -q new-app <<<"$f"' _ "$SCRATCH/remote.git"
 check "a rule changed in the UI follows" bash -c 'grep -q "^M	data/policies/fresh-app.yaml" <<<"$1" && git -C "$2" show mirror/lon1:data/policies/fresh-app.yaml | grep -q "action: DROP"' _ "$files" "$SCRATCH/remote.git"
-check "a new merge request lists the changes" python3 -c "import json,sys;l=[json.loads(x) for x in open(sys.argv[1])];p=[x for x in l if x['method']=='POST'];d=p[-1]['body']['description'];sys.exit(0 if len(p)==2 and '| added | \`data/policies/new-app.yaml\` |' in d and '| changed | \`data/policies/fresh-app.yaml\` |' in d else 1)" "$SCRATCH/gl.log"
+check "a new merge request lists the changes" python3 -c "import json,sys;l=[json.loads(x) for x in open(sys.argv[1])];p=[x for x in l if x['method']=='POST' and x['path'].endswith('/merge_requests')];d=p[-1]['body']['description'];sys.exit(0 if len(p)==2 and '| added | \`data/policies/new-app.yaml\` |' in d and '| changed | \`data/policies/fresh-app.yaml\` |' in d else 1)" "$SCRATCH/gl.log"
 check "MIRROR_AUTO_MERGE=1 sets it to merge when its pipeline passes, retrying until GitLab accepts" bash -c 'grep -q "set to merge when its pipeline passes" <<<"$1" && [ "$(grep -c "/merge_requests/2/merge" "$2")" = 2 ]' _ "$out" "$SCRATCH/gl.log"
 check "the mirrored data passes validation" python3 scripts/validate-data.py
+issue() { python3 -c "import json,sys;l=[json.loads(x) for x in open(sys.argv[1])];p=[x['body'] for x in l if x['method']=='POST' and x['path'].endswith('/issues')];print(json.dumps(p[-1], ensure_ascii=False) if p else '{}');print(len(p))" "$SCRATCH/gl.log"; }
+I="$(issue)"
+check "UI changes raise one drift issue, labelled for the site" bash -c 'grep -q "\"labels\": \"nsx-drift,site:lon1\"" <<<"$1" && tail -1 <<<"$1" | grep -qx 1' _ "$I"
+check "...listing what was added and changed, by whom" bash -c 'grep -q "| added | .group New-G. |  | alice |" <<<"$1" && grep -q "| added | .policy new-app." <<<"$1" && grep -q "| changed | .rule fresh-app/[^.]*. | action ALLOW → DROP | bob |" <<<"$1"' _ "$I"
+check "...but not an old object a newer importer takes for the first time" bash -c '! grep -q "Old-G" <<<"$1"' _ "$I"
+check "...with the investigation checklist" grep -q "Who made each change, and why" <<<"$I"
+out="$(mirror)"
+check "the same changes seen again are not raised again" bash -c '[ "$2" = 1 ] && grep -q "already in an nsx-drift issue" <<<"$1"' _ "$out" "$(issue | tail -1)"
 merge_mirror
 
 # ...and later delete them again.
 python3 - <<'PY'
 import json
 d = json.load(open("reports/lon1-raw.json"))
-d["groups"] = [g for g in d["groups"] if g["id"] != "New-G"]
+d["groups"] = [g for g in d["groups"] if g["id"] not in ("New-G", "Old-G")]
 d["policies"] = [p for p in d["policies"] if p["id"] != "new-app"]
 json.dump(d, open("reports/lon1-raw.json", "w"))
 PY
 out="$(mirror)"
 files="$(remote_files)"
+I="$(issue)"
+check "deletions raise a new drift issue; a policy's rules go with it" bash -c 'tail -1 <<<"$1" | grep -qx 2 && grep -q "| deleted | .policy new-app. | with its 1 rule(s) |" <<<"$1" && grep -q "| deleted | .group New-G." <<<"$1" && ! grep -q "rule new-app/" <<<"$1"' _ "$I"
 check "a policy and a group deleted in the UI are deleted from the repository" bash -c 'grep -q "^D	data/policies/new-app.yaml" <<<"$1" && grep -q "^D	data/groups/imported-lon1-mirror.yaml" <<<"$1"' _ "$files"
 check "...and from the import blocks" bash -c '! git -C "$1" show mirror/lon1:stacks/local-security/import-lon1-mirror.tf | grep -q "New-G\|new-app"' _ "$SCRATCH/remote.git"
 check "...and from the manifest" bash -c '! git -C "$1" show mirror/lon1:data/.import-manifest.json | grep -q new-app' _ "$SCRATCH/remote.git"
+
+# A large manager: its file list and report are over the kernel's 128 KiB limit
+# for one environment variable or argument, and over what a description holds.
+python3 - <<'PY'
+import json
+d = json.load(open("reports/lon1-raw.json"))
+fresh = next(p for p in d["policies"] if p["id"] == "fresh-app")
+for i in range(4000):
+    d["policies"].append(json.loads(json.dumps(fresh).replace("fresh-app", f"bulk-application-policy-{i:04d}")))
+json.dump(d, open("reports/lon1-raw.json", "w"))
+PY
+out="$(mirror)"
+printf '%s\n' "$out" >"$SCRATCH/large.out"
+check "a large manager is mirrored: its text reaches the merge request through files, not the environment" bash -c '! grep -q "Argument list too long" "$1" && grep -q "updated merge request" "$1" && git -C "$2" show mirror/lon1:data/policies/bulk-application-policy-3999.yaml >/dev/null' _ "$SCRATCH/large.out" "$SCRATCH/remote.git"
+check "...and the merge request lists the first 400 files, pointing at the job log for the rest" python3 -c "import json,sys;l=[json.loads(x) for x in open(sys.argv[1])];b=[x for x in l if x['method'] in ('POST','PUT') and '/merge_requests' in x['path'] and 'description' in (x.get('body') or {})][-1]['body']['description'];sys.exit(0 if 'more: see the mirror job' in b and len(b) < 1000000 else 1)" "$SCRATCH/gl.log"
+python3 - <<'PY'
+import json
+d = json.load(open("reports/lon1-raw.json"))
+d["policies"] = [p for p in d["policies"] if not p["id"].startswith("bulk-application-policy-")]
+json.dump(d, open("reports/lon1-raw.json", "w"))
+PY
 
 out="$(mirror MIRROR_SITE=nyc1)"
 rc=$?
@@ -543,6 +584,107 @@ check "...and the next LM sync takes the rule: both orders converge" bash -c 'py
 check "...still with no id declared twice" ids_twice
 check "...and valid" python3 scripts/validate-data.py
 check "GM domain: global objects are read from domain default unless the inventory says otherwise" bash -c 'grep -q "or \"default\"$" scripts/import-estate.py'
+
+echo "estate shapes: VM members, IP addresses in rules, Global Manager location domains"
+rm -rf data/groups data/services data/policies data/.import-manifest.json stacks/*/import-*.tf
+mkdir -p data/groups data/services data/policies
+python3 - <<'PY'
+import json
+GD = "/global-infra/domains/default"; WD = "/global-infra/domains/WL-Mum"; LD = "/infra/domains/default"
+cond = lambda v: [{"resource_type": "Condition", "key": "Tag", "member_type": "VirtualMachine", "operator": "EQUALS", "value": v}]
+def grp(base, i, expr): return {"id": i, "path": f"{base}/groups/{i}", "display_name": i, "expression": expr}
+def rule(base, p, i, src, dst, seq, scope=("ANY",)):
+    return {"id": i, "path": f"{base}/security-policies/{p}/rules/{i}", "display_name": i, "sequence_number": seq, "action": "ALLOW",
+            "direction": "IN_OUT", "ip_protocol": "IPV4_IPV6", "logged": True, "source_groups": src, "destination_groups": dst,
+            "services": ["ANY"], "scope": list(scope), "profiles": ["ANY"]}
+def pol(base, i, rules): return {"id": i, "path": f"{base}/security-policies/{i}", "display_name": i, "category": "Application",
+                                 "sequence_number": 10, "stateful": True, "scope": ["ANY"], "rules": rules}
+vms = [{"resource_type": "ExternalIDExpression", "member_type": "VirtualMachine",
+        "external_ids": ["502e6f1a-0000-0000-0000-000000000001", "502e6f1a-0000-0000-0000-000000000002"]}]
+gm = {"domain": "default", "domains": ["default", "WL-Mum"],
+      "groups": [grp(GD, "VM-Jump", vms), grp(GD, "Clash", cond("app|a")),
+                 grp(WD, "M-App", cond("app|mum")), grp(WD, "Clash", cond("app|b"))],
+      "services": [],
+      "policies": [pol(GD, "g-pol", [
+                       rule(GD, "g-pol", "uses-location-group", [f"{GD}/groups/VM-Jump"], [f"{WD}/groups/M-App"], 100),
+                       rule(GD, "g-pol", "ips", ["172.19.20.57", "10.1.0.0/16"], ["172.17.9.10-172.17.9.20"], 200),
+                       rule(GD, "g-pol", "uses-clash", [f"{WD}/groups/Clash"], ["ANY"], 300)]),
+                   pol(WD, "mum-pol", [rule(WD, "mum-pol", "m1", [f"{WD}/groups/M-App"], ["ANY"], 100)])]}
+json.dump(gm, open("reports/gm1.json", "w"))
+lm = {"domain": "default",
+      "groups": [grp(LD, "L-App", cond("app|l"))], "services": [],
+      "policies": [pol(LD, "l-pol", [rule(LD, "l-pol", "r1", [f"{WD}/groups/M-App"], [f"{LD}/groups/L-App"], 100)])]}
+json.dump(lm, open("reports/lon1.json", "w"))
+PY
+out_gm="$(mir gm1)"
+out="$(mir lon1)"
+G="$(cat data/groups/imported-gm1-mirror.yaml)"
+check "a group of VMs picked one by one is adopted, as external ids" bash -c 'python3 -c "import yaml,sys;g=yaml.safe_load(sys.stdin)[\"groups\"][\"VM-Jump\"];c=g[\"criteria\"][0];sys.exit(0 if c[\"member_type\"]==\"VirtualMachine\" and len(c[\"external_ids\"])==2 and g[\"why_static\"] else 1)" <<<"$1"' _ "$G"
+check "a rule with IP addresses, a CIDR and a range is adopted, with them as written" bash -c 'python3 -c "import yaml,sys;r=yaml.safe_load(open(\"data/policies/g-pol.yaml\"))[\"rules\"][\"ips\"];sys.exit(0 if r[\"source_groups\"]==[\"172.19.20.57\",\"10.1.0.0/16\"] and r[\"destination_groups\"]==[\"172.17.9.10-172.17.9.20\"] else 1)"'
+check "a location domain's group is adopted, keeping its domain" bash -c 'python3 -c "import yaml,sys;g=yaml.safe_load(sys.stdin)[\"groups\"][\"M-App\"];sys.exit(0 if g[\"domain\"]==\"WL-Mum\" else 1)" <<<"$1"' _ "$G"
+check "...and a global rule using it is adopted" bash -c 'python3 -c "import yaml,sys;r=yaml.safe_load(open(\"data/policies/g-pol.yaml\"))[\"rules\"][\"uses-location-group\"];sys.exit(0 if r[\"destination_groups\"]==[\"M-App\"] else 1)"'
+check "a location domain's policy is adopted in its domain" bash -c 'python3 -c "import yaml,sys;p=yaml.safe_load(open(\"data/policies/mum-pol.yaml\"))[\"policy\"];sys.exit(0 if p[\"domain\"]==\"WL-Mum\" else 1)"'
+check "an id in two domains: the global domain's is adopted, the other stays in the UI, and says why" bash -c 'python3 -c "import yaml,sys;g=yaml.safe_load(sys.stdin)[\"groups\"][\"Clash\"];sys.exit(0 if \"domain\" not in g else 1)" <<<"$1" && grep -q "group Clash: its id is also a group in domain default" <<<"$2"' _ "$G" "$out_gm"
+check "...with the rule using the other one" bash -c 'grep -q "rule g-pol/uses-clash: uses Clash" <<<"$1"' _ "$out_gm"
+check "a Local Manager rule using a location domain's global group is adopted" bash -c 'python3 -c "import yaml,sys;r=yaml.safe_load(open(\"data/policies/l-pol.yaml\"))[\"rules\"][\"r1\"];sys.exit(0 if r[\"source_groups\"]==[\"M-App\"] else 1)"'
+check "import ids keep each object's own domain" bash -c 'grep -q "/global-infra/domains/WL-Mum/groups/M-App" stacks/global-security/import-gm1-mirror.tf && grep -q "/global-infra/domains/WL-Mum/security-policies/mum-pol\"" stacks/global-security/import-gm1-mirror.tf'
+check "it all validates" python3 scripts/validate-data.py
+check "the group module builds external ids" grep -q "external_id_expression" modules/group/main.tf
+check "the policy module takes an address in a rule without looking it up as a group" bash -c 'grep -q "ip_literal" modules/dfw-policy/main.tf'
+cp data/policies/g-pol.yaml "$SCRATCH/g-pol.yaml"
+cp data/groups/imported-gm1-mirror.yaml "$SCRATCH/gm1-groups.yaml"
+python3 - <<'PY'
+import yaml
+d = yaml.safe_load(open("data/policies/g-pol.yaml")); d["rules"]["ips"]["scope"] = ["10.9.9.9"]
+open("data/policies/g-pol.yaml", "w").write(yaml.safe_dump(d))
+d = yaml.safe_load(open("data/groups/imported-gm1-mirror.yaml")); del d["groups"]["VM-Jump"]["criteria"][0]["member_type"]
+open("data/groups/imported-gm1-mirror.yaml", "w").write(yaml.safe_dump(d))
+PY
+out="$(python3 scripts/validate-data.py 2>&1)"
+check "an address in an Apply To is refused, and says where addresses are allowed" grep -q "not in its Apply To" <<<"$out"
+check "external ids without a member_type are refused" grep -q "external_ids and member_type go together" <<<"$out"
+cp "$SCRATCH/g-pol.yaml" data/policies/g-pol.yaml
+cp "$SCRATCH/gm1-groups.yaml" data/groups/imported-gm1-mirror.yaml
+python3 - <<'PY'
+import json
+GD = "/global-infra/domains/default"
+vm = [{"resource_type": "ExternalIDExpression", "member_type": "VirtualMachine", "external_ids": ["502e6f1a-0000-0000-0000-000000000009"]}]
+ids = ["_h-cis-np-ansi02", "_Exchange-GW_VM's", "WIN11 IC SI H 2025"]
+groups = [{"id": i, "path": f"{GD}/groups/{i}", "display_name": i, "expression": vm} for i in ids]
+rules = [{"id": f"r {n}", "path": f"{GD}/security-policies/_My Policy/rules/r {n}", "display_name": "r", "sequence_number": 100 * (n + 1),
+          "action": "ALLOW", "direction": "IN_OUT", "logged": True, "source_groups": [g["path"]], "destination_groups": ["ANY"],
+          "services": ["ANY"], "scope": ["ANY"], "profiles": ["ANY"]} for n, g in enumerate(groups)]
+d = json.load(open("reports/gm1.json"))
+d["groups"] += groups
+d["policies"].append({"id": "_My Policy", "path": f"{GD}/security-policies/_My Policy", "display_name": "My Policy",
+                      "category": "Application", "sequence_number": 50, "scope": ["ANY"], "rules": rules})
+json.dump(d, open("reports/gm1.json", "w"))
+PY
+out="$(mir gm1)"
+check "ids made in the UI ('_h-…', apostrophes, spaces) are adopted verbatim" bash -c '! grep -q "NOT ADOPTED  group _\|NOT ADOPTED  group WIN11" <<<"$1" && test -f "data/policies/_My Policy.yaml" && grep -q "_Exchange-GW_VM" data/groups/imported-gm1-mirror.yaml' _ "$out"
+check "...and validate: an adopted object keeps its own id" bash -c '! python3 scripts/validate-data.py 2>&1 | grep -q "^ERROR"'
+printf 'groups:\n  _new one:\n    display_name: x\n    owner: gm\n    criteria:\n      - conditions:\n          - {key: Tag, member_type: VirtualMachine, operator: EQUALS, value: "app|x"}\n' >data/groups/authored.yaml
+check "a new object written here is still held to letters, digits, '.', '_' and '-'" bash -c 'python3 scripts/validate-data.py 2>&1 | grep -q "a new object.s id is letters, digits"'
+rm data/groups/authored.yaml
+python3 - <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("ie", "scripts/import-estate.py"); ie = importlib.util.module_from_spec(spec); spec.loader.exec_module(ie)
+calls = []
+def fake(host, path, *a):
+    calls.append(path)
+    if path.endswith("/global-infra/domains"): return {"results": [{"id": "default"}, {"id": "WL-Mum"}]}
+    if path.endswith("/groups"): return {"results": [{"id": "g", "path": path + "/g"}]}
+    return {"results": []}
+ie.api_get = fake
+sys.stderr = open("/dev/null", "w")
+e = ie.fetch_estate("h", "u", "p", ie.GM_BASE, "default", False)
+ok = e["domains"] == ["default", "WL-Mum"] and len(e["groups"]) == 2 and any("/domains/WL-Mum/security-policies" in c for c in calls)
+calls.clear()
+e = ie.fetch_estate("h", "u", "p", ie.LM_BASE, "default", False)
+ok = ok and e["domains"] == ["default"] and not any(c.endswith("/domains") for c in calls)
+sys.exit(0 if ok else 1)
+PY
+check "a Global Manager is read in every domain, its own first; a Local Manager in default only" test $? -eq 0
 cd "$T" || exit 1
 
 finish brownfield

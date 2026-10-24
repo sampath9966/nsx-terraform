@@ -272,9 +272,71 @@ check "a policy deleted in the UI: nothing to do in NSX" grep -q "0 import, 0 cr
 observe >/dev/null
 check "...and it is gone from state" bash -c '! grep -q "new-app" <<<"$1" && grep -q "legacy-app" <<<"$1"' _ "$(in_state)"
 
-sed -i 's/^    mode: mirror$/    mode: managed/' inventory/managers.yaml
+echo "cutover: the copy becomes the configuration engineers edit"
+git_quiet init -q -b main .
+git_quiet add -A
+git_quiet commit -qm "lon1 in mirror mode, in step"
+git init -q --bare "$SCRATCH/t2-remote.git"
+gl_port=$((20000 + RANDOM % 20000))
+python3 "$REPO/tests/fake_gitlab_api.py" "$gl_port" "$SCRATCH/t2-gl.log" &
+gl=$!
+sleep 1
+cut() { env -u NSXT_MANAGER_HOST -u NSXT_USERNAME -u NSXT_PASSWORD NSX_LON1_USERNAME=u NSX_LON1_PASSWORD=p \
+	NSX_ADOPT_REMOTE="$SCRATCH/t2-remote.git" NSX_ADOPT_TOKEN=T CI_API_V4_URL="http://127.0.0.1:$gl_port/api/v4" \
+	CI_PROJECT_ID=7 CI_DEFAULT_BRANCH=main CUTOVER_SITE=lon1 scripts/cutover.sh 2>&1; }
+ui edit-and-add
+out="$(cut)"
+check "a UI change not yet synced stops the cutover, and nothing is pushed" bash -c 'grep -q "lon1 changed in the UI since the last sync" <<<"$1" && ! git -C "$2" rev-parse -q --verify refs/heads/cutover/lon1' _ "$out" "$SCRATCH/t2-remote.git"
+check "...leaving the checkout as it was" bash -c '[ -z "$(git status --porcelain)" ] && [ "$(git rev-parse --abbrev-ref HEAD)" = main ]'
+ui delete
+out="$(cut)"
+check "in step: the cutover plans every stack of the manager, and each changes nothing" bash -c 'grep -q "plan-guard lon1/local-security, normal: 0 import, 0 create, 0 update, 0 destroy/replace, 0 hand back" <<<"$1" && ! grep -q "^error" <<<"$1"' _ "$out"
+check "...and opens the merge request that is the cutover" bash -c 'grep -q "\"title\": \"Cut lon1 over to managed\"" "$1" && grep -q "merge request: " <<<"$2"' _ "$SCRATCH/t2-gl.log" "$out"
+B="$SCRATCH/t2-remote.git"
+check "...the branch: mode managed, no import blocks, no mirror marks, the groups file renamed" bash -c 'git -C "$1" show cutover/lon1:inventory/managers.yaml | grep -q "^    mode: managed" && ! git -C "$1" show cutover/lon1:stacks/local-security/import-lon1-mirror.tf >/dev/null 2>&1 && ! git -C "$1" grep -q "nsx-mirror:" cutover/lon1 -- data && git -C "$1" show cutover/lon1:data/groups/imported-lon1.yaml | head -1 | grep -q "managed by this repository since"' _ "$B"
+check "...and the files still validate" bash -c 'd="$(mktemp -d)" && git -C "$1" archive cutover/lon1 | tar -x -C "$d" && cd "$d" && python3 scripts/validate-data.py >/dev/null' _ "$B"
+git_quiet fetch -q "$B" cutover/lon1
+git_quiet checkout -q -B cutover FETCH_HEAD
 out="$(tf plan local-security lon1)"
-check "cutover (mode: managed): Terraform already holds it all" grep -q "No changes" <<<"$out"
+check "merged: the manager plans as managed, with nothing to do" bash -c 'grep -q "No changes" <<<"$1" && grep -q "lon1/local-security, normal" <<<"$1"' _ "$out"
+# An engineer edits an imported rule and adds a new one, in the files.
+python3 - <<'PY'
+import re
+f = "data/policies/legacy-app.yaml"; t = open(f).read()
+t = t.replace("action: ALLOW", "action: DROP", 1)
+open(f, "w").write(t)
+PY
+python3 scripts/add-rule.py --policy legacy-app --rule new-web-rule --source App-Web --destination App-DB --service HTTPS --scope App-All >/dev/null 2>&1 ||
+	printf '  new-web-rule:\n    sequence_number: 900\n    action: ALLOW\n    direction: IN_OUT\n    source_groups: [App-Web]\n    destination_groups: [App-DB]\n    services: [HTTPS]\n    scope: [App-All]\n    logged: true\n' >>data/policies/legacy-app.yaml
+out="$(tf plan local-security lon1)"
+check "after cutover, editing an imported rule and adding one plan as exactly that" bash -c 'grep -q "Plan: 1 to add, 1 to change, 0 to destroy" <<<"$1" && grep -q "plan-guard: allowed" <<<"$1"' _ "$out"
+git_quiet checkout -q -- data
+# Someone changes the managed manager in the UI: a drift issue, with who and when.
+python3 - "$UI" <<'PY'
+import json, sys, time
+d = json.load(open(sys.argv[1]))
+for g in d["groups"]:
+    if g["id"] == "App-Web":
+        g["expression"][0]["value"] = "app|web-ui-edit"
+        g["_last_modified_user"] = "carol"; g["_last_modified_time"] = int(time.time() * 1000)
+json.dump(d, open(sys.argv[1], "w"))
+PY
+out="$(env -u NSXT_MANAGER_HOST -u NSXT_USERNAME -u NSXT_PASSWORD NSX_LON1_USERNAME=u NSX_LON1_PASSWORD=p NSX_ADOPT_TOKEN=T \
+	CI_API_V4_URL="http://127.0.0.1:$gl_port/api/v4" CI_PROJECT_ID=7 CI_JOB_URL=http://gitlab.test/jobs/9 \
+	scripts/with-credentials.sh lon1 -- scripts/drift-job.sh --one lon1 local-security 2>&1)"
+check "drift on a managed manager raises an issue, with who changed it, from NSX" python3 - "$SCRATCH/t2-gl.log" <<'PY'
+import json, sys
+p = [json.loads(x)["body"] for x in open(sys.argv[1]) if '"/api/v4/projects/7/issues"' in x and '"POST"' in x]
+d = p[-1]["description"] if p else ""
+ok = len(p) == 1 and p[0]["labels"] == "nsx-drift,site:lon1" and 'base_groups.nsxt_policy_group.this["App-Web"]' in d and "| carol |" in d
+ok = ok and "the next apply of this manager reverts it" in d and "http://gitlab.test/jobs/9" in d
+sys.exit(0 if ok else 1)
+PY
+out="$(env -u NSXT_MANAGER_HOST -u NSXT_USERNAME -u NSXT_PASSWORD NSX_LON1_USERNAME=u NSX_LON1_PASSWORD=p NSX_ADOPT_TOKEN=T \
+	CI_API_V4_URL="http://127.0.0.1:$gl_port/api/v4" CI_PROJECT_ID=7 \
+	scripts/with-credentials.sh lon1 -- scripts/drift-job.sh --one lon1 local-security 2>&1)"
+check "...once: the next check finds it already raised" grep -q "already in an nsx-drift issue" <<<"$out"
+kill "$gl" 2>/dev/null
 cp "$SCRATCH/ui.orig" "$UI"
 cd "$T" || exit 1
 
@@ -320,6 +382,57 @@ check "the real provider plans the LM, global references included, as a pure imp
 check "...and the LM stack manages none of the GM's objects" bash -c '! grep -q "G-Web\"\]\|G-Svc\"\]" <<<"$1"' _ "$out"
 check "it applies as imports only" grep -q "Resources: 10 imported, 0 added, 0 changed, 0 destroyed" <<<"$(APPROVE=yes tf apply local-security lon1)"
 check "...and the next plan is quiet: no drift between the GM's objects and the LM's rule" grep -q "No changes" <<<"$(tf plan local-security lon1)"
+check "...nor the one after (no loop)" grep -q "No changes" <<<"$(tf plan local-security lon1)"
+cp "$SCRATCH/ui.orig" "$UI"
+cd "$T" || exit 1
+
+echo "estate shapes: VM members, IP addresses in rules, a location domain's global group, ids as NSX allows them"
+# What a real estate holds and the first mirror of hyd-gm01 left in the UI: a
+# group of VMs picked one by one (ExternalIDExpression), rules with addresses
+# written in them, and a rule using a Global Manager group from a location
+# domain (WL-Mum). Taken over with no change, and no drift afterwards.
+T4="$SCRATCH/tree4"
+generate "$T4" --no-examples
+cd "$T4" || exit 1
+printf 'managers:\n  gm1:\n    role: gm\n    host: gm.example.net\n    site: global\n    vcf_instance: vcf-a\n    vault_path: secret/nsx/gm1\n    tier: prod\n  lon1:\n    role: lm\n    host: 127.0.0.1:%s\n    site: lon1\n    vcf_instance: vcf-a\n    vault_path: secret/nsx/lon1\n    tier: prod\n' "$port" >inventory/managers.yaml
+printf 'terraform {\n  backend "local" {}\n}\n' >stacks/local-security/backend_override.tf
+printf 'path = "%s/shapes.tfstate"\n' "$SCRATCH" >envs/lon1.backend.hcl
+mkdir -p reports
+python3 - "$UI" <<'PY'
+import json, sys
+WD = "/global-infra/domains/WL-Mum"; LD = "/infra/domains/default"
+gm = {"domain": "default", "domains": ["default", "WL-Mum"],
+      "groups": [{"id": "M-App", "path": f"{WD}/groups/M-App", "display_name": "M-App",
+                  "expression": [{"resource_type": "Condition", "key": "Tag", "member_type": "VirtualMachine", "operator": "EQUALS", "value": "app|mum"}]}],
+      "services": [], "policies": []}
+json.dump(gm, open("reports/gm1.json", "w"))
+d = json.load(open(sys.argv[1]))
+d["groups"].append({"id": "_Exchange-GW_VM's", "path": f"{LD}/groups/_Exchange-GW_VM's", "display_name": "_Exchange-GW_VM's",
+                    "expression": [{"resource_type": "ExternalIDExpression", "member_type": "VirtualMachine",
+                                    "external_ids": ["502e6f1a-0000-0000-0000-000000000001", "502e6f1a-0000-0000-0000-000000000002"]}]})
+def rule(i, seq, src, dst):
+    return {"id": i, "path": f"{LD}/security-policies/_Shapes App/rules/{i}", "display_name": i, "sequence_number": seq,
+            "action": "ALLOW", "direction": "IN_OUT", "ip_protocol": "IPV4_IPV6", "logged": True, "disabled": False,
+            "sources_excluded": False, "destinations_excluded": False, "source_groups": src, "destination_groups": dst,
+            "services": ["ANY"], "scope": ["ANY"], "profiles": ["ANY"]}
+d["policies"].append({"id": "_Shapes App", "path": f"{LD}/security-policies/_Shapes App", "display_name": "_Shapes App",
+    "category": "Application", "sequence_number": 40, "stateful": True, "tcp_strict": True, "locked": False, "scope": ["ANY"],
+    "rules": [rule("vm-members", 100, [f"{LD}/groups/_Exchange-GW_VM's"], [f"{LD}/groups/App-DB"]),
+              rule("addresses", 200, ["172.19.20.57", "10.1.0.0/16"], ["172.17.9.10-172.17.9.20", f"{LD}/groups/App-DB"]),
+              rule("location-group", 300, [f"{WD}/groups/M-App"], [f"{LD}/groups/App-DB"])]})
+json.dump(d, open(sys.argv[1], "w"))
+PY
+python3 scripts/import-estate.py --site gm1 --role gm --from-dump reports/gm1.json --mirror >/dev/null 2>&1
+out="$(env -u NSXT_MANAGER_HOST NSX_LON1_USERNAME=u NSX_LON1_PASSWORD=p scripts/with-credentials.sh lon1 --from env -- \
+	python3 scripts/import-estate.py --site lon1 --dump-only "$SCRATCH/shapes-cap.json" >/dev/null 2>&1 &&
+	python3 scripts/import-estate.py --site lon1 --from-dump "$SCRATCH/shapes-cap.json" --mirror 2>&1)"
+check "(setup) the copy takes all three rules, and leaves nothing of them in the UI" bash -c '! grep -q "NOT ADOPTED" <<<"$1" && grep -q "^  location-group:" "data/policies/_Shapes App.yaml" && grep -q "external_ids" data/groups/imported-lon1-mirror.yaml' _ "$out"
+check "(setup) the copy validates" python3 scripts/validate-data.py
+out="$(tf plan local-security lon1)"
+check "the real provider plans VM members, addresses and the location group as a pure import" bash -c 'grep -qE "Plan: [0-9]+ to import, 0 to add, 0 to change, 0 to destroy" <<<"$1" && grep -q "plan-guard: allowed" <<<"$1"' _ "$out"
+check "...the location group by its domain's path" grep -q '/global-infra/domains/WL-Mum/groups/M-App' <<<"$out"
+check "it applies as imports only" grep -qE "Resources: [0-9]+ imported, 0 added, 0 changed, 0 destroyed" <<<"$(APPROVE=yes tf apply local-security lon1)"
+check "...and the next plan is quiet: external ids and addresses read back as written" grep -q "No changes" <<<"$(tf plan local-security lon1)"
 check "...nor the one after (no loop)" grep -q "No changes" <<<"$(tf plan local-security lon1)"
 cp "$SCRATCH/ui.orig" "$UI"
 cd "$T" || exit 1

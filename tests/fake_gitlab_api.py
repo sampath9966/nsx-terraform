@@ -3,7 +3,8 @@
   python3 tests/fake_gitlab_api.py <port> <log>
 
 Keeps merge requests in memory: list (filtered by state, source and target
-branch), create, update (including state_event=close) and schedule a merge. The
+branch), create, update (including state_event=close) and schedule a merge.
+Issues too: create, and list filtered by labels and state. The
 first merge call of each merge request is refused, as GitLab does until the
 merge request's pipeline exists. Every call is appended to <log> as one JSON
 line: method, path, headers that matter, body."""
@@ -12,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 port, log = int(sys.argv[1]), sys.argv[2]
 mrs: dict[int, dict] = {}
+issues: list[dict] = []
 merge_calls: dict[int, int] = {}
 
 
@@ -31,6 +33,17 @@ class H(BaseHTTPRequestHandler):
             f.write(json.dumps({"method": self.command, "path": url.path, "query": url.query,
                                 "token": self.headers.get("PRIVATE-TOKEN"), "body": body}) + "\n")
         parts = url.path.rstrip("/").split("/")
+        if parts[-1] == "issues" and self.command == "POST":
+            issue = dict(body, iid=len(issues) + 1, state="opened", web_url=f"http://gitlab.test/issues/{len(issues) + 1}")
+            issues.append(issue)
+            return self.reply(201, issue)
+        if parts[-1] == "issues" and self.command == "GET":
+            q = urllib.parse.parse_qs(url.query)
+            want = set(filter(None, q.get("labels", [""])[0].split(",")))
+            state = q.get("state", ["opened"])[0]
+            found = [i for i in reversed(issues) if want <= set(i.get("labels", "").split(","))
+                     and state in ("all", i["state"])]
+            return self.reply(200, found)
         if parts[-1] == "merge_requests" and self.command == "GET":
             q = urllib.parse.parse_qs(url.query)
             found = [m for m in mrs.values()
