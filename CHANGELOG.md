@@ -17,6 +17,8 @@ cannot fix itself. Run it again after fixing whatever it reported.
 
 **The mirror job says why no manager is in mirror mode.** With `MIRROR_SITE=all` and none found, it failed with only "no manager in inventory/managers.yaml has mode: mirror", which pointed at the inventory even when the setting was meant to come from the CI/CD variables. It now lists every manager with the mode it saw and where that came from (`NSX_MODE_<SITE>`, the inventory, or neither), names the variable it looked for, and says what to set: value exactly `mirror`, environment scope *All*, since the job has no environment and never sees a variable scoped to one.
 
+**A CI/CD variable named in the wrong case stops the job and says so.** Variable names are case-sensitive and every `NSX_*` variable these scripts read is upper-case, so `NSX_MODE_hyd_gm01` or `NSX_CA_FILE_hyd_gm01` were silently ignored: the mode stayed managed, the manager's CA was never trusted. Now the pipeline's matrix job, `tf.sh`, the mirror job and change control (through the inventory reader), and every job that talks to NSX (through `with-credentials.sh`) stop with the variable's name and the name to rename it to.
+
 ## 1.4.0
 
 **Change control: two approvals, enforced by the pipeline, and a change log.** GitLab Community Edition has no enforced approval rules or deployment approvals, so `NSX_APPLY_MODE=approval` enforces them in the pipeline (`scripts/change-control.py`, `scripts/approve-apply.sh`; `docs/GITOPS.md`, "Change control"):

@@ -5309,6 +5309,14 @@ done
 
 command -v curl >/dev/null 2>&1 || die "curl is required"
 
+# Every NSX_* variable read here is upper-case, and names are case-sensitive:
+# NSX_CA_FILE_hyd_gm01 would be silently ignored. Say so instead.
+misnamed=""
+while read -r v; do
+	case "$v" in [Nn][Ss][Xx]_*) [ "$v" = "${v^^}" ] || misnamed="$misnamed $v->${v^^}" ;; esac
+done < <(compgen -e)
+[ -z "$misnamed" ] || die "CI/CD variable names are case-sensitive, so these are never read; rename them:$(printf '\n  %s' $misnamed)"
+
 # Inventory lookup: host and vault path for this site. Never the secret.
 eval "$(python3 "$REPO_ROOT/scripts/ci-matrix.py" --export "$SITE")"
 [ -n "${NSX_HOST:-}" ] || die "site '$SITE' is not in inventory/managers.yaml"
@@ -5506,7 +5514,18 @@ GM_STACKS = ["global-security"]
 LM_STACKS = ["local-security", "local-tags", "local-network", "platform"]
 
 
+def misnamed_variables() -> list[tuple[str, str]]:
+    """NSX_* variables set with lower-case letters, and the name they should
+    have. Variable names are case-sensitive and every one these scripts read
+    is upper-case, so NSX_MODE_hyd_gm01 is simply never seen."""
+    return sorted((k, k.upper()) for k in os.environ if k[:4].upper() == "NSX_" and k != k.upper())
+
+
 def managers(strict: bool = True) -> dict:
+    wrong = misnamed_variables()
+    if wrong:
+        sys.exit("error: these CI/CD variables are never read, because names are case-sensitive:\n"
+                 + "\n".join(f"  {k}  ->  rename it to {u}" for k, u in wrong))
     if not INVENTORY.exists():
         if strict:
             sys.exit(f"error: {INVENTORY} does not exist")

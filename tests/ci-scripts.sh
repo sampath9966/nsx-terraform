@@ -397,6 +397,8 @@ import sys, yaml
 d = yaml.safe_load(sys.stdin)
 bad = [(n, l) for n, j in d.items() if isinstance(j, dict) for l in j.get(\"script\", []) if not isinstance(l, str)]
 sys.exit(1 if bad else 0)" || exit 1; done' _ "$T"
+check "a variable named in the wrong case stops the pipeline, naming the right name" bash -c 'cd "$1" && ! out="$(env NSX_MODE_hyd_np01=mirror CI_COMMIT_BRANCH=main CI_DEFAULT_BRANCH=main python3 scripts/gitlab-child-pipeline.py 2>&1)" && grep -q "NSX_MODE_hyd_np01  ->  rename it to NSX_MODE_HYD_NP01" <<<"$out"' _ "$T"
+check "...and so does any NSX job that talks to the manager" bash -c 'cd "$1" && out="$(env -i PATH="$PATH" NSX_USERNAME=u NSX_PASSWORD=p NSX_CA_FILE_hyd_gm01=/x scripts/with-credentials.sh hyd-gm01 -- true 2>&1)"; grep -q "NSX_CA_FILE_hyd_gm01->NSX_CA_FILE_HYD_GM01" <<<"$out"' _ "$T"
 check "NSX_MODE_<SITE> overrides the inventory, both ways, without a commit" bash -c 'grep -q "^\"sync-state local-security @ hyd-np01\":" <<<"$1" && ! grep -q "^\"apply local-security @ hyd-np01\":" <<<"$1" && grep -q "^\"apply global-security @ hyd-gm01\":" <<<"$1"' _ "$var_child"
 check "...and an unknown value stops the pipeline, naming the variable" bash -c 'cd "$1" && ! out="$(NSX_MODE_HYD_NP01=Mirror python3 scripts/gitlab-child-pipeline.py 2>&1)" && grep -q "NSX_MODE_HYD_NP01 must be one of: managed, mirror" <<<"$out"' _ "$T"
 check "the inventory schema accepts mode" bash -c 'cd "$1" && ! python3 scripts/validate-data.py 2>&1 | grep -q "\.mode:"' _ "$T"
