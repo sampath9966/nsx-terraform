@@ -211,12 +211,10 @@ retry_wait_min = 5
 The state **name** at the end of the address must be unique per stack per
 manager — that is what keeps `lon1-local-security` and `lon1-local-tags` apart.
 
-Credentials never go in that file, because it is committed:
-
-```bash
-export TF_HTTP_USERNAME=gitlab-ci-token
-export TF_HTTP_PASSWORD="$CI_JOB_TOKEN"     # in GitLab CI
-```
+Credentials never go in that file, because it is committed. In a GitLab job
+`scripts/tf.sh` authenticates with the job's own token (`gitlab-ci-token` and
+`CI_JOB_TOKEN`), so nothing needs storing; set `TF_HTTP_USERNAME` and
+`TF_HTTP_PASSWORD` yourself only to override that.
 
 Outside CI, use a project access token with the `api` scope, sourced the same
 way NSX credentials are. `make validate` errors if a credential appears in
@@ -371,8 +369,12 @@ in the environment. There are two sources, chosen automatically (Vault when
   `HYD_GM01`). The exact lookup order, and why unprotected plan variables need a
   read-only NSX account, are in `docs/GITOPS.md`.
 
-If the NSX managers use an internal certificate authority, give the pipeline its
-PEM as a CI/CD variable `NSX_CA_FILE` of type File. Run by hand, set
+If a manager's certificate comes from an internal CA, or is self-signed, give
+the pipeline that PEM as a CI/CD variable of type File: `NSX_CA_FILE_<SITE>` for
+that manager (`hyd-gm01` is `NSX_CA_FILE_HYD_GM01`), or `NSX_CA_FILE` for every
+manager without its own. Check first that the certificate lists the manager's
+name or address as a Subject Alternative Name; one with only a Common Name is
+rejected whatever you trust (`docs/GITOPS.md` shows the one-line check). Run by hand, set
 `SSL_CERT_FILE` to a bundle that holds your CA and, for a GitLab with its own CA,
 GitLab's too.
 
@@ -467,6 +469,10 @@ a plan has been reviewed against a real manager.
 The common case, and the one to take slowly: one policy of one manager per merge
 request, each step reversible. `docs/IMPORT.md` in the generated tree is the full
 runbook, including what is deliberately not adopted.
+
+From the pipeline, with no credentials on any server: *Run pipeline* on the
+default branch with `ADOPT_SITE=lon1` lists what can be adopted; adding
+`ADOPT_POLICY=legacy-app` opens a merge request that adopts it. By hand:
 
 ```bash
 # 0. with no data for the manager yet, a plan must say "no changes"

@@ -78,9 +78,21 @@ policies = [{"id": "legacy-app", "path": f"{D}/security-policies/legacy-app", "d
 json.dump({"groups": groups, "services": services, "policies": policies, "domain": "default"}, open("reports/lon1-raw.json", "w"))
 PY
 
-# The mock manager.
-openssl req -x509 -newkey rsa:2048 -nodes -keyout "$SCRATCH/key.pem" -out "$SCRATCH/cert.pem" -days 1 \
-	-subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1" >/dev/null 2>&1
+# The mock manager, with a certificate from its own CA, verified for real
+# through NSX_CA_FILE_<SITE>: TLS verification is never switched off here.
+for ca in site other; do
+	openssl req -x509 -newkey rsa:2048 -nodes -keyout "$SCRATCH/$ca-ca.key" -out "$SCRATCH/$ca-ca.pem" -days 1 \
+		-subj "/CN=$ca CA" >/dev/null 2>&1
+done
+openssl req -newkey rsa:2048 -nodes -keyout "$SCRATCH/key.pem" -out "$SCRATCH/srv.csr" -subj "/CN=127.0.0.1" >/dev/null 2>&1
+printf 'subjectAltName=IP:127.0.0.1\n' >"$SCRATCH/ext.cnf"
+openssl x509 -req -in "$SCRATCH/srv.csr" -CA "$SCRATCH/site-ca.pem" -CAkey "$SCRATCH/site-ca.key" -CAcreateserial \
+	-out "$SCRATCH/cert.pem" -days 1 -extfile "$SCRATCH/ext.cnf" >/dev/null 2>&1
+# Behind a TLS-inspecting proxy, provider downloads need that proxy's CA too:
+# TEST_EXTRA_CA names it. Not needed on a normal network.
+for ca in site other; do
+	cat "$SCRATCH/$ca-ca.pem" ${TEST_EXTRA_CA:+"$TEST_EXTRA_CA"} >"$SCRATCH/trust-$ca.pem"
+done
 port=$((20000 + RANDOM % 20000))
 python3 "$REPO/tests/mock_nsx.py" reports/lon1-raw.json "$SCRATCH/requests.log" "$port" "$SCRATCH/cert.pem" "$SCRATCH/key.pem" &
 mock=$!
@@ -89,11 +101,20 @@ sleep 1
 
 printf 'terraform {\n  backend "local" {}\n}\n' >stacks/local-security/backend_override.tf
 for s in lon1 nyc1; do printf 'path = "%s/%s.tfstate"\n' "$SCRATCH" "$s" >"envs/$s.backend.hcl"; done
-export NSXT_MANAGER_HOST="127.0.0.1:$port" NSXT_USERNAME=u NSXT_PASSWORD=p NSXT_ALLOW_UNVERIFIED_SSL=true
+export NSXT_MANAGER_HOST="127.0.0.1:$port" NSXT_USERNAME=u NSXT_PASSWORD=p
+export NSX_CA_FILE_LON1="$SCRATCH/trust-site.pem" NSX_CA_FILE_NYC1="$SCRATCH/trust-site.pem"
+unset SSL_CERT_FILE NSXT_ALLOW_UNVERIFIED_SSL
 export TF_CLI_ARGS="-no-color" TF_PLUGIN_CACHE_DIR="$SCRATCH/plugins" ALLOW_LOCAL_STATE=1
 mkdir -p "$TF_PLUGIN_CACHE_DIR"
 tf() { scripts/tf.sh "$@" 2>&1; }
 RULE='module.policies["legacy-app"].nsxt_policy_security_policy_rule.this["web-to-db"]'
+
+echo "trust"
+python3 scripts/import-estate.py --site lon1 --from-dump reports/lon1-raw.json --policy legacy-app >/dev/null
+check "a manager signed by another CA is refused by the real provider" grep -q "x509: certificate signed by unknown authority" \
+	<<<"$(NSX_CA_FILE_LON1="$SCRATCH/trust-other.pem" tf plan local-security lon1)"
+rm -rf data/groups data/services data/policies stacks/local-security/import-*.tf data/.import-manifest.json
+mkdir -p data/groups data/services data/policies
 
 echo "a manager with no data"
 out="$(tf plan local-security nyc1)"

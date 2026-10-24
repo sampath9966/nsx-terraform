@@ -192,7 +192,8 @@ printf '%s\n' '-----BEGIN CERTIFICATE-----' 'NSX-CA' '-----END CERTIFICATE-----'
 cat >"$SCRATCH/faketf/terraform" <<'STUB'
 #!/usr/bin/env bash
 echo "SSL_CERT_FILE=${SSL_CERT_FILE:-unset}"
-for want in GITLAB-CA NSX-CA; do
+echo "TF_HTTP_USERNAME=${TF_HTTP_USERNAME:-unset} TF_HTTP_PASSWORD=${TF_HTTP_PASSWORD:-unset}"
+for want in GITLAB-CA NSX-CA SITE-CA; do
 	[ -n "${SSL_CERT_FILE:-}" ] && [ -r "$SSL_CERT_FILE" ] && grep -q "$want" "$SSL_CERT_FILE" && echo "has-$want"
 done
 exit 0
@@ -204,6 +205,20 @@ check "NSX_CA_FILE alone builds a bundle" grep -q has-NSX-CA <<<"$(tfenv NSX_CA_
 check "an NSX_CA_FILE that does not exist is an error, not silently ignored" bash -c '! (cd "$1" && env -u SSL_CERT_FILE NSX_CA_FILE=/no/such/file PATH="$2:$PATH" scripts/tf.sh init global-security hyd-gm01) >/dev/null 2>&1' _ "$T" "$SCRATCH/faketf"
 echo "not a certificate" >"$SCRATCH/junk.crt"
 check "an NSX_CA_FILE with no certificate in it is an error" bash -c '! (cd "$1" && env -u SSL_CERT_FILE NSX_CA_FILE="$3" PATH="$2:$PATH" scripts/tf.sh init global-security hyd-gm01) >/dev/null 2>&1' _ "$T" "$SCRATCH/faketf" "$SCRATCH/junk.crt"
+# A manager with its own CA: NSX_CA_FILE_<SITE> wins, so its run trusts only that CA.
+printf '%s\n' '-----BEGIN CERTIFICATE-----' 'SITE-CA' '-----END CERTIFICATE-----' >"$SCRATCH/site.crt"
+out="$(tfenv NSX_CA_FILE="$SCRATCH/nsx.crt" NSX_CA_FILE_HYD_GM01="$SCRATCH/site.crt")"
+check "a manager's own NSX_CA_FILE_<SITE> is used instead of the shared one" bash -c 'grep -q has-SITE-CA <<<"$1" && ! grep -q has-NSX-CA <<<"$1"' _ "$out"
+check "NSX_CA_FILE_<SITE> alone builds a bundle" grep -q has-SITE-CA <<<"$(tfenv NSX_CA_FILE_HYD_GM01="$SCRATCH/site.crt")"
+out="$(tfenv NSX_CA_FILE="$SCRATCH/nsx.crt" NSX_CA_FILE_LAB_1A="$SCRATCH/site.crt")"
+check "another manager's CA file is not used; the shared one is" bash -c 'grep -q has-NSX-CA <<<"$1" && ! grep -q has-SITE-CA <<<"$1"' _ "$out"
+check "a missing per-manager CA file is an error that names the variable" grep -q "NSX_CA_FILE_HYD_GM01 is set to" <<<"$(cd "$T" && env -u SSL_CERT_FILE NSX_CA_FILE_HYD_GM01=/no/such PATH="$SCRATCH/faketf:$PATH" scripts/tf.sh init global-security hyd-gm01 2>&1)"
+# GitLab-managed state is reached with the job's own token.
+out="$(tfenv CI_JOB_TOKEN=job-token-123)"
+check "in a GitLab job the state backend gets the job token" grep -q "TF_HTTP_USERNAME=gitlab-ci-token TF_HTTP_PASSWORD=job-token-123" <<<"$out"
+check "explicit state credentials are left alone" grep -q "TF_HTTP_USERNAME=me TF_HTTP_PASSWORD=mine" <<<"$(tfenv CI_JOB_TOKEN=job-token-123 TF_HTTP_USERNAME=me TF_HTTP_PASSWORD=mine)"
+check "outside CI nothing is set" grep -q "TF_HTTP_USERNAME=unset TF_HTTP_PASSWORD=unset" <<<"$(env -u CI_JOB_TOKEN -u TF_HTTP_USERNAME -u TF_HTTP_PASSWORD bash -c "$(declare -f tfenv); T=$T SCRATCH=$SCRATCH tfenv X=1")"
+check "the token is never printed by tf.sh" bash -c '! (cd "$1" && env -u SSL_CERT_FILE CI_JOB_TOKEN=job-token-123 PATH="/nonexistent:$PATH" scripts/tf.sh init global-security hyd-gm01 2>&1) | grep -q job-token-123' _ "$T"
 check "a preset SSL_CERT_FILE wins and says NSX_CA_FILE was not added" grep -q "NSX_CA_FILE is not added" <<<"$(cd "$T" && env PATH="$SCRATCH/faketf:$PATH" SSL_CERT_FILE=/already/set NSX_CA_FILE="$SCRATCH/nsx.crt" scripts/tf.sh init global-security hyd-gm01 2>&1)"
 leftover="$(ls "${TMPDIR:-/tmp}"/nsx-ca.* 2>/dev/null | wc -l)"
 check "the temporary CA bundle is removed after the run" test "$leftover" -eq 0

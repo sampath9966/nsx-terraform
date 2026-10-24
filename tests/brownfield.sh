@@ -76,6 +76,7 @@ policies = [
     ], [f"{D}/groups/App-All"], comments="NetOps", tags=[{"scope": "owner", "tag": "netops"}]),
     pol("other-app", [r("other-app", "x", [f"{D}/groups/Other"], [f"{D}/groups/App-Web"], ["ANY"], 10)], [f"{D}/groups/App-All"]),
     pol("mac-scoped", [r("mac-scoped", "m", [f"{D}/groups/App-Web"], [f"{D}/groups/App-DB"], ["ANY"], 10)], [f"{D}/groups/Mac"]),
+    pol("fresh-app", [r("fresh-app", "f1", [f"{D}/groups/App-Web"], [f"{D}/groups/App-DB"], ["ANY"], 10)], [f"{D}/groups/App-All"]),
     pol("Default-Layer3", [], ["ANY"], _system_owned=True),
 ]
 json.dump({"groups": groups, "services": services, "policies": policies, "domain": "default"}, open("reports/lon1-raw.json", "w"))
@@ -135,6 +136,101 @@ m.api_get = fake
 estate = m.fetch_estate("h", "u", "p", "/policy/api/v1/infra", "default", False)
 sys.exit(0 if [g["id"] for g in estate["groups"]] == ["a", "b", "c"] else 1)
 PY
+
+echo "importer: capture over TLS trusts the manager's own CA"
+for ca in mine other; do
+	openssl req -x509 -newkey rsa:2048 -nodes -keyout "$SCRATCH/$ca.key" -out "$SCRATCH/$ca-ca.pem" -days 1 -subj "/CN=$ca CA" >/dev/null 2>&1
+done
+openssl req -newkey rsa:2048 -nodes -keyout "$SCRATCH/srv.key" -out "$SCRATCH/srv.csr" -subj "/CN=127.0.0.1" >/dev/null 2>&1
+printf 'subjectAltName=IP:127.0.0.1\n' >"$SCRATCH/ext.cnf"
+openssl x509 -req -in "$SCRATCH/srv.csr" -CA "$SCRATCH/mine-ca.pem" -CAkey "$SCRATCH/mine.key" -CAcreateserial \
+	-out "$SCRATCH/srv.pem" -days 1 -extfile "$SCRATCH/ext.cnf" >/dev/null 2>&1
+port=$((20000 + RANDOM % 20000))
+python3 "$REPO/tests/mock_nsx.py" reports/lon1-raw.json "$SCRATCH/req.log" "$port" "$SCRATCH/srv.pem" "$SCRATCH/srv.key" &
+mock=$!
+sleep 1
+capture() { env -u SSL_CERT_FILE -u NSX_CA_FILE NSXT_MANAGER_HOST="127.0.0.1:$port" NSXT_USERNAME=u NSXT_PASSWORD=p "$@" \
+	python3 scripts/import-estate.py --site lon1 --dump-only "$SCRATCH/cap.json" 2>&1; }
+check "with NSX_CA_FILE_<SITE> the capture verifies the manager and reads it" grep -q "wrote" <<<"$(capture NSX_CA_FILE_LON1="$SCRATCH/mine-ca.pem")"
+check "...and gets the whole estate" python3 -c "import json,sys;d=json.load(open(sys.argv[1]));sys.exit(0 if len(d['groups'])==7 and len(d['policies'])==5 else 1)" "$SCRATCH/cap.json"
+check "the shared NSX_CA_FILE works too" grep -q "wrote" <<<"$(capture NSX_CA_FILE="$SCRATCH/mine-ca.pem")"
+out="$(capture)"
+check "without the CA it refuses, and says which variable to set" bash -c 'grep -q "does not trust" <<<"$1" && grep -q "NSX_CA_FILE_LON1" <<<"$1"' _ "$out"
+check "another CA is not accepted" bash -c '! grep -q "wrote" <<<"$1"' _ "$(capture NSX_CA_FILE_LON1="$SCRATCH/other-ca.pem")"
+
+echo "adopting from the pipeline (scripts/adopt.sh)"
+git init -q -b main && git_quiet add -A && git_quiet commit -m baseline
+git clone -q --bare . "$SCRATCH/remote.git"
+sed -i "s/host: lon1.example.net/host: 127.0.0.1:$port/" inventory/managers.yaml && git_quiet commit -am "mock manager"
+git_quiet push -q "$SCRATCH/remote.git" main
+api_port=$((20000 + RANDOM % 20000))
+python3 - "$api_port" "$SCRATCH/mr.json" <<'PY2' &
+import http.server, sys
+port, out = int(sys.argv[1]), sys.argv[2]
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        open(out, "wb").write(body)
+        open(out + ".headers", "w").write(str(self.headers))
+        data = b'{"web_url": "http://gitlab.test/mr/1"}'
+        self.send_response(201); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+PY2
+api=$!
+sleep 1
+adopt() { env -u SSL_CERT_FILE -u NSX_CA_FILE NSX_CA_FILE_LON1="$SCRATCH/mine-ca.pem" NSX_PLAN_USERNAME=u NSX_PLAN_PASSWORD=p \
+	NSX_ADOPT_REMOTE="$SCRATCH/remote.git" NSX_ADOPT_TOKEN=SECRET-ADOPT-TOKEN CI_API_V4_URL="http://127.0.0.1:$api_port/api/v4" \
+	CI_PROJECT_ID=7 CI_DEFAULT_BRANCH=main ADOPT_SITE=lon1 "$@" scripts/adopt.sh 2>&1; }
+out="$(adopt)"
+check "a survey lists the policies and their status" bash -c 'grep -q "policy/policies on lon1" <<<"$1" && grep -q "fresh-app" <<<"$1" && grep -q "not adoptable: Apply To uses Mac" <<<"$1"' _ "$out"
+check "...and changes nothing" bash -c '[ -z "$(git status --porcelain)" ] && [ "$(git -C "$1" branch --list "adopt/*")" = "" ]' _ "$SCRATCH/remote.git"
+out="$(adopt ADOPT_POLICY=fresh-app)"
+check "an adoption pushes a branch adopt/<site>-<tranche>" git -C "$SCRATCH/remote.git" rev-parse -q --verify refs/heads/adopt/lon1-fresh-app
+files="$(git -C "$SCRATCH/remote.git" diff --name-only main adopt/lon1-fresh-app)"
+check "...holding the policy and its site-gated import file" bash -c 'grep -q "^data/policies/fresh-app.yaml$" <<<"$1" && grep -q "^stacks/local-security/import-lon1-fresh-app.tf$" <<<"$1"' _ "$files"
+check "...and nothing already managed" bash -c '! grep -q "data/groups" <<<"$1"' _ "$files"
+check "the capture is never committed" bash -c '! git -C "$1" log --all --name-only --format= | grep -qiE "capture|raw|dump"' _ "$SCRATCH/remote.git"
+check "a merge request is opened against the default branch" python3 -c "import json,sys;d=json.load(open(sys.argv[1]));sys.exit(0 if d['source_branch']=='adopt/lon1-fresh-app' and d['target_branch']=='main' and 'pure import' in d['description'] else 1)" "$SCRATCH/mr.json"
+check "...with the token in a header" grep -q "PRIVATE-TOKEN: SECRET-ADOPT-TOKEN" "$SCRATCH/mr.json.headers"
+check "the token never appears in the job output" bash -c '! grep -q SECRET-ADOPT-TOKEN <<<"$1"' _ "$out"
+check "the job prints the merge request" grep -q "merge request: http://gitlab.test/mr/1" <<<"$out"
+git_quiet checkout main
+rm -f "$SCRATCH/mr.json"
+out="$(adopt ADOPT_POLICY=legacy-app)"
+check "adopting what is already managed opens nothing" bash -c 'grep -q "Nothing to adopt" <<<"$1" && ! test -e "$2"' _ "$out" "$SCRATCH/mr.json"
+git_quiet checkout main
+out="$(adopt ADOPT_POLICY=fresh-app)"
+check "the same tranche again is refused while its branch exists" grep -q "an adoption of this tranche is open" <<<"$out"
+check "without a site it refuses" grep -q "ADOPT_SITE is not set" <<<"$(env -u ADOPT_SITE scripts/adopt.sh 2>&1)"
+git_quiet checkout main
+
+# The real push path: HTTPS to a git server with its own CA, the token in a
+# header, and a misleading GIT_SSL_CAINFO inherited from the environment.
+mkdir -p "$SCRATCH/srv/grp"
+git clone -q --bare "$SCRATCH/remote.git" "$SCRATCH/srv/grp/proj.git"
+git -C "$SCRATCH/srv/grp/proj.git" config http.receivepack true
+git_port=$((20000 + RANDOM % 20000))
+python3 "$REPO/tests/git_https_server.py" "$SCRATCH/srv" "$git_port" SECRET-ADOPT-TOKEN "$SCRATCH/srv.pem" "$SCRATCH/srv.key" "$SCRATCH/git.log" &
+gitsrv=$!
+sleep 1
+https_adopt() { env -u SSL_CERT_FILE -u NSX_CA_FILE -u NSX_ADOPT_REMOTE NSX_CA_FILE_LON1="$SCRATCH/mine-ca.pem" \
+	NSX_PLAN_USERNAME=u NSX_PLAN_PASSWORD=p NSX_ADOPT_TOKEN=SECRET-ADOPT-TOKEN \
+	CI_SERVER_URL="https://127.0.0.1:$git_port" CI_PROJECT_PATH=grp/proj GIT_SSL_CAINFO="$SCRATCH/other-ca.pem" \
+	CI_API_V4_URL="http://127.0.0.1:$api_port/api/v4" CI_PROJECT_ID=7 CI_DEFAULT_BRANCH=main ADOPT_SITE=lon1 \
+	"$@" scripts/adopt.sh 2>&1; }
+out="$(https_adopt CI_SERVER_TLS_CA_FILE="$SCRATCH/mine-ca.pem" ADOPT_POLICY=fresh-app ADOPT_TRANCHE=https)"
+check "over HTTPS, with GitLab's CA, the branch is pushed" git -C "$SCRATCH/srv/grp/proj.git" rev-parse -q --verify refs/heads/adopt/lon1-https
+check "...authenticated by header, never by URL" bash -c 'grep -q "auth=ok" "$1" && ! grep -q "url_has_token=True" "$1"' _ "$SCRATCH/git.log"
+check "...despite an inherited GIT_SSL_CAINFO" grep -q "merge request:" <<<"$out"
+git_quiet checkout main
+out="$(https_adopt ADOPT_POLICY=fresh-app ADOPT_TRANCHE=nocert)"
+check "without GitLab's CA the push fails; verification is not skipped" bash -c '! git -C "$1" rev-parse -q --verify refs/heads/adopt/lon1-nocert && grep -q "could not push" <<<"$2"' _ "$SCRATCH/srv/grp/proj.git" "$out"
+git_quiet checkout main
+kill "$gitsrv" 2>/dev/null
+kill "$api" 2>/dev/null
+kill "$mock" 2>/dev/null
+wait "$mock" 2>/dev/null
 
 echo "plan-guard"
 plan() { # plan <file> <json for resource_changes>
