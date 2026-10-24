@@ -202,6 +202,31 @@ printf 'groups:\n  Ghost:\n    display_name: Ghost\n    owner: lm\n    sites: [l
 printf 'import {\n  for_each = var.site == "lon1" ? { "App-Web" = "/infra/domains/default/groups/App-Web" } : {}\n  to       = module.base_groups.nsxt_policy_group.this[each.key]\n  id       = each.value\n}\n' >stacks/local-security/import-lon1-ghost.tf
 check "a create during an import tranche is refused" grep -q "create during an import tranche" <<<"$(tf plan local-security lon1)"
 
+echo "mirror mode: the whole manager, then cutover"
+# A tree of its own, with no state yet: a manager still run from the UI.
+T2="$SCRATCH/tree2"
+generate "$T2" --no-examples
+cd "$T2" || exit 1
+printf 'managers:\n  lon1:\n    role: lm\n    host: 127.0.0.1:%s\n    site: lon1\n    vcf_instance: vcf-a\n    vault_path: secret/nsx/lon1\n    tier: prod\n    mode: mirror\n' "$port" >inventory/managers.yaml
+printf 'terraform {\n  backend "local" {}\n}\n' >stacks/local-security/backend_override.tf
+printf 'path = "%s/mirror-lon1.tfstate"\n' "$SCRATCH" >envs/lon1.backend.hcl
+mkdir -p reports
+out="$(env -u NSXT_MANAGER_HOST NSX_LON1_USERNAME=u NSX_LON1_PASSWORD=p scripts/with-credentials.sh lon1 --from env -- \
+	python3 scripts/import-estate.py --site lon1 --dump-only "$SCRATCH/mirror-cap.json" 2>&1 &&
+	python3 scripts/import-estate.py --site lon1 --from-dump "$SCRATCH/mirror-cap.json" --mirror 2>&1)"
+check "the mirror reads the whole manager through the same trust as plans" grep -q "mirror of lon1 regenerated" <<<"$out"
+out="$(tf plan local-security lon1)"
+check "the real provider plans the whole mirror as a pure import" grep -q "Plan: 8 to import, 0 to add, 0 to change, 0 to destroy" <<<"$out"
+check "...which plan-guard accepts" grep -q "plan-guard: allowed" <<<"$out"
+check "nothing is applied while the manager is in mode: mirror" grep -q "lon1 is in mode: mirror" <<<"$(APPROVE=yes tf apply local-security lon1)"
+check "...and no state was written" test ! -s "$SCRATCH/mirror-lon1.tfstate"
+sed -i 's/^    mode: mirror$/    mode: managed/' inventory/managers.yaml
+out="$(tf plan local-security lon1)"
+check "cutover (mode: managed): the same plan, still a pure import" grep -q "Plan: 8 to import, 0 to add, 0 to change, 0 to destroy" <<<"$out"
+check "...applies as imports only" grep -q "Resources: 8 imported, 0 added, 0 changed, 0 destroyed" <<<"$(APPROVE=yes tf apply local-security lon1)"
+check "...and Terraform now owns the manager with nothing left to change" grep -q "No changes" <<<"$(tf plan local-security lon1)"
+cd "$T" || exit 1
+
 writes="$(grep WRITE "$SCRATCH/requests.log" | grep -vc "/api/session/create" || true)"
 check "NSX received no write at all (login sessions aside)" test "$writes" -eq 0
 

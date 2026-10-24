@@ -354,6 +354,53 @@ check "rate-limited with nothing cached: exits non-zero" test "$rc" -ne 0
 check "...names the rate limit and what to do" bash -c 'grep -qi "rate-limiting" <<<"$1" && grep -q "docker login" <<<"$1"' _ "$out"
 check "...after retrying the pull" bash -c '[ "$(grep -c "^pull" "$1/calls")" -ge 3 ]' _ "$FD"
 
+# Mirror mode: planned, never applied, from any pipeline.
+cp "$T/inventory/managers.yaml" "$SCRATCH/managers.keep"
+cat >"$T/inventory/managers.yaml" <<'INV'
+managers:
+  hyd-gm01:
+    role: gm
+    host: gm.example.net
+    site: hyd-gm01
+    vcf_instance: v.example.net
+    vault_path: secret/nsx/hyd-gm01
+    tier: prod
+    mode: mirror
+  hyd-np01:
+    role: lm
+    host: np.example.net
+    site: hyd-np01
+    vcf_instance: v.example.net
+    vault_path: secret/nsx/hyd-np01
+    tier: nonprod
+INV
+main_child="$(cd "$T" && CI_COMMIT_BRANCH=main CI_DEFAULT_BRANCH=main python3 scripts/gitlab-child-pipeline.py)"
+check "a manager in mode: mirror is planned on the default branch" grep -q '^"plan global-security @ hyd-gm01":' <<<"$main_child"
+check "...but has no apply job" bash -c '! grep -q "^\"apply global-security @ hyd-gm01\":" <<<"$1"' _ "$main_child"
+check "...while a managed manager still has its apply jobs" grep -q '^"apply local-security @ hyd-np01":' <<<"$main_child"
+check "the inventory schema accepts mode" bash -c 'cd "$1" && ! python3 scripts/validate-data.py 2>&1 | grep -q "\.mode:"' _ "$T"
+check "...and rejects anything but managed or mirror" bash -c 'cd "$1" && sed -i "s/mode: mirror/mode: mirrored/" inventory/managers.yaml && python3 scripts/validate-data.py 2>&1 | grep -q "hyd-gm01.mode: .mirrored. is not one of managed, mirror"; rc=$?; sed -i "s/mode: mirrored/mode: mirror/" inventory/managers.yaml; exit $rc' _ "$T"
+check "the GitHub apply matrix leaves mirror managers out" bash -c 'cd "$1" && m="$(python3 scripts/ci-matrix.py --format github --managed-only)" && ! grep -q hyd-gm01 <<<"$m" && grep -q hyd-np01 <<<"$m"' _ "$T"
+check "...and is exactly the empty form the apply job tests for when all are mirrors" bash -c 'cd "$1" && sed -i "/^    tier: nonprod$/a\    mode: mirror" inventory/managers.yaml && [ "$(python3 scripts/ci-matrix.py --format github --managed-only)" = "{\"include\": []}" ] && grep -q "apply_matrix != '"'"'{\"include\": \[\]}'"'"'" .github/workflows/apply.yml 2>/dev/null || [ ! -f .github/workflows/apply.yml ]' _ "$T"
+cp "$SCRATCH/managers.keep" "$T/inventory/managers.yaml"
+ci="$T/.gitlab-ci.yml"
+check "the mirror job runs only from a schedule or Run pipeline, on the default branch" python3 - "$ci" <<'PY'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+rules = d["mirror"]["rules"]
+ok = len(rules) == 1 and "$MIRROR_SITE" in rules[0]["if"] and '"schedule"' in rules[0]["if"] and "$CI_DEFAULT_BRANCH" in rules[0]["if"]
+ok = ok and d["mirror"]["variables"]["NSX_CRED_SCOPE"] == "plan" and d["mirror"]["interruptible"] is False
+sys.exit(0 if ok else 1)
+PY
+check "...and a mirror pipeline runs nothing else" python3 - "$ci" <<'PY'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+for job in ("data", "terraform", "matrix", "managers"):
+    first = d[job]["rules"]
+    if not any("$MIRROR_SITE" in r.get("if", "") and r.get("when") == "never" for r in first):
+        sys.exit(1)
+PY
+
 # The NSX provider in the image.
 : >"$FD/local"
 rm -f "$FD"/label.*

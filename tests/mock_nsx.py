@@ -5,22 +5,32 @@
 Serves the objects of an import-estate.py dump over HTTPS, the way the policy API
 returns them, so the real vmware/nsxt provider can import and refresh them.
 Every request is logged; every write is refused (except the login session), so
-a test can prove that a plan or an import apply changes nothing in NSX."""
-import fnmatch, json, re, ssl, sys, urllib.parse
+a test can prove that a plan or an import apply changes nothing in NSX.
+
+The dump is read again whenever the file changes, so a test can stand in for an
+engineer changing the manager in the UI between two reads."""
+import fnmatch, json, os, re, ssl, sys, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-dump = json.load(open(sys.argv[1])); log = open(sys.argv[2], "a"); port = int(sys.argv[3]); cert, key = sys.argv[4], sys.argv[5]
-objs = {}
-for g in dump["groups"]: objs["/policy/api/v1" + g["path"]] = dict(g, resource_type="Group", _revision=1)
-for s in dump["services"]: objs["/policy/api/v1" + s["path"]] = dict(s, resource_type="Service", _revision=1)
-for p in dump["policies"]:
-    body = dict(p, resource_type="SecurityPolicy", _revision=1); objs["/policy/api/v1" + p["path"]] = body
-    for r in p["rules"]: objs["/policy/api/v1" + r["path"]] = dict(r, resource_type="Rule", _revision=1)
+log = open(sys.argv[2], "a"); port = int(sys.argv[3]); cert, key = sys.argv[4], sys.argv[5]
+objs = {}; loaded = None
+def load():
+    global loaded
+    stamp = os.stat(sys.argv[1]).st_mtime_ns
+    if stamp == loaded: return
+    dump = json.load(open(sys.argv[1])); objs.clear(); loaded = stamp
+    for g in dump["groups"]: objs["/policy/api/v1" + g["path"]] = dict(g, resource_type="Group", _revision=1)
+    for s in dump["services"]: objs["/policy/api/v1" + s["path"]] = dict(s, resource_type="Service", _revision=1)
+    for p in dump["policies"]:
+        body = dict(p, resource_type="SecurityPolicy", _revision=1); objs["/policy/api/v1" + p["path"]] = body
+        for r in p["rules"]: objs["/policy/api/v1" + r["path"]] = dict(r, resource_type="Rule", _revision=1)
+load()
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def send(self, code, body):
         data = json.dumps(body).encode(); self.send_response(code)
         self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
     def do_GET(self):
+        load()
         path = self.path.split("?")[0]; log.write(f"GET {self.path}\n"); log.flush()
         if path in ("/api/v1/node", "/api/v1/node/version"): return self.send(200, {"node_version": "4.1.2.0.0", "product_version": "4.1.2.0.0"})
         if path in objs: return self.send(200, objs[path])

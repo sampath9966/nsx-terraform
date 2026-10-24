@@ -229,6 +229,102 @@ check "without GitLab's CA the push fails; verification is not skipped" bash -c 
 git_quiet checkout main
 kill "$gitsrv" 2>/dev/null
 kill "$api" 2>/dev/null
+
+echo "mirror mode (scripts/mirror.sh): a manager still run from the UI"
+sed -i '/^  lon1:$/a\    mode: mirror' inventory/managers.yaml
+git_quiet commit -am "lon1 in mirror mode"
+git_quiet push -q "$SCRATCH/remote.git" main
+gl_port=$((20000 + RANDOM % 20000))
+python3 "$REPO/tests/fake_gitlab_api.py" "$gl_port" "$SCRATCH/gl.log" &
+gl=$!
+sleep 1
+: >"$SCRATCH/req.log"
+mirror() { env -u SSL_CERT_FILE -u NSX_CA_FILE NSX_CA_FILE_LON1="$SCRATCH/mine-ca.pem" NSX_PLAN_USERNAME=u NSX_PLAN_PASSWORD=p \
+	NSX_ADOPT_REMOTE="$SCRATCH/remote.git" NSX_ADOPT_TOKEN=SECRET-ADOPT-TOKEN CI_API_V4_URL="http://127.0.0.1:$gl_port/api/v4" \
+	CI_PROJECT_ID=7 CI_DEFAULT_BRANCH=main MIRROR_RETRY_SLEEP=0 MIRROR_SITE=lon1 "$@" scripts/mirror.sh 2>&1; }
+posts() { grep -c '"method": "POST"' "$SCRATCH/gl.log" || true; }
+remote_files() { git -C "$SCRATCH/remote.git" diff --name-status main mirror/lon1; }
+head_before="$(git rev-parse HEAD)"
+
+out="$(mirror)"
+check "the first sync pushes mirror/lon1" git -C "$SCRATCH/remote.git" rev-parse -q --verify refs/heads/mirror/lon1
+files="$(remote_files)"
+check "...with every adoptable object not declared anywhere else" bash -c 'grep -q "^A	data/policies/fresh-app.yaml" <<<"$1" && grep -q "^A	stacks/local-security/import-lon1-mirror.tf" <<<"$1"' _ "$files"
+check "...each file marked as the mirror's own" bash -c 'git -C "$1" show mirror/lon1:data/policies/fresh-app.yaml | head -1 | grep -qx "# nsx-mirror: lon1"' _ "$SCRATCH/remote.git"
+check "objects another file declares are left to it" bash -c '! grep -q "other-app\|legacy-app\|data/groups" <<<"$1" && grep -q "MANAGED   policy other-app" <<<"$2" && grep -q "MANAGED   group App-Web" <<<"$2"' _ "$files" "$out"
+check "objects that cannot be represented stay in the UI, reported" grep -q "NOT ADOPTED  policy mac-scoped" <<<"$out"
+check "a merge request is opened for it" python3 -c "import json,sys;l=[json.loads(x) for x in open(sys.argv[1])];p=[x for x in l if x['method']=='POST'];sys.exit(0 if len(p)==1 and p[0]['body']['source_branch']=='mirror/lon1' and p[0]['body']['title']=='Mirror lon1 from NSX' and 'Nothing is applied' in p[0]['body']['description'] else 1)" "$SCRATCH/gl.log"
+check "...with the token in a header, never in the output" bash -c 'grep -q "\"token\": \"SECRET-ADOPT-TOKEN\"" "$1" && ! grep -q SECRET-ADOPT-TOKEN <<<"$2"' _ "$SCRATCH/gl.log" "$out"
+check "the capture is never committed" bash -c '! git -C "$1" log --all --name-only --format= | grep -qiE "capture|raw|dump"' _ "$SCRATCH/remote.git"
+check "the job leaves the checkout where it found it" test "$(git rev-parse HEAD)" = "$head_before"
+tree1="$(git -C "$SCRATCH/remote.git" rev-parse "mirror/lon1^{tree}")"
+
+out="$(mirror)"
+check "a second sync before the merge updates the same merge request" bash -c '[ "$(grep -c "\"method\": \"POST\"" "$1")" = 1 ] && grep -q "\"method\": \"PUT\", \"path\": \"/api/v4/projects/7/merge_requests/1\"" "$1" && grep -q "updated merge request !1" <<<"$2"' _ "$SCRATCH/gl.log" "$out"
+check "...with byte-identical content: an unchanged manager gives the same files" test "$(git -C "$SCRATCH/remote.git" rev-parse "mirror/lon1^{tree}")" = "$tree1"
+
+merge_mirror() { # the merge request is merged
+	git -C "$SCRATCH/remote.git" update-ref refs/heads/main refs/heads/mirror/lon1
+	git_quiet fetch -q "$SCRATCH/remote.git" main
+	git_quiet checkout -q -B main FETCH_HEAD
+}
+merge_mirror
+out="$(mirror)"
+check "once merged, an unchanged manager means nothing to do" grep -q "lon1 matches the repository: nothing to do" <<<"$out"
+check "...and a merge request still open for it is closed" grep -q "closed merge request !1" <<<"$out"
+check "...without pushing anything" test "$(git -C "$SCRATCH/remote.git" rev-parse "mirror/lon1^{tree}")" = "$tree1"
+
+# Engineers change the manager in the UI: a new group and policy, an edited rule.
+python3 - <<'PY'
+import json
+d = json.load(open("reports/lon1-raw.json"))
+D = "/infra/domains/default"
+d["groups"].append({"id": "New-G", "path": f"{D}/groups/New-G", "display_name": "New-G",
+                    "expression": [{"resource_type": "IPAddressExpression", "ip_addresses": ["10.9.9.9"]}]})
+fresh = next(p for p in d["policies"] if p["id"] == "fresh-app")
+fresh["rules"][0]["action"] = "DROP"
+new = json.loads(json.dumps(fresh).replace("fresh-app", "new-app"))
+new["rules"][0]["source_groups"] = [f"{D}/groups/New-G"]
+d["policies"].append(new)
+json.dump(d, open("reports/lon1-raw.json", "w"))
+PY
+out="$(mirror MIRROR_AUTO_MERGE=1)"
+files="$(remote_files)"
+check "a group and a policy added in the UI are added" bash -c 'grep -q "^A	data/groups/imported-lon1-mirror.yaml" <<<"$1" && grep -q "^A	data/policies/new-app.yaml" <<<"$1"' _ "$files"
+check "...with their import blocks" bash -c 'f="$(git -C "$1" show mirror/lon1:stacks/local-security/import-lon1-mirror.tf)"; grep -q New-G <<<"$f" && grep -q new-app <<<"$f"' _ "$SCRATCH/remote.git"
+check "a rule changed in the UI follows" bash -c 'grep -q "^M	data/policies/fresh-app.yaml" <<<"$1" && git -C "$2" show mirror/lon1:data/policies/fresh-app.yaml | grep -q "action: DROP"' _ "$files" "$SCRATCH/remote.git"
+check "a new merge request lists the changes" python3 -c "import json,sys;l=[json.loads(x) for x in open(sys.argv[1])];p=[x for x in l if x['method']=='POST'];d=p[-1]['body']['description'];sys.exit(0 if len(p)==2 and '| added | \`data/policies/new-app.yaml\` |' in d and '| changed | \`data/policies/fresh-app.yaml\` |' in d else 1)" "$SCRATCH/gl.log"
+check "MIRROR_AUTO_MERGE=1 sets it to merge when its pipeline passes, retrying until GitLab accepts" bash -c 'grep -q "set to merge when its pipeline passes" <<<"$1" && [ "$(grep -c "/merge_requests/2/merge" "$2")" = 2 ]' _ "$out" "$SCRATCH/gl.log"
+check "the mirrored data passes validation" python3 scripts/validate-data.py
+merge_mirror
+
+# ...and later delete them again.
+python3 - <<'PY'
+import json
+d = json.load(open("reports/lon1-raw.json"))
+d["groups"] = [g for g in d["groups"] if g["id"] != "New-G"]
+d["policies"] = [p for p in d["policies"] if p["id"] != "new-app"]
+json.dump(d, open("reports/lon1-raw.json", "w"))
+PY
+out="$(mirror)"
+files="$(remote_files)"
+check "a policy and a group deleted in the UI are deleted from the repository" bash -c 'grep -q "^D	data/policies/new-app.yaml" <<<"$1" && grep -q "^D	data/groups/imported-lon1-mirror.yaml" <<<"$1"' _ "$files"
+check "...and from the import blocks" bash -c '! git -C "$1" show mirror/lon1:stacks/local-security/import-lon1-mirror.tf | grep -q "New-G\|new-app"' _ "$SCRATCH/remote.git"
+check "...and from the manifest" bash -c '! git -C "$1" show mirror/lon1:data/.import-manifest.json | grep -q new-app' _ "$SCRATCH/remote.git"
+
+out="$(mirror MIRROR_SITE=nyc1)"
+rc=$?
+check "a manager in mode: managed is refused, and the job fails" bash -c '[ "$2" -ne 0 ] && grep -q "nyc1 is in mode: managed" <<<"$1" && ! git -C "$3" rev-parse -q --verify refs/heads/mirror/nyc1' _ "$out" "$rc" "$SCRATCH/remote.git"
+out="$(mirror MIRROR_SITE=all)"
+check "MIRROR_SITE=all takes every manager in mode: mirror, and only those" bash -c 'grep -q "=== lon1" <<<"$1" && ! grep -q "=== nyc1" <<<"$1" && ! grep -q "=== gm1" <<<"$1"' _ "$out"
+check "without MIRROR_SITE it refuses" grep -q "MIRROR_SITE is not set" <<<"$(mirror MIRROR_SITE=)"
+writes="$(grep WRITE "$SCRATCH/req.log" | grep -vc "/api/session/create" || true)"
+check "mirroring only reads NSX" test "$writes" -eq 0
+kill "$gl" 2>/dev/null
+git_quiet checkout -q main
+sed -i '/^    mode: mirror$/d' inventory/managers.yaml
+git_quiet commit -qam "lon1 back to managed for the tests below"
+
 kill "$mock" 2>/dev/null
 wait "$mock" 2>/dev/null
 
@@ -303,6 +399,9 @@ check "a plan made for one manager is refused for another" grep -q "was made for
 check "...before anything is applied" bash -c '! grep -q "^apply" "$1"' _ "$FAKE_LOG"
 rm -f stacks/local-security/tfplan.site
 check "a plan with no record of its manager is refused" grep -q "was made for 'an unknown manager'" <<<"$(APPROVE=yes tf apply local-security nyc1)"
+sed -i '/^  nyc1:$/a\    mode: mirror' inventory/managers.yaml
+check "nothing is applied to a manager in mode: mirror, whatever the plan" grep -q "nyc1 is in mode: mirror" <<<"$(APPROVE=yes tf apply local-security nyc1)"
+sed -i '/^    mode: mirror$/d' inventory/managers.yaml
 tf plan local-security nyc1 >/dev/null
 # The test tree is on the placeholder local backend, which tf.sh only applies to
 # when told it is a lab.
