@@ -84,7 +84,16 @@ check "gitlab-https.sh succeeds" test "$rc" -eq 0
 [ "$rc" -eq 0 ] || tail -40 "$SCRATCH/https.log" | sed 's/^/    /'
 export GITLAB_SSL_DIR="$SSL"
 CA="$SSL/ca.crt"
-check "answers over HTTPS on 8443, trusting only our CA" curl -sf -o /dev/null --max-time 20 --cacert "$CA" https://127.0.0.1:8443/users/sign_in
+# GitLab can still be cycling a service for a few seconds after the switch, so
+# this waits up to a minute; on failure it shows what GitLab last answered.
+https_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 20 --cacert "$CA" https://127.0.0.1:8443/users/sign_in; }
+for _ in 1 2 3 4 5 6; do
+	code="$(https_code)"
+	[ "$code" = 200 ] && break
+	sleep 10
+done
+check "answers over HTTPS on 8443, trusting only our CA" test "$code" = 200
+[ "$code" = 200 ] || echo "    last answer: HTTP ${code:-none}"
 check "is NOT trusted without the CA" bash -c "! curl -sf -o /dev/null --max-time 20 https://127.0.0.1:8443/users/sign_in"
 check "certificate carries the IP in its SAN" bash -c "echo | openssl s_client -connect 127.0.0.1:8443 -CAfile '$CA' 2>/dev/null | openssl x509 -noout -text | grep -q 'IP Address:127.0.0.1'"
 check "old HTTP port no longer answers" bash -c "! curl -sf -o /dev/null --max-time 10 http://127.0.0.1:8929/users/sign_in"
@@ -109,6 +118,11 @@ echo "step 4b: bring the host to this release, on a network with no outside acce
 # else: every outside address is sent to a dead proxy, as on a locked-down network.
 export NSX_TEST_BLOCK_EGRESS=1
 if [ "$MODE" = upgrade ]; then
+	# The previous release may already have built the image with the provider
+	# inside (with outside access, in step 1). Remove it, so this release builds
+	# it here, with none: the path where the provider cannot be fetched is then
+	# tested on every upgrade run, whatever the previous release did.
+	docker rmi -f nsx-ci:1 >/dev/null 2>&1 || true
 	# What a consumer does: the tree is from the previous release; pull, run one command.
 	"$REPO/scripts/update.sh" --no-pull --dir "$T" --yes >"$SCRATCH/update.log" 2>&1
 	rc=$?
@@ -129,7 +143,7 @@ check "the runner passes the (blocked) proxy into jobs" docker exec nsx-gitlab-r
 check "the runner excludes every private range from that proxy" bash -c 't=$(docker exec nsx-gitlab-runner cat /etc/gitlab-runner/config.toml); printf "%s" "$t" | grep -q "10.0.0.0/8" && printf "%s" "$t" | grep -q "172.16.0.0/12" && printf "%s" "$t" | grep -q "192.168.0.0/16"'
 check "the clone script does not clear the host proxy" bash -c '! docker exec nsx-gitlab-runner cat /etc/gitlab-runner/config.toml | grep -F -q ".proxy"'
 # fresh: the image was first built in step 1, with outside access, so the NSX
-# provider is inside it. upgrade: this release's image is first built here,
+# provider is inside it. upgrade: the image was removed above and is built here,
 # with none, so the provider cannot be fetched and the image is built without.
 if [ "$MODE" = fresh ]; then
 	check "the NSX provider is in the CI image" docker run --rm nsx-ci:1 sh -c 'ls /usr/local/share/terraform/plugins/registry.terraform.io/vmware/nsxt/*.zip'

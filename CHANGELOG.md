@@ -13,6 +13,61 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.3.0
+
+**Mirror mode: the whole manager in the repository and in Terraform's state, following the UI, until you cut over.** For a manager engineers still run from the UI, while the other managers carry on as normal.
+
+**Turning it on.** Put a manager in mirror mode with the CI/CD variable `NSX_MODE_<SITE>` = `mirror`, with no commit (`hyd-gm01` is `NSX_MODE_HYD_GM01`), or with `mode: mirror` in `inventory/managers.yaml`. The variable wins. An unknown value stops the pipeline and names the variable.
+
+**The `mirror` job.** Schedule it under *Build → Pipeline schedules* with `MIRROR_SITE` = `all` or one manager, and `MIRROR_AUTO_MERGE` = `1` for hands-off. Each sync:
+- reads the manager with the read-only plan credential;
+- rewrites that manager's own files with every object the importer can represent exactly: groups, custom services, and distributed firewall policies and rules. Objects added, edited or deleted in the UI follow;
+- keeps one merge request up to date listing the changes, and does nothing when NSX matches the repository. An unchanged manager rewrites the same bytes.
+
+**State follows, NSX is never written.** On the default branch a mirror manager has no apply job. It gets an automatic `sync-state` job instead, which applies its plan only if the plan just imports and refreshes. `plan-guard --observe` refuses any create, update, destroy (approved or not) or hand-back, and `tf.sh` lets a mirror manager be applied only with the read-only credential. So new objects are imported, edited ones refreshed, and deleted ones leave state. A copy that is behind the UI is refused, never pushed back onto NSX, and the next sync brings the change in.
+
+**Other managers are not held up.** A mirror manager's plans may fail as a warning on other merge requests and on the default branch, so its UI churn never blocks other managers' work. Its own mirror merge request must plan cleanly. GitHub Actions leaves mirror managers out of the apply matrix.
+
+**Cutover.** Sync, check that the plan reports no changes, then switch the manager to managed. State already holds everything, so there is nothing to apply. Then delete the mirror's import file. `docs/IMPORT.md`, "Mirror mode", has the steps.
+
+**Mirror files.** They start with `# nsx-mirror: <site>` and belong to the job. Objects declared in other files are left to them (`MANAGED`); objects that cannot be represented exactly stay in the UI (`NOT ADOPTED`). `scripts/import-estate.py --mirror` is the same conversion by hand.
+
+**A Global Manager and its Local Managers: nothing taken twice, no drift loops.** Each object has one owner in `data/`, so one stack manages it. These changes keep that true when both are copied:
+
+- **Global objects stay the GM's.** The importer keeps only the manager's own tree: a Local Manager's listing of the GM's objects is never taken (`NOT ADOPTED ... belongs to the Global Manager`).
+- **Global references resolve.** A site-local rule using a global group or service is written by name, and the local-security stack now resolves GM-owned names to their `/global-infra` paths without managing them. Before, the converter wrote the raw path and the validator failed the merge request. Until the GM's copy holds the object, the rule waits in the UI.
+- **No silent mis-binding.** A local object whose id another manager owns in `data/` is not taken, nor are the rules that use it, which would otherwise resolve to the other object. Neither is an LM group that nests a global group.
+- **No raw paths.** A reference that resolves to nothing now leaves the rule in the UI, with the reason, instead of writing a raw path.
+- **No empty policies.** A policy with no rule left to take stays in the UI whole.
+
+**Fixed in adoption generally:**
+- **Apply To `ANY`.** A rule or policy whose *Applied To* is `ANY` was written with an empty scope, which the validator and the dfw-policy module refuse. It is now written as `ANY`, which plans with no change.
+- **Predefined services named twice.** The same predefined service (for example `HTTPS`) named in two files, by the GM's and an LM's copy or by two adoptions, was reported as defined twice. Identical declarations are now accepted.
+- **GM domain.** The importer read a Global Manager's objects from domain `global`; NSX keeps global objects in `default`, as the stacks already assumed. The example inventory and the global-security README said `global` too; fixed.
+- **Not-adopted reasons.** Rules reported as not adopted now say why.
+
+**Tests:**
+- `tests/brownfield-provider.sh`, with the real provider: an LM rule using the GM's group and service, Apply To `ANY`, plans as a pure import (`10 to import, 0 to change`), manages none of the GM's objects, applies as imports only, and the next two plans report no changes.
+- `tests/brownfield.sh` copies a GM and an LM side by side and covers:
+  - the LM's listing of a global object;
+  - an LM group with a GM group's id, and the rule using it;
+  - an LM group nesting a global group;
+  - rules using a declared and an undeclared global group;
+  - `ANY` scope, and `HTTPS` named by both managers;
+  - no id declared twice, no raw paths, the copy validating, and a re-sync changing nothing;
+  - both sync orders (LM first, then GM) converging.
+- `tests/brownfield-provider.sh`, mirror mode, with the real provider:
+  - the whole copy plans as `8 to import, 0 to add, 0 to change, 0 to destroy`;
+  - the write credential is refused, and the read-only sync-state apply imports all 8;
+  - a UI change not yet synced is refused, by the plan and by the apply;
+  - after the sync, an edited group needs nothing and a new policy is imported, and state holds both;
+  - a policy deleted in the UI leaves state with nothing done in NSX;
+  - at cutover Terraform already holds everything;
+  - NSX receives no write.
+- `tests/brownfield.sh`: the mirror job end to end against the mock manager, a bare git remote and a new fake GitLab API (`tests/fake_gitlab_api.py`). Covers syncs, merge request updates and closure, add, edit and delete, auto-merge, `all`, managed managers refused, and token hygiene. Also `plan-guard --observe`, and `tf.sh` refusing the write credential and honouring `NSX_MODE_<SITE>`.
+- `tests/ci-scripts.sh`: the child pipeline. A mirror manager gets no apply job, an automatic read-only sync-state job, and a lenient plan except in its own mirror merge request. Managed managers keep manual applies and strict plans, the variable override works both ways, and an invalid value fails. Also the schema, the mirror job's rules, and the GitHub apply matrix.
+- `tests/mock_nsx.py` re-reads its data when it changes, to stand in for an engineer in the UI.
+
 ## 1.2.10
 
 **Plan jobs failed with `remote error: tls: unrecognized name` on a network with an internet proxy.** The runner gives jobs the host's proxy and a `NO_PROXY` of private address ranges. Terraform, curl and Python match `NO_PROXY` against the name in the URL, and a range such as `10.0.0.0/8` only ever covers a literal IP address, so a manager named by FQDN was sent to the proxy, which refused it. `scripts/with-credentials.sh`, which every job that talks to NSX already runs through, now adds the manager's host from `inventory/managers.yaml` (and `SDDC_MANAGER_HOST`) to `NO_PROXY`, so managers are always reached directly. Downloads of providers and images still use the proxy. Where managers really are reached through a proxy, set `NSX_MANAGER_VIA_PROXY=1`.

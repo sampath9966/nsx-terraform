@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.2.10"
+VERSION="1.3.0"
 
 ROOT="$PWD"
 FORCE=0
@@ -1367,6 +1367,104 @@ scopes, masked and protected; branch protection still keeps it off the default
 branch. Steps 1 and 2 below are the same thing done by hand, for when you want to
 iterate on a conversion offline.
 
+## Mirror mode: the whole manager, kept in step, until you cut over
+
+For a manager that engineers keep running from the UI while the repository and
+Terraform's state catch up. Instead of choosing policies, the repository holds a
+copy of **everything** the importer can represent, refreshed on a schedule, and
+state follows it. Nothing is applied to NSX for that manager until you switch
+it to managed. The other managers carry on as normal: their merge requests are
+planned, merged and applied as usual.
+
+**Turn it on, per manager.** Either way works; the variable wins:
+
+- the CI/CD variable `NSX_MODE_<SITE>` = `mirror` (*Settings → CI/CD →
+  Variables*; `hyd-gm01` is `NSX_MODE_HYD_GM01`): no commit, takes effect at the
+  next pipeline;
+- or `mode: mirror` for the manager in `inventory/managers.yaml`, in a merge
+  request.
+
+From then on, for that manager:
+
+- **no apply job.** On the default branch it gets an automatic `sync-state` job
+  instead. That job applies its plan only if the plan just imports and refreshes
+  (`plan-guard --observe`: any create, update, destroy or hand-back is refused),
+  and only with the **read-only** plan credential, so it cannot write to NSX
+  even by mistake. `scripts/tf.sh apply` holds anyone to the same rules.
+  GitHub Actions leaves it out of the apply matrix.
+- **its plans never hold up the other managers.** It changes in the UI between
+  syncs, so on other merge requests and on the default branch its plan may fail,
+  shown as a warning. In its own mirror merge request the plan must pass.
+
+**Schedule the sync.** *Build → Pipeline schedules → New schedule*, on the
+default branch, with the variable `MIRROR_SITE` = `all` (every manager in mirror
+mode) or one manager's name, and `MIRROR_AUTO_MERGE` = `1` for state to follow
+without anyone merging. Every few hours is typical. *Run pipeline* with the same
+variables syncs on demand. The `mirror` job (`scripts/mirror.sh`):
+
+1. reads each manager with the read-only plan credential;
+2. rewrites that manager's mirror files from what it holds now:
+   `data/groups/imported-<site>-mirror.yaml`, `data/services/imported-<site>-mirror.yaml`,
+   `data/policies/<policy-id>.yaml` and `stacks/<stack>/import-<site>-mirror.tf`, each
+   starting with the line `# nsx-mirror: <site>`. Objects added in the UI are
+   added, edited ones follow, deleted ones are removed;
+3. if that matches the default branch, does nothing (and closes a merge request
+   still open for it); otherwise force-pushes the branch `mirror/<site>` and keeps
+   **one** merge request for it up to date, listing what was added, changed and
+   deleted. With `MIRROR_AUTO_MERGE=1` it merges itself when its pipeline passes.
+
+Once merged, the default-branch pipeline's `sync-state` job brings state up to
+date: new objects are imported, edited ones are refreshed, deleted ones leave
+state. If an engineer changed the manager after the sync read it, the plan
+differs from the copy; it is refused, nothing is pushed back onto NSX, and the
+next sync brings the change in.
+
+It needs `NSX_ADOPT_TOKEN`, as the adopt job. An unchanged manager rewrites the
+same bytes, so a quiet manager produces no merge requests. Objects declared in any
+other file (adopted by hand, or written by you) are left to that file and listed
+as `MANAGED`; objects the importer cannot represent exactly stay in the UI and are
+listed as `NOT ADOPTED`, as everywhere else. Do not edit the mirror files: the
+next sync overwrites them.
+
+**A Global Manager and its Local Managers.** Each object has exactly one owner in
+`data/`, so exactly one stack manages it and the GM and an LM never fight over
+it:
+
+- The GM's copy is read from the global tree (`/global-infra`, domain `default`
+  unless the inventory sets one) and is `owner: gm`. A Local Manager also lists
+  the GM's objects; its copy never takes them (`NOT ADOPTED ... belongs to the
+  Global Manager`).
+- A site-local rule that uses a global group or service names it, and the
+  local-security stack resolves the name to its `/global-infra` path without
+  managing it. If the GM's copy does not hold that object yet, the rule waits in
+  the UI until the next sync after the GM's copy is merged.
+- A local group or service whose id another manager already owns in `data/` is
+  not taken, nor are the rules that use it, since the name would resolve to the
+  other object. Rename one of them in NSX to bring it in.
+- A policy with no rule left to take stays in the UI whole.
+
+Two managers cannot both own an object with the same id (the data is keyed by
+id): the second is listed as `NOT ADOPTED` and left in its UI. An object edited in
+the UI into something the importer cannot represent leaves the copy but not
+state, so its plan shows a destroy and is refused every time: hand it back
+(below) to stop managing it.
+
+**Cut over** when the team is ready to stop changing that manager by hand:
+
+1. Agree a short freeze on UI changes for that manager.
+2. Run the sync (*Run pipeline*, `MIRROR_SITE` = the manager), merge its merge
+   request, and let `sync-state` finish. The plan must report no changes.
+3. Set the manager to managed: `NSX_MODE_<SITE>` = `managed` (or delete the
+   variable and set `mode: managed` in the inventory, in a merge request). State
+   already holds everything, so there is nothing to apply.
+4. In a merge request, delete `stacks/<stack>/import-<site>-mirror.tf`. The data
+   files stay; they are now the source of truth. Their first line may stay or
+   go: the mirror job refuses managers in managed mode.
+
+From then on, changes go through merge requests. A change made in the UI shows
+in the next plan as a difference Terraform would undo, and `scripts/drift.sh`
+reports it.
+
 ## 1. Capture, read-only
 
 ```bash
@@ -2538,6 +2636,10 @@ write_file data/schema/managers.schema.json <<'SCAFFOLD_EOF'
           "domain": { "type": "string" },
           "standby_for": { "type": "string" },
           "enabled": { "type": "boolean" },
+          "mode": {
+            "enum": ["managed", "mirror"],
+            "description": "managed (the default): the pipeline plans and applies. mirror: scripts/mirror.sh keeps data/ a copy of the manager, and only its state is updated (imports and refreshes, read-only); nothing is applied to NSX. The CI/CD variable NSX_MODE_<SITE> overrides this. docs/IMPORT.md."
+          },
           "stacks": {
             "type": "array",
             "items": {
@@ -4278,7 +4380,7 @@ referenced across the span, and the dfw-policy module fails the plan if you try.
 ## Run
 
 ```bash
-export TF_VAR_domain=global          # never leave this to default
+export TF_VAR_domain=default         # the global domain; a location's domain only for location-specific objects
 terraform init -backend-config=../../envs/gm1.backend.hcl
 terraform plan -out=tfplan -parallelism=5
 ```
@@ -4349,7 +4451,15 @@ locals {
   base_groups      = { for k, g in local.groups : k => g if !contains(local.composite_group_keys, k) }
   composite_groups = { for k, g in local.groups : k => g if contains(local.composite_group_keys, k) }
 
-  group_paths = merge(module.base_groups.paths, module.composite_groups.paths)
+  # The Global Manager's groups, as a Local Manager sees them: read-only, under
+  # /global-infra. A site-local rule may use one by name; this stack never
+  # manages it (owner: gm is filtered out above), so it cannot fight the GM.
+  global_group_paths = {
+    for k, g in local.groups_all : k => "/global-infra/domains/${try(g.domain, "default")}/groups/${k}"
+    if try(g.owner, "lm") == "gm"
+  }
+
+  group_paths = merge(local.global_group_paths, module.base_groups.paths, module.composite_groups.paths)
 
   # --- services -----------------------------------------------------------
   service_files = fileset("${local.data_root}/services", "*.yaml")
@@ -4365,7 +4475,14 @@ locals {
     if try(v.owner, "gm") == "lm" && (contains(try(v.sites, ["*"]), var.site) || contains(try(v.sites, ["*"]), "*"))
   }
 
+  # The Global Manager's custom services, likewise: used by name, never managed here.
+  global_service_paths = {
+    for k, v in local.custom_services_all : k => "/global-infra/services/${k}"
+    if try(v.owner, "gm") == "gm"
+  }
+
   service_paths = merge(
+    local.global_service_paths,
     { for k, s in data.nsxt_policy_service.predefined : k => s.path },
     module.services.paths,
   )
@@ -4947,7 +5064,7 @@ uses_local_backend() { grep -q 'backend "local"' "$stack_dir/backend.tf" 2>/dev/
 # each plan and again before each apply, so a hand-run apply is held to it too.
 guard() {
 	(cd "$stack_dir" && terraform show -json tfplan) |
-		python3 "$REPO_ROOT/scripts/plan-guard.py" --site "$site" --stack "$stack"
+		python3 "$REPO_ROOT/scripts/plan-guard.py" --site "$site" --stack "$stack" "$@"
 }
 
 backend_args=(-backend-config="$backend_file")
@@ -5022,9 +5139,20 @@ apply)
 		echo "error: apply requires an explicit human decision. Re-run with APPROVE=yes after reviewing the plan." >&2
 		exit 1
 	fi
+	# A manager in mirror mode is still run from the UI; data/ is a copy of it.
+	# Only its state is brought up to date: imports and refreshes, with the
+	# read-only identity, so even a mistake here cannot write to NSX.
+	observe=()
+	if [ "${NSX_MODE:-}" = mirror ]; then
+		if [ "${NSX_CRED_SCOPE:-}" != plan ]; then
+			echo "error: $site is in mirror mode: only its state is updated, and only with the read-only credential (NSX_CRED_SCOPE=plan). Nothing else is applied to it until mode: managed; docs/IMPORT.md, \"Mirror mode\"." >&2
+			exit 1
+		fi
+		observe=(--observe)
+	fi
 	require_plan_for_site
 	ensure_init
-	if ! guard; then
+	if ! guard ${observe[@]+"${observe[@]}"}; then
 		echo "error: refusing to apply: the saved plan does not pass plan-guard (above)." >&2
 		exit 2
 	fi
@@ -5281,6 +5409,8 @@ scripts/gitlab-child-pipeline.py for GitLab.
 
 from __future__ import annotations
 
+import os
+import re
 import sys
 from pathlib import Path
 
@@ -5289,6 +5419,20 @@ from yamlcompat import load_yaml  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INVENTORY = REPO_ROOT / "inventory" / "managers.yaml"
+MODES = ("managed", "mirror")
+
+
+def mode_of(name: str, manager: dict) -> str:
+    """managed or mirror. The CI/CD variable NSX_MODE_<SITE> (hyd-gm01 is
+    NSX_MODE_HYD_GM01) wins over the inventory's mode, so one manager can be put
+    into, or taken out of, mirror mode without a commit."""
+    variable = "NSX_MODE_" + re.sub(r"[^A-Z0-9]", "_", name.upper())
+    override = os.environ.get(variable, "").strip()
+    mode = override or manager.get("mode", "managed")
+    if mode not in MODES:
+        source = variable if override else "inventory/managers.yaml"
+        sys.exit(f"error: {name}: mode {mode!r} from {source} must be one of: {', '.join(MODES)}")
+    return mode
 
 # A Global Manager has no VM inventory and no local networking, so local-tags,
 # local-network and platform are Local Manager stacks only.
@@ -5323,6 +5467,7 @@ def entries(stack_filter: str | None = None, strict: bool = False) -> list[dict]
                     "host": m.get("host", ""),
                     "tier": m.get("tier", ""),
                     "vcf_instance": m.get("vcf_instance", ""),
+                    "mode": mode_of(name, m),
                 }
             )
     return out
@@ -5350,7 +5495,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ci_matrix_lib import entries, managers  # noqa: E402
+from ci_matrix_lib import entries, managers, mode_of  # noqa: E402
 
 
 def export(site: str) -> int:
@@ -5366,6 +5511,7 @@ def export(site: str) -> int:
         "NSX_VAULT_PATH": m.get("vault_path", ""),
         "NSX_DOMAIN": m.get("domain", "default"),
         "NSX_VCF_INSTANCE": m.get("vcf_instance", ""),
+        "NSX_MODE": mode_of(site, m),
     }
     for key, value in pairs.items():
         print(f"export {key}={shlex.quote(str(value))}")
@@ -5377,6 +5523,8 @@ def main() -> int:
     ap.add_argument("--stack", help="only include this stack")
     ap.add_argument("--format", choices=["json", "github", "lines"], default="json")
     ap.add_argument("--export", metavar="SITE", help="print shell exports for one manager")
+    ap.add_argument("--managed-only", action="store_true",
+                    help="leave out managers in mode: mirror (the apply matrix)")
     args = ap.parse_args()
 
     if args.export:
@@ -5385,6 +5533,8 @@ def main() -> int:
     # Strict here: a human or a GitHub matrix asking for the inventory when it
     # does not exist is an error, not an empty list.
     rows = entries(args.stack, strict=True)
+    if args.managed_only:
+        rows = [r for r in rows if r["mode"] != "mirror"]
     if args.format == "lines":
         for r in rows:
             print(f"{r['site']}\t{r['stack']}\t{r['role']}\t{r['host']}")
@@ -6121,6 +6271,11 @@ def check_services(docs: dict[Path, dict], sites: set[str], imported: set[str], 
         check_no_raw_paths(where, doc, report)
 
         for name, display in (doc.get("predefined") or {}).items():
+            # A predefined service is a lookup, not an object anyone owns: two
+            # files (a GM's and an LM's, or two adoptions) may both name it.
+            known = services.get(name)
+            if known and known["kind"] == "predefined" and known["display_name"] == display:
+                continue
             if name in services:
                 report.error(where, f"service {name!r} is also defined in {origin[name]}")
                 continue
@@ -6991,6 +7146,19 @@ If a target file already exists it is written as <name>.new and reported. Your
 data is never overwritten by this tool, and bootstrap.sh refuses to overwrite
 anything listed in the manifest even with --force-data.
 
+Mirror mode: --mirror converts EVERY adoptable object of the manager, not a
+chosen policy, into files this tool owns for that manager and regenerates on
+every run, so objects added, changed or deleted in the UI follow:
+
+  data/groups/imported-<site>-mirror.yaml, data/services/imported-<site>-mirror.yaml,
+  data/policies/<policy-id>.yaml, stacks/<stack>/import-<site>-mirror.tf
+
+Each starts with the line "# nsx-mirror: <site>". Those files are overwritten
+and removed by the next run; nothing else is touched, and objects declared in
+any other file are left to that file. The output is stable: a run against an
+unchanged manager rewrites the same bytes. scripts/mirror.sh runs this from
+the pipeline for managers with "mode: mirror" in the inventory.
+
 IMPORT ID FORMAT: policy resources in the nsxt provider have taken more than
 one import id format across versions — the policy path, or "domain/id". This
 script defaults to the path and can emit either (--id-format). Confirm on your
@@ -7015,6 +7183,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA = REPO_ROOT / "data"
 MANIFEST = DATA / ".import-manifest.json"
+
+# First line of every file mirror mode owns, followed by the manager's name.
+MIRROR_MARK = "# nsx-mirror: "
 
 GM_BASE = "/global-manager/api/v1/global-infra"
 LM_BASE = "/policy/api/v1/infra"
@@ -7295,7 +7466,9 @@ def convert_rule(rule: dict, group_paths: dict, service_paths: dict) -> dict:
         converted["profiles"] = profiles
     if tags_of(rule):
         converted["tags"] = tags_of(rule)
-    converted["scope"] = scope
+    # Apply To "ANY" (the policy's own scope) is written as ANY: an empty list
+    # would read as a rule that forgot its Apply To, and is refused.
+    converted["scope"] = scope or ["ANY"]
     return converted
 
 
@@ -7322,7 +7495,7 @@ def convert_policy(policy: dict, group_paths: dict, service_paths: dict, owner: 
     header["rule_management"] = "standalone"
     header["scope"] = [
         group_paths.get(p, p) for p in policy.get("scope", []) if p != "ANY"
-    ]
+    ] or ["ANY"]
 
     rules = {}
     for rule in policy.get("rules", []):
@@ -7394,10 +7567,11 @@ def service_unsupported(service: dict) -> str | None:
     return ("service entries of type " + ", ".join(sorted(str(k) for k in kinds))) if kinds else None
 
 
-def unsupported_objects(groups: list[dict], services: list[dict]) -> dict[str, str]:
+def unsupported_objects(groups: list[dict], services: list[dict], start: dict[str, str] | None = None) -> dict[str, str]:
     """path -> reason, for groups and custom services that cannot be adopted.
-    A group that nests an unsupported group is unsupported too."""
-    bad: dict[str, str] = {}
+    A group that nests an unsupported group is unsupported too. start: paths
+    already known to be unadoptable (federation())."""
+    bad: dict[str, str] = dict(start or {})
     for g in groups:
         if not is_system(g) and (why := group_unsupported(g)):
             bad[g["path"]] = why
@@ -7422,9 +7596,9 @@ def unsupported_objects(groups: list[dict], services: list[dict]) -> dict[str, s
 def rule_unsupported(rule: dict, bad: dict[str, str]) -> str | None:
     if rule.get("service_entries"):
         return "inline service entries"
-    used = [p for f in ("source_groups", "destination_groups", "scope", "services") for p in rule.get(f) or [] if p in bad]
+    used = sorted({p for f in ("source_groups", "destination_groups", "scope", "services") for p in rule.get(f) or [] if p in bad})
     if used:
-        return "uses " + ", ".join(sorted({u.rsplit("/", 1)[-1] for u in used})) + " (not adoptable)"
+        return "uses " + "; ".join(f"{u.rsplit('/', 1)[-1]} ({bad[u]})" for u in used)
     return None
 
 
@@ -7437,15 +7611,16 @@ def is_system(obj: dict) -> bool:
 # --------------------------------------------------------------------------
 
 class Writer:
-    def __init__(self, dry_run: bool) -> None:
+    def __init__(self, dry_run: bool, overwrite: bool = False) -> None:
         self.dry_run = dry_run
+        self.overwrite = overwrite
         self.written: list[str] = []
         self.deferred: list[str] = []
 
     def write(self, path: Path, text: str) -> None:
         rel = str(path.relative_to(REPO_ROOT))
         target = path
-        if path.exists():
+        if path.exists() and not self.overwrite:
             target = path.with_suffix(path.suffix + ".new")
             self.deferred.append(f"{rel} -> {target.name}")
         else:
@@ -7505,17 +7680,118 @@ def import_file(site: str, tranche: str, role: str, kinds: list[tuple[str, str, 
     return "\n".join(lines) + "\n"
 
 
-def existing_keys() -> dict[str, set[str]]:
-    """What data/ already declares: those objects are managed and never re-imported."""
+def mirror_files(site: str) -> set[Path]:
+    """The data files mirror mode owns for this manager, by their first line."""
+    own: set[Path] = set()
+    for kind in ("groups", "services", "policies"):
+        for f in (DATA / kind).glob("*.yaml"):
+            if f.read_text().split("\n", 1)[0].strip() == f"{MIRROR_MARK}{site}":
+                own.add(f)
+    return own
+
+
+def declared_objects(exclude: frozenset[Path] | set[Path] = frozenset()) -> dict[str, dict[str, dict]]:
+    """Groups and custom services data/ declares, id -> definition."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from yamlcompat import load_yaml  # noqa: PLC0415
+
+    out: dict[str, dict[str, dict]] = {"groups": {}, "services": {}}
+    for kind, key in (("groups", "groups"), ("services", "custom")):
+        for f in sorted((DATA / kind).glob("*.yaml")):
+            if f in exclude:
+                continue
+            for name, definition in ((load_yaml(f.read_text()) or {}).get(key) or {}).items():
+                out[kind][name] = definition if isinstance(definition, dict) else {}
+    return out
+
+
+def federation(role: str, site: str, groups: list, services: list, policies: list,
+               declared: dict, group_paths: dict, service_paths: dict) -> dict[str, str]:
+    """What cannot be adopted on this manager because of the Global Manager / Local
+    Manager split, path -> reason; fills group_paths and service_paths with the
+    global objects a Local Manager's rules may use.
+
+    data/ is keyed by id, and each object has one owner, so an object belongs to
+    exactly one manager's stack and two stacks never fight over it. Here that
+    is kept true: a local object whose id another manager already owns in
+    data/ is not adopted (its name would resolve to the other object), and a
+    reference that resolves to nothing data/ declares is not adopted either,
+    rather than written as a raw path."""
+    default_owner = {"groups": "lm", "services": "gm"}
+
+    def elsewhere(kind: str, definition: dict) -> bool:
+        owner = definition.get("owner", default_owner[kind])
+        if role == "gm":
+            return owner != "gm"
+        sites_ = definition.get("sites") or []
+        return owner == "gm" or not (site in sites_ or "*" in sites_)
+
+    if role != "gm":
+        # A Local Manager sees the Global Manager's objects under /global-infra,
+        # read-only. Its own rules may use those that data/ declares as owner: gm.
+        for gid, definition in declared["groups"].items():
+            if definition.get("owner", "lm") == "gm":
+                group_paths[f"/global-infra/domains/{definition.get('domain', 'default')}/groups/{gid}"] = gid
+        for sid, definition in declared["services"].items():
+            if definition.get("owner", "gm") == "gm":
+                service_paths[f"/global-infra/services/{sid}"] = sid
+
+    problems: dict[str, str] = {}
+    for kind, objects in (("groups", groups), ("services", services)):
+        for obj in objects:
+            definition = declared[kind].get(obj["id"])
+            if definition is not None and not is_system(obj) and elsewhere(kind, definition):
+                whose = "the Global Manager's" if definition.get("owner", default_owner[kind]) == "gm" else "another manager's"
+                problems[obj["path"]] = f"its id is also {whose} {kind[:-1]} in data/, so the names would collide"
+
+    def check(path: str, known: dict, what: str) -> None:
+        if path in ("ANY", "") or path in known or path in problems:
+            return
+        if path.startswith("/global-infra/") and role != "gm":
+            problems[path] = f"uses the global {what} {path.rsplit('/', 1)[-1]}, which data/ does not declare: adopt or mirror the Global Manager first"
+        else:
+            problems[path] = f"refers to {path}, which {site} does not hold"
+
+    for policy in policies:
+        for path in policy.get("scope") or []:
+            check(path, group_paths, "group")
+        for rule in policy.get("rules", []):
+            for field in ("source_groups", "destination_groups", "scope"):
+                for path in rule.get(field) or []:
+                    check(path, group_paths, "group")
+            for path in rule.get("services") or []:
+                check(path, service_paths, "service")
+    for group in groups:
+        for expression in group.get("expression", []):
+            if expression.get("resource_type") != "PathExpression":
+                continue
+            for path in expression.get("paths", []):
+                if path.startswith("/global-infra/") and role != "gm":
+                    # A site-local group cannot be built from a global one here.
+                    problems.setdefault(group["path"], f"nests the global group {path.rsplit('/', 1)[-1]}")
+                else:
+                    check(path, group_paths, "group")
+    return problems
+
+
+def existing_keys(exclude: frozenset[Path] | set[Path] = frozenset()) -> dict[str, set[str]]:
+    """What data/ already declares: those objects are managed and never re-imported.
+    Files in exclude are not counted (mirror mode's own, about to be rewritten)."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from yamlcompat import load_yaml  # noqa: PLC0415
 
     found: dict[str, set[str]] = {"groups": set(), "services": set(), "policies": set()}
     for f in sorted((DATA / "groups").glob("*.yaml")):
+        if f in exclude:
+            continue
         found["groups"].update(((load_yaml(f.read_text()) or {}).get("groups") or {}).keys())
     for f in sorted((DATA / "services").glob("*.yaml")):
+        if f in exclude:
+            continue
         found["services"].update(((load_yaml(f.read_text()) or {}).get("custom") or {}).keys())
     for f in sorted((DATA / "policies").glob("*.yaml")):
+        if f in exclude:
+            continue
         doc = load_yaml(f.read_text()) or {}
         found["policies"].add(str((doc.get("policy") or {}).get("id") or f.stem))
     return found
@@ -7564,8 +7840,14 @@ def main() -> int:
                     help="survey: list the policies and whether each can be adopted; write nothing")
     ap.add_argument("--tranche", default=None, metavar="NAME",
                     help="name for this piece of work, used in the file names (default: the first --policy, or 'all')")
+    ap.add_argument("--mirror", action="store_true",
+                    help="mirror mode: every adoptable object, into files this tool owns and rewrites each run")
     args = ap.parse_args()
-    tranche = args.tranche or (args.policy[0] if args.policy else "all")
+    if args.mirror and (args.policy or args.tranche or args.list or args.dump_only):
+        sys.exit("error: --mirror takes the whole manager: not with --policy, --tranche, --list or --dump-only")
+    if not args.mirror and args.tranche == "mirror":
+        sys.exit("error: the tranche name 'mirror' belongs to --mirror")
+    tranche = "mirror" if args.mirror else (args.tranche or (args.policy[0] if args.policy else "all"))
     global CA_SITE
     CA_SITE = args.site
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", tranche):
@@ -7580,7 +7862,9 @@ def main() -> int:
         managers = (load_yaml(inventory_path.read_text()) or {}).get("managers") or {}
     manager = managers.get(args.site, {})
     role = args.role or manager.get("role", "lm")
-    domain = args.domain or manager.get("domain") or ("global" if role == "gm" else "default")
+    # On a Global Manager too, global objects live in domain "default" (another
+    # domain is one location's); scripts/tf.sh uses the same default.
+    domain = args.domain or manager.get("domain") or "default"
     base = GM_BASE if role == "gm" else LM_BASE
 
     if args.from_dump:
@@ -7604,22 +7888,47 @@ def main() -> int:
         print(f"wrote {out}")
         return 0
 
-    all_groups = estate.get("groups", [])
-    all_services = estate.get("services", [])
-    all_policies = estate.get("policies", [])
+    # This manager's own tree only. A Local Manager also shows the Global
+    # Manager's objects (under /global-infra); those belong to the GM's data,
+    # never to an LM's, or the same object would be managed twice.
+    tree = "/global-infra/" if role == "gm" else "/infra/"
+    foreign = [o for kind in ("groups", "services", "policies") for o in estate.get(kind, [])
+               if not str(o.get("path", tree)).startswith(tree)]
+    all_groups = [g for g in estate.get("groups", []) if str(g.get("path", tree)).startswith(tree)]
+    all_services = [s for s in estate.get("services", []) if str(s.get("path", tree)).startswith(tree)]
+    all_policies = [p for p in estate.get("policies", []) if str(p.get("path", tree)).startswith(tree)]
 
-    if args.list:
-        return survey(args.site, all_groups, all_services, all_policies)
-    sites = [args.site]
-    owner = "gm" if role == "gm" else "lm"
-
+    own: set[Path] = mirror_files(args.site) if args.mirror else set()
     # References are converted to names using everything that was read, so a
     # rule can name a group this tranche does not adopt.
     group_paths = {g["path"]: g["id"] for g in all_groups if g.get("path")}
     service_paths = {s["path"]: s["id"] for s in all_services if s.get("path")}
+    federated = federation(role, args.site, all_groups, all_services, all_policies,
+                           declared_objects(exclude=own), group_paths, service_paths)
+
+    if args.list:
+        return survey(args.site, all_groups, all_services, all_policies, federated)
+    sites = [args.site]
+    owner = "gm" if role == "gm" else "lm"
 
     groups, services, policies = all_groups, all_services, all_policies
     skipped: list[str] = []
+    if args.mirror:
+        # Everything, except what another file declares: that file manages it.
+        # Sorted, so an unchanged manager gives byte-identical files.
+        have = existing_keys(exclude=own)
+        skipped += sorted(f"group {g['id']}" for g in groups if g["id"] in have["groups"] and not is_system(g))
+        skipped += sorted(f"service {s['id']}" for s in services if s["id"] in have["services"] and not is_system(s))
+        skipped += sorted(f"policy {p['id']}" for p in policies if p["id"] in have["policies"] and not is_system(p))
+        groups = sorted((g for g in groups if g["id"] not in have["groups"]), key=lambda g: g["id"])
+        services = sorted((s for s in services if is_system(s) or s["id"] not in have["services"]), key=lambda s: s["id"])
+        # A policy's file is data/policies/<id>.yaml; one that another file
+        # already occupies is that file's, whatever it declares.
+        taken = {p["id"] for p in policies if (DATA / "policies" / f"{p['id']}.yaml").exists()
+                 and DATA / "policies" / f"{p['id']}.yaml" not in own and p["id"] not in have["policies"]}
+        skipped += sorted(f"policy {i} (data/policies/{i}.yaml is another file)" for i in taken)
+        policies = sorted((p for p in policies if p["id"] not in have["policies"] and p["id"] not in taken),
+                          key=lambda p: p["id"])
     if args.policy:
         by_id = {p["id"]: p for p in all_policies}
         missing = [i for i in args.policy if i not in by_id]
@@ -7643,8 +7952,15 @@ def main() -> int:
         policies = [p for p in policies if p["id"] not in have["policies"]]
 
     # Never adopt what cannot be represented exactly; report it instead.
-    bad = unsupported_objects(all_groups, all_services)
-    kept_in_ui: list[str] = []
+    bad = unsupported_objects(all_groups, all_services, federated)
+    kept_in_ui: list[str] = [f"{o.get('resource_type', 'object')} {o.get('id')}: belongs to the Global Manager ({o.get('path')})"
+                             for o in foreign]
+    # A local object shadowed by another manager's id is reported here, not as MANAGED.
+    for kind, objects in (("group", all_groups), ("service", all_services)):
+        for o in objects:
+            if o.get("path") in federated and "names would collide" in federated[o["path"]]:
+                kept_in_ui.append(f"{kind} {o['id']}: {federated[o['path']]}")
+                skipped = [x for x in skipped if x != f"{kind} {o['id']}"]
     for g in groups:
         if g.get("path") in bad:
             kept_in_ui.append(f"group {g['id']}: {bad[g['path']]}")
@@ -7666,23 +7982,50 @@ def main() -> int:
             kept_in_ui.append(reason)
             continue
         rules = []
+        notes = []
         for rule in policy.get("rules", []):
             why = rule_unsupported(rule, bad)
             if why:
-                kept_in_ui.append(f"rule {policy['id']}/{rule['id']}: {why}; stays in the UI, the rest of the policy is adopted")
+                notes.append(f"rule {policy['id']}/{rule['id']}: {why}; stays in the UI, the rest of the policy is adopted")
             else:
                 rules.append(rule)
+        if not rules:
+            # A policy with no rule to adopt stays whole in the UI: data/ holds no
+            # empty policies.
+            reason = f"policy {policy['id']}: none of its {len(policy.get('rules', []))} rule(s) can be adopted"
+            if policy["id"] in args.policy:
+                sys.exit(f"error: {reason}. Nothing was written.")
+            kept_in_ui += [n.replace("; stays in the UI, the rest of the policy is adopted", "") for n in notes] + [reason]
+            continue
+        kept_in_ui += notes
         adoptable.append(dict(policy, rules=rules))
     policies = adoptable
 
-    writer = Writer(args.dry_run)
+    writer = Writer(args.dry_run, overwrite=args.mirror)
+    security_stack = "global-security" if role == "gm" else "local-security"
+    import_path = REPO_ROOT / "stacks" / security_stack / f"import-{args.site}-{tranche}.tf"
+    mirror_header = (
+        f"{MIRROR_MARK}{args.site}\n"
+        f"# Mirror of {args.site}, regenerated from the live manager by scripts/mirror.sh.\n"
+        "# Do not edit: the next sync overwrites this file. Change the object in NSX, or\n"
+        "# move the manager to mode: managed (docs/IMPORT.md, \"Mirror mode\").\n\n"
+    )
+    if args.mirror and not args.dry_run:
+        # Start from nothing: what NSX no longer has must not survive here.
+        for f in own:
+            f.unlink()
+        import_path.unlink(missing_ok=True)
 
     # --- groups ---------------------------------------------------------
     converted_groups = {
         g["id"]: convert_group(g, group_paths, owner, sites) for g in groups if not is_system(g)
     }
+    if role == "gm" and domain != "default":
+        # Local Managers find a GM group under its domain (local-security).
+        for definition in converted_groups.values():
+            definition["domain"] = domain
     if converted_groups:
-        header = (
+        header = mirror_header if args.mirror else (
             f"# Imported from {args.site} on {datetime.now(timezone.utc):%Y-%m-%d}. Adopted, not created.\n"
             "#\n"
             "# Review before the first apply: check every 'why_static' note, and confirm\n"
@@ -7707,7 +8050,7 @@ def main() -> int:
                 if owner == "lm":
                     definition["sites"] = list(sites)
             document["custom"] = custom
-        header = f"# Imported from {args.site} on {datetime.now(timezone.utc):%Y-%m-%d}.\n\n"
+        header = mirror_header if args.mirror else f"# Imported from {args.site} on {datetime.now(timezone.utc):%Y-%m-%d}.\n\n"
         writer.write(DATA / "services" / f"imported-{args.site}-{tranche}.yaml", header + to_yaml(document))
 
     # --- policies: one file each, so add-rule.py can find them ----------
@@ -7715,7 +8058,7 @@ def main() -> int:
         if is_system(policy):
             continue
         document = convert_policy(policy, group_paths, service_paths, owner, sites)
-        header = (
+        header = mirror_header if args.mirror else (
             f"# Imported from {args.site} on {datetime.now(timezone.utc):%Y-%m-%d}. Adopted, not created.\n"
             "#\n"
             "# A new rule for this policy belongs IN THIS FILE. Do not declare a second\n"
@@ -7724,7 +8067,6 @@ def main() -> int:
         writer.write(DATA / "policies" / f"{policy['id']}.yaml", header + to_yaml(document))
 
     # --- import blocks --------------------------------------------------
-    security_stack = "global-security" if role == "gm" else "local-security"
     base: dict = {}
     composite: dict = {}
     for group_id, definition in converted_groups.items():
@@ -7757,8 +8099,16 @@ def main() -> int:
         ("policies", "module.policies[each.key].nsxt_policy_parent_security_policy.this", policy_ids),
         ("rules", "module.policies[each.value.policy].nsxt_policy_security_policy_rule.this[each.value.rule]", rule_ids),
     ]
-    import_path = REPO_ROOT / "stacks" / security_stack / f"import-{args.site}-{tranche}.tf"
     header = (
+        f"# Mirror of {args.site}: every object in the mirror files, imported into state.\n"
+        "# Regenerated by scripts/mirror.sh; do not edit.\n"
+        "#\n"
+        f"# While {args.site} is in mirror mode, its sync-state job applies these imports\n"
+        "# (and nothing else) with the read-only credential; an object already in state\n"
+        "# is left as it is. After cutover to managed, delete this file in its own merge\n"
+        "# request.\n"
+        f"#\n# id format: {args.id_format}.\n"
+    ) if args.mirror else (
         f"# Generated by scripts/import-estate.py: tranche '{tranche}' for {args.site}.\n"
         "# Adopts existing objects into state; creates nothing.\n"
         "#\n"
@@ -7782,26 +8132,35 @@ def main() -> int:
             manifest = json.loads(MANIFEST.read_text())
         except ValueError:
             pass
+    before = json.dumps(manifest, indent=2) + "\n"
+    if args.mirror:
+        # No dated history here: an unchanged manager must leave no diff. Files
+        # this mirror no longer writes (deleted in NSX) leave the list too.
+        gone = {str(f.relative_to(REPO_ROOT)) for f in own} - set(writer.written)
+        manifest["imported"] = [r for r in manifest.get("imported", []) if r not in gone]
     for rel in writer.written:
         if rel not in manifest["imported"]:
             manifest["imported"].append(rel)
-    manifest["sources"].append(
-        {
-            "site": args.site,
-            "role": role,
-            "domain": domain,
-            "tranche": tranche,
-            "policies": [p["id"] for p in policies if not is_system(p)],
-            "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "counts": {
-                "groups": len(converted_groups),
-                "policies": len([p for p in policies if not is_system(p)]),
-                "rules": sum(len(p.get("rules", [])) for p in policies if not is_system(p)),
-                "services": len(custom),
-            },
-        }
-    )
-    if not args.dry_run:
+    if args.mirror:
+        manifest.setdefault("mirrors", {})[args.site] = {"role": role, "domain": domain}
+    else:
+        manifest["sources"].append(
+            {
+                "site": args.site,
+                "role": role,
+                "domain": domain,
+                "tranche": tranche,
+                "policies": [p["id"] for p in policies if not is_system(p)],
+                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "counts": {
+                    "groups": len(converted_groups),
+                    "policies": len([p for p in policies if not is_system(p)]),
+                    "rules": sum(len(p.get("rules", [])) for p in policies if not is_system(p)),
+                    "services": len(custom),
+                },
+            }
+        )
+    if not args.dry_run and json.dumps(manifest, indent=2) + "\n" != before:
         MANIFEST.write_text(json.dumps(manifest, indent=2) + "\n")
 
     # --- report ---------------------------------------------------------
@@ -7823,6 +8182,10 @@ def main() -> int:
     if args.dry_run:
         print("dry run — nothing was written.")
         return 0
+    if args.mirror:
+        print(f"mirror of {args.site} regenerated. While it is in mode: mirror, its plans must only import;")
+        print("only its state is updated, by import and refresh. Cutover: docs/IMPORT.md, \"Mirror mode\".")
+        return 0
     print()
     print("next:")
     print("  1. make validate")
@@ -7833,9 +8196,9 @@ def main() -> int:
     return 0
 
 
-def survey(site: str, groups: list, services: list, policies: list) -> int:
+def survey(site: str, groups: list, services: list, policies: list, federated: dict | None = None) -> int:
     """What could be adopted from this manager, policy by policy. Writes nothing."""
-    bad = unsupported_objects(groups, services)
+    bad = unsupported_objects(groups, services, federated)
     have = existing_keys()
     rows = []
     for policy in policies:
@@ -7910,6 +8273,11 @@ Two rules, both mechanical so that nobody has to spot the problem in review:
 Handing an object back without deleting it (a removed block with
 destroy = false) shows as "forget" and is always allowed.
 
+--observe is stricter still, for a manager in mirror mode (scripts/tf.sh asks
+for it before applying to one): the plan may only import and leave alone.
+Every create, update, destroy (approved or not) and forget is refused, so what
+is applied can only bring Terraform's state up to date with NSX.
+
 Exit status: 0 the plan is allowed, 2 it is refused, 1 usage or input error.
 """
 
@@ -7917,6 +8285,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -7950,6 +8319,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--site", required=True)
     ap.add_argument("--stack", required=True)
+    ap.add_argument("--observe", action="store_true",
+                    help="mirror mode: only imports and no-ops; everything else is refused")
     ap.add_argument("plan_json", nargs="?", help="output of 'terraform show -json tfplan' (default: stdin)")
     args = ap.parse_args()
 
@@ -7977,6 +8348,9 @@ def main() -> int:
         importing = bool(c["change"].get("importing"))
         if importing:
             counts["import"] += 1
+        if args.observe and actions not in (["no-op"], ["read"]):
+            refused.append((address, f"{'/'.join(actions)} on a manager in mirror mode: only imports and refreshes are applied to it"))
+            continue
         if "delete" in actions:
             counts["destroy"] += 1
             kind = "replace" if "create" in actions else "destroy"
@@ -8000,13 +8374,14 @@ def main() -> int:
                 why = "the data does not match the live object yet" if importing else "a change mixed into an import tranche; adopt first, change in a later merge request"
                 refused.append((address, f"update during an import tranche: {why}"))
 
-    mode = "import tranche (must be pure)" if tranche else "normal"
+    mode = "mirror, observe only" if args.observe else "import tranche (must be pure)" if tranche else "normal"
     print(
         f"plan-guard {args.site}/{args.stack}, {mode}: "
         f"{counts['import']} import, {counts['create']} create, {counts['update']} update, "
         f"{counts['destroy']} destroy/replace, {counts['forget']} hand back"
     )
-    if leftover and not counts["import"]:
+    # A mirror's import file stays until cutover; it is not a finished tranche.
+    if leftover and not counts["import"] and os.environ.get("NSX_MODE") != "mirror":
         names = ", ".join(f"stacks/{args.stack}/{f.name}" for f in leftover)
         print(f"  note: {names} imports nothing new, so that tranche is applied. Delete the file(s)")
         print("        in their own merge request; until then this stack accepts imports only.")
@@ -8022,6 +8397,11 @@ def main() -> int:
     for address, why in refused:
         print(f"  x {address}")
         print(f"      {why}")
+    if os.environ.get("NSX_MODE") == "mirror":
+        print()
+        print(f"{args.site} is in mirror mode, so data/ is a copy of it. A difference here usually means it")
+        print("was changed in the UI after the last sync: the next sync brings that in. If it persists, the")
+        print("object named above cannot be copied exactly; hand it back (docs/IMPORT.md).")
     if destroy_lines:
         print()
         print("If, and only if, deleting those objects in NSX is the intent, approve each one")
@@ -8276,6 +8656,230 @@ url="$(printf '%s' "$response" | python3 -c 'import json,sys; print(json.load(sy
 echo "merge request: ${url:-opened}"
 SCAFFOLD_EOF
 mark_executable scripts/adopt.sh
+
+write_file scripts/mirror.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# Mirror mode: keep data/ a copy of managers that are still run from the UI.
+#
+# Run by the 'mirror' job, on a pipeline schedule (Build -> Pipeline schedules)
+# or by hand (Run pipeline) on the default branch, with:
+#
+#   MIRROR_SITE        a manager from inventory/managers.yaml, several separated
+#                      by spaces, or 'all' for every manager in mode: mirror
+#   MIRROR_AUTO_MERGE  1 to set the merge request to merge when its pipeline
+#                      passes (optional; without it, a person merges it)
+#
+# For each manager it reads everything (read-only plan credential), rewrites the
+# manager's mirror files with scripts/import-estate.py --mirror, and compares
+# them with the default branch. If NSX matches the repository there is nothing
+# to do. Otherwise it commits the difference to the branch mirror/<site>, which
+# it owns and force-pushes, and keeps ONE merge request for it up to date: the
+# objects engineers added, changed or deleted in the UI since the last merge.
+# When NSX matches the repository again, that merge request is closed.
+#
+# Only managers in mirror mode are touched. Nothing is applied to NSX for them:
+# they have no apply job, and their sync-state job only imports and refreshes
+# Terraform's state, with the read-only credential, until mode: managed.
+#
+# Needs NSX_ADOPT_TOKEN, as the adopt job: a project access token with the api
+# and write_repository scopes. Masked and protected.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+die() {
+	echo "error: $*" >&2
+	exit 1
+}
+
+[ -n "${MIRROR_SITE:-}" ] || die "MIRROR_SITE is not set: a manager in mode: mirror, several, or 'all'"
+[ -n "${NSX_ADOPT_TOKEN:-}${NSX_ADOPT_REMOTE:-}" ] ||
+	die "NSX_ADOPT_TOKEN is not set: a project access token (api, write_repository), masked and protected"
+api="${CI_API_V4_URL:?CI_API_V4_URL is not set}"
+project="${CI_PROJECT_ID:?CI_PROJECT_ID is not set}"
+target="${CI_DEFAULT_BRANCH:-main}"
+base="$(git rev-parse HEAD)"
+
+# Managers, with their mode, from the inventory.
+inventory="$(python3 - <<'PY'
+import sys
+sys.path.insert(0, "scripts")
+from ci_matrix_lib import managers, mode_of
+for name, m in sorted(managers().items()):
+    if m.get("enabled") is not False:
+        print(name, mode_of(name, m))
+PY
+)" || die "cannot read the managers' modes (above)"
+mode_of() { awk -v s="$1" '$1 == s { print $2 }' <<<"$inventory"; }
+if [ "$MIRROR_SITE" = all ]; then
+	sites="$(awk '$2 == "mirror" { print $1 }' <<<"$inventory")"
+	[ -n "$sites" ] || die "no manager in inventory/managers.yaml has mode: mirror"
+else
+	sites="$MIRROR_SITE"
+fi
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+token_header=()
+[ -z "${NSX_ADOPT_TOKEN:-}" ] || token_header=(--header "PRIVATE-TOKEN: ${NSX_ADOPT_TOKEN}")
+gitlab() { # gitlab METHOD PATH [JSON-FILE]: the project API; the token stays in a header
+	local data=()
+	[ -z "${3:-}" ] || data=(--header "Content-Type: application/json" --data "@$3")
+	curl --silent --show-error --fail-with-body --max-time 60 -X "$1" \
+		${CI_SERVER_TLS_CA_FILE:+--cacert "$CI_SERVER_TLS_CA_FILE"} \
+		${token_header[@]+"${token_header[@]}"} ${data[@]+"${data[@]}"} "${api%/}/projects/${project}$2"
+}
+json_field() { python3 -c 'import json,sys; d=json.load(sys.stdin); d=d[0] if isinstance(d, list) and d else d; print((d or {}).get(sys.argv[1], "") if isinstance(d, dict) else "")' "$1"; }
+
+push_branch() { # push_branch BRANCH: force, as the branch belongs to this job
+	local remote push_env=() auth=()
+	if [ -n "${NSX_ADOPT_REMOTE:-}" ]; then
+		remote="$NSX_ADOPT_REMOTE"
+	else
+		remote="${CI_SERVER_URL%/}/${CI_PROJECT_PATH}.git"
+		# In a header, never in the URL, so the token cannot reach a log.
+		auth=(-c "http.extraHeader=Authorization: Basic $(printf 'oauth2:%s' "$NSX_ADOPT_TOKEN" | base64 | tr -d '\n')")
+		# GitLab's CA through the environment: an inherited GIT_SSL_CAINFO overrides git's config.
+		if [ -n "${CI_SERVER_TLS_CA_FILE:-}" ] && [ -r "$CI_SERVER_TLS_CA_FILE" ]; then
+			push_env=(GIT_SSL_CAINFO="$CI_SERVER_TLS_CA_FILE")
+		fi
+	fi
+	env ${push_env[@]+"${push_env[@]}"} git ${auth[@]+"${auth[@]}"} push -q --force "$remote" "HEAD:refs/heads/$1"
+}
+
+failed=()
+for site in $sites; do
+	echo
+	echo "=== $site"
+	case "$(mode_of "$site")" in
+	mirror) ;;
+	"")
+		echo "error: $site is not an enabled manager in inventory/managers.yaml" >&2
+		failed+=("$site")
+		continue
+		;;
+	*)
+		echo "error: $site is in mode: managed. Terraform owns it now; mirroring would overwrite the repository with whatever the UI holds." >&2
+		failed+=("$site")
+		continue
+		;;
+	esac
+	branch="mirror/$site"
+	git checkout -q -f -B "$branch" "$base"
+
+	dump="$work/$site.json"
+	if ! NSX_CRED_SCOPE=plan scripts/with-credentials.sh "$site" -- \
+		python3 scripts/import-estate.py --site "$site" --dump-only "$dump"; then
+		failed+=("$site")
+		continue
+	fi
+	if ! report="$(python3 scripts/import-estate.py --site "$site" --from-dump "$dump" --mirror)"; then
+		echo "$report"
+		failed+=("$site")
+		continue
+	fi
+	grep -E "NOT ADOPTED|MANAGED|group\(s\)" <<<"$report" || true
+
+	git add -A data stacks
+	open_mr="$(gitlab GET "/merge_requests?state=opened&source_branch=$branch&target_branch=$target" | json_field iid)" || open_mr=""
+	if git diff --cached --quiet; then
+		echo "$site matches the repository: nothing to do."
+		if [ -n "$open_mr" ]; then
+			printf '{"state_event": "close"}' >"$work/close.json"
+			gitlab PUT "/merge_requests/$open_mr" "$work/close.json" >/dev/null &&
+				echo "closed merge request !$open_mr: NSX matches the repository again."
+		fi
+		continue
+	fi
+
+	changes="$(git diff --cached --name-status)"
+	echo "$changes"
+	git -c user.name="${GITLAB_USER_NAME:-nsx-mirror}" -c user.email="${GITLAB_USER_EMAIL:-nsx-mirror@localhost}" \
+		-c commit.gpgsign=false commit -q -m "Mirror $site from NSX
+
+Regenerated by scripts/mirror.sh in pipeline ${CI_PIPELINE_ID:-local}: what was
+added, changed or deleted in the NSX UI. $site is in mirror mode: nothing
+is applied to NSX; once merged, its state follows by import and refresh."
+	if ! push_branch "$branch"; then
+		echo "error: could not push $branch" >&2
+		failed+=("$site")
+		continue
+	fi
+
+	CHANGES="$changes" REPORT="$report" SITE="$site" BRANCH="$branch" TARGET="$target" NEW="${open_mr:-}" \
+		python3 - "$work/mr.json" <<'PY'
+import json, os, sys
+e = os.environ
+kinds = {"A": "added", "M": "changed", "D": "deleted"}
+rows = []
+for line in e["CHANGES"].splitlines():
+    status, _, path = line.partition("\t")
+    if path.endswith(".import-manifest.json"):
+        continue
+    rows.append(f"| {kinds.get(status[:1], status)} | `{path}` |")
+kept = [l.strip() for l in e["REPORT"].splitlines() if "NOT ADOPTED" in l or "  MANAGED" in l]
+description = "\n".join([
+    f"**{e['SITE']}** is in mirror mode: engineers change it in the NSX UI, and this merge request",
+    "brings the repository up to date with what it holds now. It is regenerated on every sync until merged.",
+    "",
+    "**Nothing is applied to NSX.** A manager in mirror mode has no apply job; once this is merged, its",
+    "`sync-state` job only imports and refreshes Terraform's state, with the read-only credential. The plan",
+    "here must only import: a red plan names an object that would not be taken over cleanly.",
+    "",
+    "| | file |", "|---|---|", *rows,
+    "",
+    "### Left in the UI",
+    "```", *(kept or ["(nothing)"]), "```",
+])
+body = {"title": f"Mirror {e['SITE']} from NSX", "description": description}
+if not e["NEW"]:
+    body.update(source_branch=e["BRANCH"], target_branch=e["TARGET"], remove_source_branch=True)
+json.dump(body, open(sys.argv[1], "w"))
+PY
+	if [ -n "$open_mr" ]; then
+		gitlab PUT "/merge_requests/$open_mr" "$work/mr.json" >/dev/null || { failed+=("$site"); continue; }
+		iid="$open_mr"
+		echo "updated merge request !$iid"
+	else
+		response="$(gitlab POST "/merge_requests" "$work/mr.json")" || {
+			echo "error: $branch was pushed, but the merge request could not be opened: $response" >&2
+			failed+=("$site")
+			continue
+		}
+		iid="$(json_field iid <<<"$response")"
+		echo "merge request: $(json_field web_url <<<"$response")"
+	fi
+
+	if [ "${MIRROR_AUTO_MERGE:-}" = 1 ] && [ -n "$iid" ]; then
+		# The push starts the merge request pipeline a moment later; until it
+		# exists GitLab refuses to schedule the merge.
+		printf '{"merge_when_pipeline_succeeds": true, "should_remove_source_branch": true}' >"$work/merge.json"
+		scheduled=0
+		for _ in 1 2 3 4 5 6 7 8 9 10; do
+			if gitlab PUT "/merge_requests/$iid/merge" "$work/merge.json" >/dev/null 2>&1; then
+				scheduled=1
+				break
+			fi
+			sleep "${MIRROR_RETRY_SLEEP:-6}"
+		done
+		if [ "$scheduled" = 1 ]; then
+			echo "set to merge when its pipeline passes"
+		else
+			echo "note: GitLab would not schedule the merge (no pipeline yet, or merge checks); merge !$iid by hand."
+		fi
+	fi
+done
+git checkout -q -f "$base" 2>/dev/null || true
+
+if [ "${#failed[@]}" -gt 0 ]; then
+	die "not mirrored: ${failed[*]} (above)"
+fi
+SCAFFOLD_EOF
+mark_executable scripts/mirror.sh
 
 write_file scripts/drift.sh <<'SCAFFOLD_EOF'
 #!/usr/bin/env bash
@@ -10987,6 +11591,10 @@ write_file .gitlab-ci.yml <<'SCAFFOLD_EOF'
 # Adopting existing objects is a pipeline too: Run pipeline on the default branch
 # with ADOPT_SITE (and ADOPT_POLICY) set runs only the 'adopt' job, which opens a
 # merge request. docs/IMPORT.md.
+#
+# Mirror mode: a pipeline schedule (or Run pipeline) on the default branch with
+# MIRROR_SITE set runs only the 'mirror' job, which keeps data/ a copy of the
+# managers still run from the UI. docs/IMPORT.md, "Mirror mode".
 
 stages:
   - adopt
@@ -11032,6 +11640,25 @@ adopt:
   rules:
     - if: $ADOPT_SITE && $CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
+# --- mirror: keep data/ a copy of managers still run from the UI ------------
+# Run from a pipeline schedule (Build -> Pipeline schedules) or Run pipeline on
+# the default branch, with MIRROR_SITE (a manager in mode: mirror, or 'all').
+# Reads with the read-only plan credential; keeps one merge request per manager
+# up to date; never applies and never pushes to the default branch.
+
+mirror:
+  stage: adopt
+  variables:
+    NSX_CRED_SCOPE: plan
+    VAULT_TOKEN: $VAULT_PLAN_TOKEN
+  script:
+    - scripts/mirror.sh
+  # One sync at a time, and never cancelled halfway through a push.
+  resource_group: nsx-mirror
+  interruptible: false
+  rules:
+    - if: $MIRROR_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
 # --- validate: offline, no credentials, runs on everything ------------------
 
 data:
@@ -11040,6 +11667,8 @@ data:
     - python3 scripts/validate-data.py
   rules:
     - if: $ADOPT_SITE && $CI_PIPELINE_SOURCE == "web"
+      when: never
+    - if: $MIRROR_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
@@ -11058,6 +11687,8 @@ terraform:
   rules:
     - if: $ADOPT_SITE && $CI_PIPELINE_SOURCE == "web"
       when: never
+    - if: $MIRROR_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -11074,6 +11705,8 @@ matrix:
   rules:
     - if: $ADOPT_SITE && $CI_PIPELINE_SOURCE == "web"
       when: never
+    - if: $MIRROR_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -11089,6 +11722,8 @@ managers:
     strategy: depend
   rules:
     - if: $ADOPT_SITE && $CI_PIPELINE_SOURCE == "web"
+      when: never
+    - if: $MIRROR_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
@@ -11108,6 +11743,12 @@ in Terraform.
 On a merge request it emits plan jobs only. On the default branch it emits plan
 jobs plus a MANUAL apply job per manager, each applying the plan artifact its
 own plan job produced — never a fresh one.
+
+A manager in mirror mode (inventory mode, or the CI/CD variable NSX_MODE_<SITE>)
+gets no apply job. On the default branch it gets an automatic sync-state job
+instead, which applies its plan only if that plan just imports and refreshes,
+with the read-only credential. Its plans do not hold up other managers' work:
+they may fail (shown as a warning) except in its own mirror merge request.
 """
 
 from __future__ import annotations
@@ -11121,6 +11762,7 @@ from ci_matrix_lib import entries  # noqa: E402
 
 DEFAULT_BRANCH = os.environ.get("CI_DEFAULT_BRANCH", "main")
 IS_DEFAULT_BRANCH = os.environ.get("CI_COMMIT_BRANCH") == DEFAULT_BRANCH
+MR_SOURCE = os.environ.get("CI_MERGE_REQUEST_SOURCE_BRANCH_NAME", "")
 
 # manual (default): merging queues the apply, and a human starts it with the
 # plan in front of them. auto: apply runs on merge, no second pause.
@@ -11199,11 +11841,40 @@ def main() -> int:
         out.append('      - "plan-$STACK-$SITE.txt"')
         out.append("    expire_in: 1 week")
         out.append("    when: always")
-        # A failed plan at one site must not hide the others.
-        out.append("  allow_failure: false")
+        # A failed plan at one site must not hide the others. A manager in
+        # mirror mode is the exception: it changes in the UI between syncs, and
+        # that must not block other managers' merge requests. Its own mirror
+        # merge request is held to a clean plan.
+        mirror = row.get("mode") == "mirror"
+        lenient = mirror and MR_SOURCE != f"mirror/{row['site']}"
+        out.append(f"  allow_failure: {'true' if lenient else 'false'}")
         out.append("")
 
         if not IS_DEFAULT_BRANCH:
+            continue
+        if mirror:
+            # Still run from the UI: nothing is applied to it. Its state follows
+            # NSX instead: this plan is applied only if it just imports and
+            # refreshes (plan-guard --observe), with the read-only credential,
+            # so it cannot write to NSX. Automatic, as it changes nothing.
+            sync = job_name("sync-state", row)
+            out.append(f'"{sync}":')
+            out.append("  stage: apply")
+            out.append("  needs:")
+            out.append(f'    - job: "{plan}"')
+            out.append("      artifacts: true")
+            out.append("  allow_failure: true")
+            out.append(f"  resource_group: nsx-state-{row['site']}-{row['stack']}")
+            out.append("  variables:")
+            out.append(f'    SITE: "{row["site"]}"')
+            out.append(f'    STACK: "{row["stack"]}"')
+            out.append("    VAULT_TOKEN: $VAULT_PLAN_TOKEN")
+            out.append("    NSX_CRED_SCOPE: plan")
+            out.append("    APPROVE: \"yes\"")
+            out.append("  script:")
+            out.append('    - test -f "stacks/$STACK/tfplan" || { echo "no saved plan: its plan job failed; the next sync tries again" >&2; exit 1; }')
+            out.append('    - scripts/with-credentials.sh "$SITE" -- scripts/tf.sh apply "$STACK" "$SITE"')
+            out.append("")
             continue
 
         apply_job = job_name("apply", row)
@@ -11523,13 +12194,17 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.build.outputs.matrix }}
+      apply_matrix: ${{ steps.build.outputs.apply_matrix }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - id: build
-        run: echo "matrix=$(python3 scripts/ci-matrix.py --format github)" >> "$GITHUB_OUTPUT"
+        # Managers in mode: mirror are planned but never applied.
+        run: |
+          echo "matrix=$(python3 scripts/ci-matrix.py --format github)" >> "$GITHUB_OUTPUT"
+          echo "apply_matrix=$(python3 scripts/ci-matrix.py --format github --managed-only)" >> "$GITHUB_OUTPUT"
 
   plan:
     name: plan ${{ matrix.stack }} @ ${{ matrix.site }}
@@ -11570,11 +12245,12 @@ jobs:
   apply:
     name: apply ${{ matrix.stack }} @ ${{ matrix.site }}
     needs: [matrix, plan]
+    if: needs.matrix.outputs.apply_matrix != '{"include": []}'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       max-parallel: 1
-      matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.matrix.outputs.apply_matrix) }}
     # The approval gate. Protect this environment to require a reviewer.
     environment: nsx-${{ matrix.site }}-${{ matrix.stack }}
     steps:
@@ -11693,7 +12369,7 @@ managers:
     sddc_manager: sddc-lon-01.example.internal
     vault_path: nsx/data/managers/gm1
     tier: prod
-    domain: global
+    domain: default   # the global domain, spanning every location
     stacks: [global-security]
     description: Global Manager. Owns the federated DFW for the whole estate.
 

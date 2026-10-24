@@ -229,6 +229,102 @@ check "without GitLab's CA the push fails; verification is not skipped" bash -c 
 git_quiet checkout main
 kill "$gitsrv" 2>/dev/null
 kill "$api" 2>/dev/null
+
+echo "mirror mode (scripts/mirror.sh): a manager still run from the UI"
+sed -i '/^  lon1:$/a\    mode: mirror' inventory/managers.yaml
+git_quiet commit -am "lon1 in mirror mode"
+git_quiet push -q "$SCRATCH/remote.git" main
+gl_port=$((20000 + RANDOM % 20000))
+python3 "$REPO/tests/fake_gitlab_api.py" "$gl_port" "$SCRATCH/gl.log" &
+gl=$!
+sleep 1
+: >"$SCRATCH/req.log"
+mirror() { env -u SSL_CERT_FILE -u NSX_CA_FILE NSX_CA_FILE_LON1="$SCRATCH/mine-ca.pem" NSX_PLAN_USERNAME=u NSX_PLAN_PASSWORD=p \
+	NSX_ADOPT_REMOTE="$SCRATCH/remote.git" NSX_ADOPT_TOKEN=SECRET-ADOPT-TOKEN CI_API_V4_URL="http://127.0.0.1:$gl_port/api/v4" \
+	CI_PROJECT_ID=7 CI_DEFAULT_BRANCH=main MIRROR_RETRY_SLEEP=0 MIRROR_SITE=lon1 "$@" scripts/mirror.sh 2>&1; }
+posts() { grep -c '"method": "POST"' "$SCRATCH/gl.log" || true; }
+remote_files() { git -C "$SCRATCH/remote.git" diff --name-status main mirror/lon1; }
+head_before="$(git rev-parse HEAD)"
+
+out="$(mirror)"
+check "the first sync pushes mirror/lon1" git -C "$SCRATCH/remote.git" rev-parse -q --verify refs/heads/mirror/lon1
+files="$(remote_files)"
+check "...with every adoptable object not declared anywhere else" bash -c 'grep -q "^A	data/policies/fresh-app.yaml" <<<"$1" && grep -q "^A	stacks/local-security/import-lon1-mirror.tf" <<<"$1"' _ "$files"
+check "...each file marked as the mirror's own" bash -c 'git -C "$1" show mirror/lon1:data/policies/fresh-app.yaml | head -1 | grep -qx "# nsx-mirror: lon1"' _ "$SCRATCH/remote.git"
+check "objects another file declares are left to it" bash -c '! grep -q "other-app\|legacy-app\|data/groups" <<<"$1" && grep -q "MANAGED   policy other-app" <<<"$2" && grep -q "MANAGED   group App-Web" <<<"$2"' _ "$files" "$out"
+check "objects that cannot be represented stay in the UI, reported" grep -q "NOT ADOPTED  policy mac-scoped" <<<"$out"
+check "a merge request is opened for it" python3 -c "import json,sys;l=[json.loads(x) for x in open(sys.argv[1])];p=[x for x in l if x['method']=='POST'];sys.exit(0 if len(p)==1 and p[0]['body']['source_branch']=='mirror/lon1' and p[0]['body']['title']=='Mirror lon1 from NSX' and 'Nothing is applied' in p[0]['body']['description'] else 1)" "$SCRATCH/gl.log"
+check "...with the token in a header, never in the output" bash -c 'grep -q "\"token\": \"SECRET-ADOPT-TOKEN\"" "$1" && ! grep -q SECRET-ADOPT-TOKEN <<<"$2"' _ "$SCRATCH/gl.log" "$out"
+check "the capture is never committed" bash -c '! git -C "$1" log --all --name-only --format= | grep -qiE "capture|raw|dump"' _ "$SCRATCH/remote.git"
+check "the job leaves the checkout where it found it" test "$(git rev-parse HEAD)" = "$head_before"
+tree1="$(git -C "$SCRATCH/remote.git" rev-parse "mirror/lon1^{tree}")"
+
+out="$(mirror)"
+check "a second sync before the merge updates the same merge request" bash -c '[ "$(grep -c "\"method\": \"POST\"" "$1")" = 1 ] && grep -q "\"method\": \"PUT\", \"path\": \"/api/v4/projects/7/merge_requests/1\"" "$1" && grep -q "updated merge request !1" <<<"$2"' _ "$SCRATCH/gl.log" "$out"
+check "...with byte-identical content: an unchanged manager gives the same files" test "$(git -C "$SCRATCH/remote.git" rev-parse "mirror/lon1^{tree}")" = "$tree1"
+
+merge_mirror() { # the merge request is merged
+	git -C "$SCRATCH/remote.git" update-ref refs/heads/main refs/heads/mirror/lon1
+	git_quiet fetch -q "$SCRATCH/remote.git" main
+	git_quiet checkout -q -B main FETCH_HEAD
+}
+merge_mirror
+out="$(mirror)"
+check "once merged, an unchanged manager means nothing to do" grep -q "lon1 matches the repository: nothing to do" <<<"$out"
+check "...and a merge request still open for it is closed" grep -q "closed merge request !1" <<<"$out"
+check "...without pushing anything" test "$(git -C "$SCRATCH/remote.git" rev-parse "mirror/lon1^{tree}")" = "$tree1"
+
+# Engineers change the manager in the UI: a new group and policy, an edited rule.
+python3 - <<'PY'
+import json
+d = json.load(open("reports/lon1-raw.json"))
+D = "/infra/domains/default"
+d["groups"].append({"id": "New-G", "path": f"{D}/groups/New-G", "display_name": "New-G",
+                    "expression": [{"resource_type": "IPAddressExpression", "ip_addresses": ["10.9.9.9"]}]})
+fresh = next(p for p in d["policies"] if p["id"] == "fresh-app")
+fresh["rules"][0]["action"] = "DROP"
+new = json.loads(json.dumps(fresh).replace("fresh-app", "new-app"))
+new["rules"][0]["source_groups"] = [f"{D}/groups/New-G"]
+d["policies"].append(new)
+json.dump(d, open("reports/lon1-raw.json", "w"))
+PY
+out="$(mirror MIRROR_AUTO_MERGE=1)"
+files="$(remote_files)"
+check "a group and a policy added in the UI are added" bash -c 'grep -q "^A	data/groups/imported-lon1-mirror.yaml" <<<"$1" && grep -q "^A	data/policies/new-app.yaml" <<<"$1"' _ "$files"
+check "...with their import blocks" bash -c 'f="$(git -C "$1" show mirror/lon1:stacks/local-security/import-lon1-mirror.tf)"; grep -q New-G <<<"$f" && grep -q new-app <<<"$f"' _ "$SCRATCH/remote.git"
+check "a rule changed in the UI follows" bash -c 'grep -q "^M	data/policies/fresh-app.yaml" <<<"$1" && git -C "$2" show mirror/lon1:data/policies/fresh-app.yaml | grep -q "action: DROP"' _ "$files" "$SCRATCH/remote.git"
+check "a new merge request lists the changes" python3 -c "import json,sys;l=[json.loads(x) for x in open(sys.argv[1])];p=[x for x in l if x['method']=='POST'];d=p[-1]['body']['description'];sys.exit(0 if len(p)==2 and '| added | \`data/policies/new-app.yaml\` |' in d and '| changed | \`data/policies/fresh-app.yaml\` |' in d else 1)" "$SCRATCH/gl.log"
+check "MIRROR_AUTO_MERGE=1 sets it to merge when its pipeline passes, retrying until GitLab accepts" bash -c 'grep -q "set to merge when its pipeline passes" <<<"$1" && [ "$(grep -c "/merge_requests/2/merge" "$2")" = 2 ]' _ "$out" "$SCRATCH/gl.log"
+check "the mirrored data passes validation" python3 scripts/validate-data.py
+merge_mirror
+
+# ...and later delete them again.
+python3 - <<'PY'
+import json
+d = json.load(open("reports/lon1-raw.json"))
+d["groups"] = [g for g in d["groups"] if g["id"] != "New-G"]
+d["policies"] = [p for p in d["policies"] if p["id"] != "new-app"]
+json.dump(d, open("reports/lon1-raw.json", "w"))
+PY
+out="$(mirror)"
+files="$(remote_files)"
+check "a policy and a group deleted in the UI are deleted from the repository" bash -c 'grep -q "^D	data/policies/new-app.yaml" <<<"$1" && grep -q "^D	data/groups/imported-lon1-mirror.yaml" <<<"$1"' _ "$files"
+check "...and from the import blocks" bash -c '! git -C "$1" show mirror/lon1:stacks/local-security/import-lon1-mirror.tf | grep -q "New-G\|new-app"' _ "$SCRATCH/remote.git"
+check "...and from the manifest" bash -c '! git -C "$1" show mirror/lon1:data/.import-manifest.json | grep -q new-app' _ "$SCRATCH/remote.git"
+
+out="$(mirror MIRROR_SITE=nyc1)"
+rc=$?
+check "a manager in mode: managed is refused, and the job fails" bash -c '[ "$2" -ne 0 ] && grep -q "nyc1 is in mode: managed" <<<"$1" && ! git -C "$3" rev-parse -q --verify refs/heads/mirror/nyc1' _ "$out" "$rc" "$SCRATCH/remote.git"
+out="$(mirror MIRROR_SITE=all)"
+check "MIRROR_SITE=all takes every manager in mode: mirror, and only those" bash -c 'grep -q "=== lon1" <<<"$1" && ! grep -q "=== nyc1" <<<"$1" && ! grep -q "=== gm1" <<<"$1"' _ "$out"
+check "without MIRROR_SITE it refuses" grep -q "MIRROR_SITE is not set" <<<"$(mirror MIRROR_SITE=)"
+writes="$(grep WRITE "$SCRATCH/req.log" | grep -vc "/api/session/create" || true)"
+check "mirroring only reads NSX" test "$writes" -eq 0
+kill "$gl" 2>/dev/null
+git_quiet checkout -q main
+sed -i '/^    mode: mirror$/d' inventory/managers.yaml
+git_quiet commit -qam "lon1 back to managed for the tests below"
+
 kill "$mock" 2>/dev/null
 wait "$mock" 2>/dev/null
 
@@ -272,6 +368,18 @@ out="$(python3 scripts/plan-guard.py --site lon1 --stack local-security "$SCRATC
 check "an applied tranche's leftover file is pointed out" grep -q "imports nothing new, so that tranche is applied" <<<"$out"
 rm -f stacks/local-security/import-lon1-t.tf
 check "input that is not a plan is an error" bash -c '! echo nope | python3 scripts/plan-guard.py --site lon1 --stack local-security >/dev/null 2>&1'
+obs() { python3 scripts/plan-guard.py --site lon1 --stack local-security --observe "$1" >/dev/null 2>&1; echo $?; }
+plan "$SCRATCH/noop.json" "[{\"address\":\"$A\",\"mode\":\"managed\",\"change\":{\"actions\":[\"no-op\"]}},{\"address\":\"data.x.y\",\"mode\":\"data\",\"change\":{\"actions\":[\"read\"]}}]"
+check "observe (mirror mode): imports are allowed" test "$(obs "$SCRATCH/import.json")" -eq 0
+check "observe: a plan with nothing to change is allowed" test "$(obs "$SCRATCH/noop.json")" -eq 0
+check "observe: creates and updates are refused, even outside a tranche" test "$(obs "$SCRATCH/create-update.json")" -eq 2
+check "observe: an update during an import is refused" test "$(obs "$SCRATCH/import-update.json")" -eq 2
+check "observe: hand-backs (forget) are refused" test "$(obs "$SCRATCH/forget.json")" -eq 2
+printf 'lon1 local-security %s\n' "module.policies[\"p\"].nsxt_policy_security_policy_rule.this[\"r\"]" >allow-destroy.txt
+check "observe: a destroy is refused even when approved in allow-destroy.txt" test "$(obs "$SCRATCH/delete.json")" -eq 2
+rm -f allow-destroy.txt
+out="$(NSX_MODE=mirror python3 scripts/plan-guard.py --site lon1 --stack local-security --observe "$SCRATCH/create-update.json" 2>&1)"
+check "observe: the refusal explains a manager changed since its last sync" grep -q "changed in the UI after the last sync" <<<"$out"
 
 echo "tf.sh: one manager's state and plan never reach another"
 mkdir -p "$SCRATCH/fake"
@@ -303,6 +411,12 @@ check "a plan made for one manager is refused for another" grep -q "was made for
 check "...before anything is applied" bash -c '! grep -q "^apply" "$1"' _ "$FAKE_LOG"
 rm -f stacks/local-security/tfplan.site
 check "a plan with no record of its manager is refused" grep -q "was made for 'an unknown manager'" <<<"$(APPROVE=yes tf apply local-security nyc1)"
+sed -i '/^  nyc1:$/a\    mode: mirror' inventory/managers.yaml
+check "a manager in mode: mirror is refused the write credential, whatever the plan" grep -q "nyc1 is in mirror mode: only its state is updated, and only with the read-only credential" <<<"$(APPROVE=yes NSX_CRED_SCOPE=apply tf apply local-security nyc1)"
+check "...and refused without a scope at all" grep -q "only with the read-only credential" <<<"$(APPROVE=yes tf apply local-security nyc1)"
+check "NSX_MODE_<SITE> puts a manager in mirror mode without a commit" grep -q "lon1 is in mirror mode" <<<"$(APPROVE=yes NSX_MODE_LON1=mirror tf apply local-security lon1)"
+check "...and an unknown value is an error naming the variable" grep -q "NSX_MODE_LON1 must be one of: managed, mirror" <<<"$(APPROVE=yes NSX_MODE_LON1=observe tf apply local-security lon1)"
+sed -i '/^    mode: mirror$/d' inventory/managers.yaml
 tf plan local-security nyc1 >/dev/null
 # The test tree is on the placeholder local backend, which tf.sh only applies to
 # when told it is a lab.
@@ -337,5 +451,88 @@ sed -i 's#rules:#rules:#' "$SCRATCH/v/data/policies/legacy-app.yaml"
 check "context profiles may be referenced by path" bash -c '! (cd "$1" && python3 scripts/validate-data.py 2>&1) | grep -q "context-profiles"' _ "$SCRATCH/v"
 sed -i 's#scope: \[App-All\]#scope: [/infra/domains/default/groups/App-All]#' "$SCRATCH/v/data/policies/legacy-app.yaml"
 check "any other raw path is still an error" grep -q "raw policy path" <<<"$(cd "$SCRATCH/v" && python3 scripts/validate-data.py 2>&1)"
+
+echo "federation: a Global Manager and a Local Manager, side by side"
+F="$SCRATCH/fed"
+generate "$F" --no-examples
+cd "$F" || exit 1
+mkdir -p reports
+printf 'managers:\n  gm1:\n    role: gm\n    host: gm.example.net\n    site: global\n    vcf_instance: v\n    vault_path: secret/gm1\n    tier: prod\n  lon1:\n    role: lm\n    host: lon1.example.net\n    site: lon1\n    vcf_instance: v\n    vault_path: secret/lon1\n    tier: prod\n' >inventory/managers.yaml
+python3 - <<'PY'
+import json
+GD = "/global-infra/domains/default"; LD = "/infra/domains/default"
+cond = lambda v: [{"resource_type": "Condition", "key": "Tag", "member_type": "VirtualMachine", "operator": "EQUALS", "value": v}]
+def grp(base, i, expr): return {"id": i, "path": f"{base}/groups/{i}", "display_name": i, "expression": expr}
+def rule(base, p, i, src, dst, svc, seq):
+    return {"id": i, "path": f"{base}/security-policies/{p}/rules/{i}", "display_name": i, "sequence_number": seq, "action": "ALLOW",
+            "direction": "IN_OUT", "ip_protocol": "IPV4_IPV6", "logged": True, "source_groups": src, "destination_groups": dst,
+            "services": svc, "scope": ["ANY"], "profiles": ["ANY"]}
+def pol(base, i, rules, scope): return {"id": i, "path": f"{base}/security-policies/{i}", "display_name": i, "category": "Application",
+                                        "sequence_number": 10, "stateful": True, "scope": scope, "rules": rules}
+https_g = {"id": "HTTPS", "path": "/global-infra/services/HTTPS", "display_name": "HTTPS", "_system_owned": True, "service_entries": []}
+gsvc = {"id": "G-Svc", "path": "/global-infra/services/G-Svc", "display_name": "G-Svc",
+        "service_entries": [{"resource_type": "L4PortSetServiceEntry", "display_name": "t9443", "l4_protocol": "TCP", "destination_ports": ["9443"]}]}
+gm = {"domain": "default",
+      "groups": [grp(GD, "G-Web", cond("tier|web")), grp(GD, "Shared", cond("app|shared-gm"))],
+      "services": [https_g, gsvc],
+      "policies": [pol(GD, "g-pol", [rule(GD, "g-pol", "g1", [f"{GD}/groups/G-Web"], [f"{GD}/groups/Shared"], ["/global-infra/services/HTTPS"], 100)], [f"{GD}/groups/G-Web"])]}
+json.dump(gm, open("reports/gm1.json", "w"))
+lm = {"domain": "default",
+      "groups": [grp(LD, "L-App", cond("app|l")), grp(LD, "Shared", cond("app|shared-lm")),
+                 grp(LD, "Nest-G", [{"resource_type": "PathExpression", "paths": [f"{GD}/groups/G-Web"]}]),
+                 grp(GD, "G-Web", cond("tier|web"))],            # a global object, listed by the LM
+      "services": [{"id": "HTTPS", "path": "/infra/services/HTTPS", "display_name": "HTTPS", "_system_owned": True, "service_entries": []}],
+      "policies": [pol(LD, "l-pol", [
+          rule(LD, "l-pol", "r1", [f"{GD}/groups/G-Web"], [f"{LD}/groups/L-App"], ["/global-infra/services/G-Svc", "/infra/services/HTTPS"], 100),
+          rule(LD, "l-pol", "r2", [f"{LD}/groups/Shared"], [f"{LD}/groups/L-App"], ["ANY"], 200),
+          rule(LD, "l-pol", "r3", [f"{GD}/groups/Unknown-G"], [f"{LD}/groups/L-App"], ["ANY"], 300),
+      ], [f"{LD}/groups/L-App"])]}
+json.dump(lm, open("reports/lon1.json", "w"))
+PY
+mir() { python3 scripts/import-estate.py --site "$1" --from-dump "reports/$1.json" --mirror 2>&1; }
+ids_twice() { python3 - <<'PY'
+import sys, yaml, glob, collections
+seen = collections.Counter()
+for f in glob.glob("data/groups/*.yaml"): seen.update((yaml.safe_load(open(f)) or {}).get("groups", {}).keys())
+for f in glob.glob("data/services/*.yaml"): seen.update((yaml.safe_load(open(f)) or {}).get("custom", {}).keys())
+dup = [k for k, n in seen.items() if n > 1]
+print(" ".join(dup)); sys.exit(1 if dup else 0)
+PY
+}
+out_gm="$(mir gm1)"
+out="$(mir lon1)"
+LG="$(cat data/groups/imported-lon1-mirror.yaml)"
+LP="$(cat data/policies/l-pol.yaml)"
+check "the GM's objects are the GM's: owner gm, read from the global tree" bash -c 'grep -q "owner: gm" data/groups/imported-gm1-mirror.yaml && grep -q "^  G-Web:" data/groups/imported-gm1-mirror.yaml'
+check "...all of them taken, nothing left out" bash -c '! grep -q "NOT ADOPTED" <<<"$1" && grep -q "2 group(s), 1 policy/policies, 1 rule(s), 1 custom service(s)" <<<"$1"' _ "$out_gm"
+check "a global object an LM lists is not adopted from the LM" bash -c '! grep -q "^  G-Web:" <<<"$1" && grep -q "G-Web: belongs to the Global Manager" <<<"$2"' _ "$LG" "$out"
+check "no group or service id is declared twice" ids_twice
+check "an LM rule using a global group and service names them; the LM stack resolves them" bash -c 'python3 -c "import yaml,sys;r=yaml.safe_load(sys.stdin)[\"rules\"][\"r1\"];sys.exit(0 if r[\"source_groups\"]==[\"G-Web\"] and r[\"services\"]==[\"G-Svc\",\"HTTPS\"] else 1)" <<<"$1"' _ "$LP"
+check "an LM group with the id of a GM group is not adopted, and says why" bash -c '! grep -q "^  Shared:" <<<"$1" && grep -q "group Shared: its id is also the Global Manager.s group" <<<"$2"' _ "$LG" "$out"
+check "...nor the rule using it, which would bind to the GM's group" bash -c 'grep -q "rule l-pol/r2: uses Shared" <<<"$1" && ! grep -q "^  r2:" <<<"$2"' _ "$out" "$LP"
+check "an LM group nesting a global group is not adopted" grep -q "group Nest-G: nests the global group G-Web" <<<"$out"
+check "a rule using a global group data/ does not declare stays in the UI, and says why" bash -c 'grep -q "rule l-pol/r3: uses Unknown-G (uses the global group Unknown-G, which data/ does not declare" <<<"$1" && ! grep -q "^  r3:" <<<"$2"' _ "$out" "$LP"
+check "a rule and a policy applied to ANY are written as ANY, not as a missing Apply To" bash -c 'python3 -c "import yaml,sys;d=yaml.safe_load(open(\"data/policies/g-pol.yaml\"));sys.exit(0 if d[\"rules\"][\"g1\"][\"scope\"]==[\"ANY\"] else 1)"' 
+check "no raw policy path is written anywhere" bash -c '! grep -rn "/global-infra/\|\"/infra/\| /infra/" data/groups data/policies data/services'
+check "the copy validates, HTTPS named by both managers included" python3 scripts/validate-data.py
+check "the LM stack resolves GM-owned names to their global paths, and never manages them" bash -c 'grep -q "global_group_paths" stacks/local-security/main.tf && grep -q "/global-infra/domains/\${try(g.domain, \"default\")}/groups/\${k}" stacks/local-security/main.tf && grep -q "if try(g.owner, \"lm\") == \"lm\"" stacks/local-security/main.tf'
+before="$(cat data/groups/*.yaml data/services/*.yaml data/policies/*.yaml stacks/*/import-*.tf | sha256sum)"
+mir gm1 >/dev/null; mir lon1 >/dev/null
+check "syncing both again changes nothing" test "$(cat data/groups/*.yaml data/services/*.yaml data/policies/*.yaml stacks/*/import-*.tf | sha256sum)" = "$before"
+
+# The other order: the Local Manager first.
+rm -rf data/groups data/services data/policies data/.import-manifest.json stacks/*/import-*.tf
+mkdir -p data/groups data/services data/policies
+out="$(mir lon1)"
+check "LM first: its rule using the not-yet-copied global group waits in the UI" grep -q "rule l-pol/r1: uses G-Web (uses the global group G-Web, which data/ does not declare" <<<"$out"
+out="$(mir gm1)"
+check "...the GM then leaves its Shared to the LM that claimed the id, and says so" grep -q "group Shared: its id is also another manager.s group" <<<"$out"
+check "...and a policy left with no adoptable rule stays whole in the UI" bash -c 'grep -q "policy g-pol: none of its 1 rule(s) can be adopted" <<<"$1" && ! test -f data/policies/g-pol.yaml' _ "$out"
+mir lon1 >/dev/null
+check "...and the next LM sync takes the rule: both orders converge" bash -c 'python3 -c "import yaml,sys;sys.exit(0 if \"r1\" in yaml.safe_load(open(\"data/policies/l-pol.yaml\"))[\"rules\"] else 1)"'
+check "...still with no id declared twice" ids_twice
+check "...and valid" python3 scripts/validate-data.py
+check "GM domain: global objects are read from domain default unless the inventory says otherwise" bash -c 'grep -q "or \"default\"$" scripts/import-estate.py'
+cd "$T" || exit 1
 
 finish brownfield
