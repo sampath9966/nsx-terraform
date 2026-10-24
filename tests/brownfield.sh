@@ -564,6 +564,83 @@ check "...and the next LM sync takes the rule: both orders converge" bash -c 'py
 check "...still with no id declared twice" ids_twice
 check "...and valid" python3 scripts/validate-data.py
 check "GM domain: global objects are read from domain default unless the inventory says otherwise" bash -c 'grep -q "or \"default\"$" scripts/import-estate.py'
+
+echo "estate shapes: VM members, IP addresses in rules, Global Manager location domains"
+rm -rf data/groups data/services data/policies data/.import-manifest.json stacks/*/import-*.tf
+mkdir -p data/groups data/services data/policies
+python3 - <<'PY'
+import json
+GD = "/global-infra/domains/default"; WD = "/global-infra/domains/WL-Mum"; LD = "/infra/domains/default"
+cond = lambda v: [{"resource_type": "Condition", "key": "Tag", "member_type": "VirtualMachine", "operator": "EQUALS", "value": v}]
+def grp(base, i, expr): return {"id": i, "path": f"{base}/groups/{i}", "display_name": i, "expression": expr}
+def rule(base, p, i, src, dst, seq, scope=("ANY",)):
+    return {"id": i, "path": f"{base}/security-policies/{p}/rules/{i}", "display_name": i, "sequence_number": seq, "action": "ALLOW",
+            "direction": "IN_OUT", "ip_protocol": "IPV4_IPV6", "logged": True, "source_groups": src, "destination_groups": dst,
+            "services": ["ANY"], "scope": list(scope), "profiles": ["ANY"]}
+def pol(base, i, rules): return {"id": i, "path": f"{base}/security-policies/{i}", "display_name": i, "category": "Application",
+                                 "sequence_number": 10, "stateful": True, "scope": ["ANY"], "rules": rules}
+vms = [{"resource_type": "ExternalIDExpression", "member_type": "VirtualMachine",
+        "external_ids": ["502e6f1a-0000-0000-0000-000000000001", "502e6f1a-0000-0000-0000-000000000002"]}]
+gm = {"domain": "default", "domains": ["default", "WL-Mum"],
+      "groups": [grp(GD, "VM-Jump", vms), grp(GD, "Clash", cond("app|a")),
+                 grp(WD, "M-App", cond("app|mum")), grp(WD, "Clash", cond("app|b"))],
+      "services": [],
+      "policies": [pol(GD, "g-pol", [
+                       rule(GD, "g-pol", "uses-location-group", [f"{GD}/groups/VM-Jump"], [f"{WD}/groups/M-App"], 100),
+                       rule(GD, "g-pol", "ips", ["172.19.20.57", "10.1.0.0/16"], ["172.17.9.10-172.17.9.20"], 200),
+                       rule(GD, "g-pol", "uses-clash", [f"{WD}/groups/Clash"], ["ANY"], 300)]),
+                   pol(WD, "mum-pol", [rule(WD, "mum-pol", "m1", [f"{WD}/groups/M-App"], ["ANY"], 100)])]}
+json.dump(gm, open("reports/gm1.json", "w"))
+lm = {"domain": "default",
+      "groups": [grp(LD, "L-App", cond("app|l"))], "services": [],
+      "policies": [pol(LD, "l-pol", [rule(LD, "l-pol", "r1", [f"{WD}/groups/M-App"], [f"{LD}/groups/L-App"], 100)])]}
+json.dump(lm, open("reports/lon1.json", "w"))
+PY
+out_gm="$(mir gm1)"
+out="$(mir lon1)"
+G="$(cat data/groups/imported-gm1-mirror.yaml)"
+check "a group of VMs picked one by one is adopted, as external ids" bash -c 'python3 -c "import yaml,sys;g=yaml.safe_load(sys.stdin)[\"groups\"][\"VM-Jump\"];c=g[\"criteria\"][0];sys.exit(0 if c[\"member_type\"]==\"VirtualMachine\" and len(c[\"external_ids\"])==2 and g[\"why_static\"] else 1)" <<<"$1"' _ "$G"
+check "a rule with IP addresses, a CIDR and a range is adopted, with them as written" bash -c 'python3 -c "import yaml,sys;r=yaml.safe_load(open(\"data/policies/g-pol.yaml\"))[\"rules\"][\"ips\"];sys.exit(0 if r[\"source_groups\"]==[\"172.19.20.57\",\"10.1.0.0/16\"] and r[\"destination_groups\"]==[\"172.17.9.10-172.17.9.20\"] else 1)"'
+check "a location domain's group is adopted, keeping its domain" bash -c 'python3 -c "import yaml,sys;g=yaml.safe_load(sys.stdin)[\"groups\"][\"M-App\"];sys.exit(0 if g[\"domain\"]==\"WL-Mum\" else 1)" <<<"$1"' _ "$G"
+check "...and a global rule using it is adopted" bash -c 'python3 -c "import yaml,sys;r=yaml.safe_load(open(\"data/policies/g-pol.yaml\"))[\"rules\"][\"uses-location-group\"];sys.exit(0 if r[\"destination_groups\"]==[\"M-App\"] else 1)"'
+check "a location domain's policy is adopted in its domain" bash -c 'python3 -c "import yaml,sys;p=yaml.safe_load(open(\"data/policies/mum-pol.yaml\"))[\"policy\"];sys.exit(0 if p[\"domain\"]==\"WL-Mum\" else 1)"'
+check "an id in two domains: the global domain's is adopted, the other stays in the UI, and says why" bash -c 'python3 -c "import yaml,sys;g=yaml.safe_load(sys.stdin)[\"groups\"][\"Clash\"];sys.exit(0 if \"domain\" not in g else 1)" <<<"$1" && grep -q "group Clash: its id is also a group in domain default" <<<"$2"' _ "$G" "$out_gm"
+check "...with the rule using the other one" bash -c 'grep -q "rule g-pol/uses-clash: uses Clash" <<<"$1"' _ "$out_gm"
+check "a Local Manager rule using a location domain's global group is adopted" bash -c 'python3 -c "import yaml,sys;r=yaml.safe_load(open(\"data/policies/l-pol.yaml\"))[\"rules\"][\"r1\"];sys.exit(0 if r[\"source_groups\"]==[\"M-App\"] else 1)"'
+check "import ids keep each object's own domain" bash -c 'grep -q "/global-infra/domains/WL-Mum/groups/M-App" stacks/global-security/import-gm1-mirror.tf && grep -q "/global-infra/domains/WL-Mum/security-policies/mum-pol\"" stacks/global-security/import-gm1-mirror.tf'
+check "it all validates" python3 scripts/validate-data.py
+check "the group module builds external ids" grep -q "external_id_expression" modules/group/main.tf
+check "the policy module takes an address in a rule without looking it up as a group" bash -c 'grep -q "ip_literal" modules/dfw-policy/main.tf'
+cp data/policies/g-pol.yaml "$SCRATCH/g-pol.yaml"
+python3 - <<'PY'
+import yaml
+d = yaml.safe_load(open("data/policies/g-pol.yaml")); d["rules"]["ips"]["scope"] = ["10.9.9.9"]
+open("data/policies/g-pol.yaml", "w").write(yaml.safe_dump(d))
+d = yaml.safe_load(open("data/groups/imported-gm1-mirror.yaml")); del d["groups"]["VM-Jump"]["criteria"][0]["member_type"]
+open("data/groups/imported-gm1-mirror.yaml", "w").write(yaml.safe_dump(d))
+PY
+out="$(python3 scripts/validate-data.py 2>&1)"
+check "an address in an Apply To is refused, and says where addresses are allowed" grep -q "not in its Apply To" <<<"$out"
+check "external ids without a member_type are refused" grep -q "external_ids and member_type go together" <<<"$out"
+python3 - <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("ie", "scripts/import-estate.py"); ie = importlib.util.module_from_spec(spec); spec.loader.exec_module(ie)
+calls = []
+def fake(host, path, *a):
+    calls.append(path)
+    if path.endswith("/global-infra/domains"): return {"results": [{"id": "default"}, {"id": "WL-Mum"}]}
+    if path.endswith("/groups"): return {"results": [{"id": "g", "path": path + "/g"}]}
+    return {"results": []}
+ie.api_get = fake
+sys.stderr = open("/dev/null", "w")
+e = ie.fetch_estate("h", "u", "p", ie.GM_BASE, "default", False)
+ok = e["domains"] == ["default", "WL-Mum"] and len(e["groups"]) == 2 and any("/domains/WL-Mum/security-policies" in c for c in calls)
+calls.clear()
+e = ie.fetch_estate("h", "u", "p", ie.LM_BASE, "default", False)
+ok = ok and e["domains"] == ["default"] and not any(c.endswith("/domains") for c in calls)
+sys.exit(0 if ok else 1)
+PY
+check "a Global Manager is read in every domain, its own first; a Local Manager in default only" test $? -eq 0
 cd "$T" || exit 1
 
 finish brownfield

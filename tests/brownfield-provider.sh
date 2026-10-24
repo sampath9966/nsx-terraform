@@ -324,6 +324,57 @@ check "...nor the one after (no loop)" grep -q "No changes" <<<"$(tf plan local-
 cp "$SCRATCH/ui.orig" "$UI"
 cd "$T" || exit 1
 
+echo "estate shapes: VM members, IP addresses in rules, a location domain's global group"
+# What a real estate holds and the first mirror of hyd-gm01 left in the UI: a
+# group of VMs picked one by one (ExternalIDExpression), rules with addresses
+# written in them, and a rule using a Global Manager group from a location
+# domain (WL-Mum). Taken over with no change, and no drift afterwards.
+T4="$SCRATCH/tree4"
+generate "$T4" --no-examples
+cd "$T4" || exit 1
+printf 'managers:\n  gm1:\n    role: gm\n    host: gm.example.net\n    site: global\n    vcf_instance: vcf-a\n    vault_path: secret/nsx/gm1\n    tier: prod\n  lon1:\n    role: lm\n    host: 127.0.0.1:%s\n    site: lon1\n    vcf_instance: vcf-a\n    vault_path: secret/nsx/lon1\n    tier: prod\n' "$port" >inventory/managers.yaml
+printf 'terraform {\n  backend "local" {}\n}\n' >stacks/local-security/backend_override.tf
+printf 'path = "%s/shapes.tfstate"\n' "$SCRATCH" >envs/lon1.backend.hcl
+mkdir -p reports
+python3 - "$UI" <<'PY'
+import json, sys
+WD = "/global-infra/domains/WL-Mum"; LD = "/infra/domains/default"
+gm = {"domain": "default", "domains": ["default", "WL-Mum"],
+      "groups": [{"id": "M-App", "path": f"{WD}/groups/M-App", "display_name": "M-App",
+                  "expression": [{"resource_type": "Condition", "key": "Tag", "member_type": "VirtualMachine", "operator": "EQUALS", "value": "app|mum"}]}],
+      "services": [], "policies": []}
+json.dump(gm, open("reports/gm1.json", "w"))
+d = json.load(open(sys.argv[1]))
+d["groups"].append({"id": "VM-Jump", "path": f"{LD}/groups/VM-Jump", "display_name": "VM-Jump",
+                    "expression": [{"resource_type": "ExternalIDExpression", "member_type": "VirtualMachine",
+                                    "external_ids": ["502e6f1a-0000-0000-0000-000000000001", "502e6f1a-0000-0000-0000-000000000002"]}]})
+def rule(i, seq, src, dst):
+    return {"id": i, "path": f"{LD}/security-policies/shapes-app/rules/{i}", "display_name": i, "sequence_number": seq,
+            "action": "ALLOW", "direction": "IN_OUT", "ip_protocol": "IPV4_IPV6", "logged": True, "disabled": False,
+            "sources_excluded": False, "destinations_excluded": False, "source_groups": src, "destination_groups": dst,
+            "services": ["ANY"], "scope": ["ANY"], "profiles": ["ANY"]}
+d["policies"].append({"id": "shapes-app", "path": f"{LD}/security-policies/shapes-app", "display_name": "shapes-app",
+    "category": "Application", "sequence_number": 40, "stateful": True, "tcp_strict": True, "locked": False, "scope": ["ANY"],
+    "rules": [rule("vm-members", 100, [f"{LD}/groups/VM-Jump"], [f"{LD}/groups/App-DB"]),
+              rule("addresses", 200, ["172.19.20.57", "10.1.0.0/16"], ["172.17.9.10-172.17.9.20", f"{LD}/groups/App-DB"]),
+              rule("location-group", 300, [f"{WD}/groups/M-App"], [f"{LD}/groups/App-DB"])]})
+json.dump(d, open(sys.argv[1], "w"))
+PY
+python3 scripts/import-estate.py --site gm1 --role gm --from-dump reports/gm1.json --mirror >/dev/null 2>&1
+out="$(env -u NSXT_MANAGER_HOST NSX_LON1_USERNAME=u NSX_LON1_PASSWORD=p scripts/with-credentials.sh lon1 --from env -- \
+	python3 scripts/import-estate.py --site lon1 --dump-only "$SCRATCH/shapes-cap.json" >/dev/null 2>&1 &&
+	python3 scripts/import-estate.py --site lon1 --from-dump "$SCRATCH/shapes-cap.json" --mirror 2>&1)"
+check "(setup) the copy takes all three rules, and leaves nothing of them in the UI" bash -c '! grep -q "NOT ADOPTED.*shapes-app\|NOT ADOPTED  group VM-Jump" <<<"$1" && grep -q "^  location-group:" data/policies/shapes-app.yaml && grep -q "external_ids" data/groups/imported-lon1-mirror.yaml' _ "$out"
+check "(setup) the copy validates" python3 scripts/validate-data.py
+out="$(tf plan local-security lon1)"
+check "the real provider plans VM members, addresses and the location group as a pure import" bash -c 'grep -qE "Plan: [0-9]+ to import, 0 to add, 0 to change, 0 to destroy" <<<"$1" && grep -q "plan-guard: allowed" <<<"$1"' _ "$out"
+check "...the location group by its domain's path" grep -q '/global-infra/domains/WL-Mum/groups/M-App' <<<"$out"
+check "it applies as imports only" grep -qE "Resources: [0-9]+ imported, 0 added, 0 changed, 0 destroyed" <<<"$(APPROVE=yes tf apply local-security lon1)"
+check "...and the next plan is quiet: external ids and addresses read back as written" grep -q "No changes" <<<"$(tf plan local-security lon1)"
+check "...nor the one after (no loop)" grep -q "No changes" <<<"$(tf plan local-security lon1)"
+cp "$SCRATCH/ui.orig" "$UI"
+cd "$T" || exit 1
+
 writes="$(grep WRITE "$SCRATCH/requests.log" | grep -vc "/api/session/create" || true)"
 check "NSX received no write at all (login sessions aside)" test "$writes" -eq 0
 

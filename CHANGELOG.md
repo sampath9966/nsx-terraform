@@ -13,6 +13,14 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.5.0
+
+**Mirror and adopt take three shapes a real estate is full of.** The first mirror of a production Global Manager left most of its rules in the UI for three reasons. All three are now taken over exactly, and proven with the real NSX provider to import with no change and no drift afterwards:
+
+- **Groups of VMs picked one by one** (the UI's Members tab, `ExternalIDExpression`). Written as `member_type: VirtualMachine` and `external_ids:` (each VM's instance UUID), with a `why_static` note like any static group. The group module builds them; the validator wants `member_type` with `external_ids`.
+- **IP addresses written in a rule.** A rule's source or destination may name addresses, CIDRs and ranges directly, next to groups. They are kept as written. The validator accepts them in sources and destinations, and refuses them in an Apply To.
+- **A Global Manager's location domains.** The GM is now read in every domain, not only `default`. A group or policy in a location domain such as `WL-Mum` keeps its `domain:`, so a global rule using it, and a Local Manager rule using it, are taken. An id that exists in two domains is taken from the first (the global domain) and left in the UI in the other, with the reason.
+
 ## 1.4.2
 
 **The mirror job works on large managers.** A manager with thousands of objects made the mirror job fail with `python3: Argument list too long` just after pushing `mirror/<site>`, so the merge request was never opened. The list of changed files and the importer's report went to Python in environment variables, and Linux limits one variable to 128 KiB. They now go through files. The adopt job had the same limit, and is fixed the same way.

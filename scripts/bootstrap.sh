@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.4.2"
+VERSION="1.5.0"
 
 ROOT="$PWD"
 FORCE=0
@@ -1427,8 +1427,12 @@ next sync overwrites them.
 `data/`, so exactly one stack manages it and the GM and an LM never fight over
 it:
 
-- The GM's copy is read from the global tree (`/global-infra`, domain `default`
-  unless the inventory sets one) and is `owner: gm`. A Local Manager also lists
+- The GM's copy is read from the global tree (`/global-infra`), in every domain:
+  `default` (or the inventory's `domain`) first, then each location domain such
+  as `WL-Mum`. Its objects are `owner: gm`; one outside `default` keeps its
+  `domain:`, so it is created there and Local Managers find it under that
+  domain. data/ names objects by id alone, so an id found in two domains is
+  taken from the first and left in the UI in the other. A Local Manager also lists
   the GM's objects; its copy never takes them (`NOT ADOPTED ... belongs to the
   Global Manager`).
 - A site-local rule that uses a global group or service names it, and the
@@ -1498,8 +1502,8 @@ Nothing you already have is overwritten: an existing target is written as
 Importing them would change them on the first apply, because Terraform clears
 any setting it does not manage:
 
-- groups with MAC, external-id or identity (AD) membership, or extended criteria,
-  and groups that nest one of those;
+- groups with MAC or identity (AD) membership, or extended criteria, and groups
+  that nest one of those;
 - services with entries other than TCP/UDP ports and ICMP;
 - rules with inline service entries, or that use one of the above. The rest of
   their policy is still adopted: Terraform manages rules one by one and leaves
@@ -1512,8 +1516,13 @@ any setting it does not manage:
 make validate
 ```
 
-- Every group with static IP membership has a placeholder `why_static`. Replace
-  it with the real reason.
+- Every group with static membership (IP addresses, or VMs picked one by one:
+  `external_ids`, each VM's instance UUID) has a placeholder `why_static`.
+  Replace it with the real reason. A VM rebuilt or restored as a new VM gets a
+  new UUID and silently leaves such a group; a tag does not.
+- A rule's source or destination may hold IP addresses, CIDRs and ranges as NSX
+  does (`172.19.20.57`, `10.1.0.0/16`, `172.17.9.10-172.17.9.20`), next to group
+  names. Not in an Apply To, which takes groups only.
 - Tag scopes must be in `data/schema/tag-scopes.yaml`. Add the ones your estate
   uses deliberately; a typo there silently empties a group.
 - A rule with an empty `scope` is pushed to every host in the span. The
@@ -2801,6 +2810,16 @@ write_file data/schema/group.schema.json <<'SCAFFOLD_EOF'
                   "type": "array",
                   "items": { "type": "string" }
                 },
+                "external_ids": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": { "type": "string", "minLength": 1 },
+                  "description": "Static members by external id (a VM's instance UUID); needs member_type and why_static."
+                },
+                "member_type": {
+                  "enum": ["VirtualMachine", "VirtualNetworkInterface", "CloudNativeServiceInstance", "PhysicalServer"],
+                  "description": "What external_ids name."
+                },
                 "member_groups": {
                   "type": "array",
                   "items": { "type": "string" },
@@ -3294,6 +3313,15 @@ resource "nsxt_policy_group" "this" {
         }
       }
 
+      dynamic "external_id_expression" {
+        for_each = length(try(criteria.value.external_ids, [])) > 0 ? [1] : []
+
+        content {
+          member_type  = criteria.value.member_type
+          external_ids = criteria.value.external_ids
+        }
+      }
+
       dynamic "path_expression" {
         for_each = length(try(criteria.value.member_groups, [])) > 0 ? [1] : []
 
@@ -3388,8 +3416,11 @@ blocks are joined by `conjunction`.
 - For subnet-based membership match `member_type: Segment` against a segment
   tag instead of hardcoding a CIDR. Segments are Terraform-owned, so their tags
   are reliable and a CIDR here would be a duplicated fact.
-- Static membership (`ip_addresses`, `member_groups`) requires `why_static` in
-  the data file; CI enforces it.
+- Static membership (`ip_addresses`, `external_ids`, `member_groups`) requires
+  `why_static` in the data file; CI enforces it.
+- `external_ids` names members one by one, as the UI's "Members" tab does for
+  virtual machines: `member_type: VirtualMachine` and each VM's instance UUID.
+  A rebuilt VM gets a new UUID and silently leaves the group.
 SCAFFOLD_EOF
 
 # --- modules/service -------------------------------------------------------
@@ -3519,10 +3550,12 @@ write_file modules/dfw-policy/main.tf <<'SCAFFOLD_EOF'
 # must never be mixed on the same policy; the provider says so explicitly.
 
 locals {
-  # "ANY" is the one literal allowed in a data file. Everything else is a
+  # "ANY" and IP literals (an address, CIDR or range, as a rule's source or
+  # destination) are the literals allowed in a data file. Everything else is a
   # logical name resolved to a policy path here, so no raw /infra/... path ever
-  # appears in data/.
+  # appears in data/. A group of the same name wins over a literal.
   resolvable = concat(keys(var.group_paths), ["ANY"])
+  ip_literal = "^([0-9]{1,3}(\\.[0-9]{1,3}){3}(/[0-9]{1,2})?(-[0-9]{1,3}(\\.[0-9]{1,3}){3})?|[0-9A-Fa-f]*:[0-9A-Fa-f:.]*(/[0-9]{1,3})?(-[0-9A-Fa-f]*:[0-9A-Fa-f:.]*)?)$"
 
   policy_scope = [for g in var.policy.scope : var.group_paths[g] if g != "ANY"]
 
@@ -3555,8 +3588,7 @@ locals {
   unresolved_groups = {
     for k, r in var.rules : k => sort(tolist(setsubtract(
       toset(concat(
-        try(r.source_groups, []),
-        try(r.destination_groups, []),
+        [for g in concat(try(r.source_groups, []), try(r.destination_groups, [])) : g if !can(regex(local.ip_literal, g))],
         try(r.scope, []),
       )),
       toset(local.resolvable),
@@ -5972,6 +6004,7 @@ Two layers:
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import re
 import sys
@@ -5980,6 +6013,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from yamlcompat import load_yaml  # noqa: E402
+
+
+def is_ip_literal(value: str) -> bool:
+    """An address, CIDR or range (a-b), as NSX takes in a rule's source or destination."""
+    try:
+        for part in value.split("-", 1):
+            ipaddress.ip_network(part, strict=False)
+        return True
+    except ValueError:
+        return False
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA = REPO_ROOT / "data"
@@ -6353,7 +6396,10 @@ def check_groups(docs: dict[Path, dict], scopes: dict, sites: set[str], imported
                     report.error(where, f"{name}: site {site!r} is not in inventory/managers.yaml")
 
             criteria = group.get("criteria") or []
-            static = any(c.get("ip_addresses") for c in criteria if isinstance(c, dict))
+            static = any(c.get("ip_addresses") or c.get("external_ids") for c in criteria if isinstance(c, dict))
+            for i, criterion in enumerate(criteria):
+                if isinstance(criterion, dict) and bool(criterion.get("external_ids")) != bool(criterion.get("member_type")):
+                    report.error(where, f"{name}.criteria[{i}]: external_ids and member_type go together: the ids name members of that type.")
             if static and not group.get("why_static"):
                 report.error(
                     where,
@@ -6519,12 +6565,15 @@ def check_policies(
                 "every change; use rule_management: standalone for anything with churn.",
             )
 
-        def resolve_group(name: str, label: str) -> None:
+        def resolve_group(name: str, label: str, literal_ok: bool = False) -> None:
             if name == "ANY":
                 return
             group = groups.get(name)
+            if group is None and literal_ok and is_ip_literal(name):
+                return
             if group is None:
-                report.error(where, f"{label}: references undefined group {name!r}")
+                hint = " (an IP address is allowed in a rule's source or destination, not in its Apply To)" if is_ip_literal(name) else ""
+                report.error(where, f"{label}: references undefined group {name!r}{hint}")
                 return
             if owner == "gm" and group.get("owner") != "gm":
                 report.error(
@@ -6563,7 +6612,7 @@ def check_policies(
 
             for field in ("source_groups", "destination_groups", "scope"):
                 for name in rule.get(field) or []:
-                    resolve_group(name, f"{label}.{field}")
+                    resolve_group(name, f"{label}.{field}", literal_ok=field != "scope")
 
             for name in rule.get("services") or []:
                 if name == "ANY":
@@ -7316,6 +7365,7 @@ with a "not found" style error, before anything is written to state.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import re
@@ -7397,6 +7447,10 @@ def api_get(host: str, path: str, user: str, password: str, insecure: bool) -> d
 
 
 def fetch_estate(host: str, user: str, password: str, base: str, domain: str, insecure: bool) -> dict:
+    """Groups, services and policies. On a Global Manager, from every domain: a
+    global policy's rules may use a location domain's groups (e.g. WL-Mum), and
+    location domains hold policies of their own. A Local Manager has only
+    'default' (its view of the Global Manager's domains is not its own)."""
     def results(path: str) -> list:
         # The policy API pages lists (1000 per page by default). Follow the cursor,
         # or a large estate is silently cut short.
@@ -7409,27 +7463,50 @@ def fetch_estate(host: str, user: str, password: str, base: str, domain: str, in
             if not cursor:
                 return out
 
-    print(f"reading {host} ({base}, domain {domain})", file=sys.stderr)
-    groups = results(f"{base}/domains/{domain}/groups")
-    print(f"  {len(groups)} group(s)", file=sys.stderr)
+    domains = [domain]
+    if base == GM_BASE:
+        # The manager's own domain first: on an id clash between domains, it wins.
+        domains += sorted(d["id"] for d in results(f"{base}/domains") if d.get("id") and d["id"] != domain)
+    print(f"reading {host} ({base}, domain(s) {', '.join(domains)})", file=sys.stderr)
+    groups: list = []
+    policies: list = []
+    for d in domains:
+        found = results(f"{base}/domains/{d}/groups")
+        groups += found
+        count = 0
+        for summary in results(f"{base}/domains/{d}/security-policies"):
+            # The list endpoint omits rules; fetch each policy in full.
+            policies.append(
+                api_get(
+                    host,
+                    f"{base}/domains/{d}/security-policies/{summary['id']}",
+                    user,
+                    password,
+                    insecure,
+                )
+            )
+            count += 1
+        print(f"  domain {d}: {len(found)} group(s), {count} policy/policies", file=sys.stderr)
     services = results(f"{base}/services")
     print(f"  {len(services)} service(s)", file=sys.stderr)
 
-    policies = []
-    for summary in results(f"{base}/domains/{domain}/security-policies"):
-        # The list endpoint omits rules; fetch each policy in full.
-        policies.append(
-            api_get(
-                host,
-                f"{base}/domains/{domain}/security-policies/{summary['id']}",
-                user,
-                password,
-                insecure,
-            )
-        )
-    print(f"  {len(policies)} policy/policies", file=sys.stderr)
+    return {"groups": groups, "services": services, "policies": policies, "domain": domain, "domains": domains}
 
-    return {"groups": groups, "services": services, "policies": policies, "domain": domain}
+
+def domain_of(path: str, default: str) -> str:
+    """The domain an object's path puts it in."""
+    found = re.match(r"^/(?:global-)?infra/domains/([^/]+)/", path or "")
+    return found.group(1) if found else default
+
+
+def is_ip_literal(value: str) -> bool:
+    """An address, CIDR or range (a-b), as NSX takes in a rule's source or destination."""
+    try:
+        for part in value.split("-", 1):
+            ipaddress.ip_network(part, strict=False)
+        return True
+    except ValueError:
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -7539,6 +7616,11 @@ def convert_group(group: dict, path_to_name: dict, owner: str, sites: list[str])
                 criteria.append({"conditions": conditions})
         elif kind == "IPAddressExpression":
             criteria.append({"ip_addresses": expression.get("ip_addresses", [])})
+            static = True
+        elif kind == "ExternalIDExpression":
+            # Members picked one by one in the UI: virtual machines by instance UUID.
+            criteria.append({"member_type": expression.get("member_type", "VirtualMachine"),
+                             "external_ids": list(expression.get("external_ids", []))})
             static = True
         elif kind == "PathExpression":
             criteria.append(
@@ -7688,7 +7770,8 @@ def convert_service(service: dict) -> dict:
 # What this converter and the modules represent exactly. Anything else would be
 # lost on the first apply (an unset attribute is cleared), so such objects are
 # never adopted: they stay in the UI and are reported.
-GROUP_EXPRESSIONS = {"Condition", "NestedExpression", "IPAddressExpression", "PathExpression", "ConjunctionOperator"}
+GROUP_EXPRESSIONS = {"Condition", "NestedExpression", "IPAddressExpression", "ExternalIDExpression", "PathExpression", "ConjunctionOperator"}
+EXTERNAL_ID_TYPES = {"VirtualMachine", "VirtualNetworkInterface", "CloudNativeServiceInstance", "PhysicalServer"}
 SERVICE_ENTRIES = {"L4PortSetServiceEntry", "ICMPTypeServiceEntry"}
 
 
@@ -7702,6 +7785,9 @@ def group_unsupported(group: dict) -> str | None:
                 return "nested expression containing " + ", ".join(sorted(str(k) for k in inner - {"Condition", "ConjunctionOperator"}))
     if kinds - GROUP_EXPRESSIONS:
         return "membership by " + ", ".join(sorted(str(k) for k in kinds - GROUP_EXPRESSIONS))
+    for expression in group.get("expression", []):
+        if expression.get("resource_type") == "ExternalIDExpression" and expression.get("member_type", "VirtualMachine") not in EXTERNAL_ID_TYPES:
+            return f"external ids of {expression.get('member_type')}"
     if group.get("extended_expression"):
         return "extended criteria (identity firewall)"
     if group.get("group_type"):
@@ -7894,6 +7980,8 @@ def federation(role: str, site: str, groups: list, services: list, policies: lis
     def check(path: str, known: dict, what: str) -> None:
         if path in ("ANY", "") or path in known or path in problems:
             return
+        if what == "group" and not path.startswith("/") and is_ip_literal(path):
+            return  # an address, CIDR or range written in the rule itself
         if path.startswith("/global-infra/") and role != "gm":
             problems[path] = f"uses the global {what} {path.rsplit('/', 1)[-1]}, which data/ does not declare: adopt or mirror the Global Manager first"
         else:
@@ -8058,12 +8146,29 @@ def main() -> int:
     service_paths = {s["path"]: s["id"] for s in all_services if s.get("path")}
     federated = federation(role, args.site, all_groups, all_services, all_policies,
                            declared_objects(exclude=own), group_paths, service_paths)
+    # data/ is keyed by id; NSX keys by domain and id. The same id in a second
+    # domain (Global Manager) stays in the UI rather than become a second object
+    # under one name. The manager's own domain was read first, so it keeps its own.
+    first: dict[tuple[str, str], str] = {}
+    clashing_policies: dict[str, str] = {}
+    for kind, objects in (("group", all_groups), ("policy", all_policies)):
+        for o in objects:
+            here = domain_of(o.get("path", ""), domain)
+            there = first.setdefault((kind, o["id"]), here)
+            if there != here:
+                why = f"its id is also a {kind} in domain {there}, and data/ names objects by id alone"
+                if kind == "group":
+                    federated.setdefault(o["path"], why)
+                else:
+                    clashing_policies[o["path"]] = why
 
     if args.list:
         return survey(args.site, all_groups, all_services, all_policies, federated)
     sites = [args.site]
     owner = "gm" if role == "gm" else "lm"
 
+    clashing = [p for p in all_policies if p.get("path") in clashing_policies]
+    all_policies = [p for p in all_policies if p.get("path") not in clashing_policies]
     groups, services, policies = all_groups, all_services, all_policies
     skipped: list[str] = []
     if args.mirror:
@@ -8108,6 +8213,7 @@ def main() -> int:
     bad = unsupported_objects(all_groups, all_services, federated)
     kept_in_ui: list[str] = [f"{o.get('resource_type', 'object')} {o.get('id')}: belongs to the Global Manager ({o.get('path')})"
                              for o in foreign]
+    kept_in_ui += [f"policy {p['id']}: {clashing_policies[p['path']]}" for p in clashing]
     # A local object shadowed by another manager's id is reported here, not as MANAGED.
     for kind, objects in (("group", all_groups), ("service", all_services)):
         for o in objects:
@@ -8173,10 +8279,13 @@ def main() -> int:
     converted_groups = {
         g["id"]: convert_group(g, group_paths, owner, sites) for g in groups if not is_system(g)
     }
-    if role == "gm" and domain != "default":
-        # Local Managers find a GM group under its domain (local-security).
-        for definition in converted_groups.values():
-            definition["domain"] = domain
+    if role == "gm":
+        # A group outside the global domain keeps its domain, where the GM stack
+        # creates it and Local Managers find it (local-security).
+        for g in groups:
+            where = domain_of(g.get("path", ""), domain)
+            if g["id"] in converted_groups and where != "default":
+                converted_groups[g["id"]]["domain"] = where
     if converted_groups:
         header = mirror_header if args.mirror else (
             f"# Imported from {args.site} on {datetime.now(timezone.utc):%Y-%m-%d}. Adopted, not created.\n"
@@ -8211,6 +8320,9 @@ def main() -> int:
         if is_system(policy):
             continue
         document = convert_policy(policy, group_paths, service_paths, owner, sites)
+        where = domain_of(policy.get("path", ""), domain)
+        if role == "gm" and where != "default":
+            document["policy"]["domain"] = where
         header = mirror_header if args.mirror else (
             f"# Imported from {args.site} on {datetime.now(timezone.utc):%Y-%m-%d}. Adopted, not created.\n"
             "#\n"
@@ -8225,7 +8337,7 @@ def main() -> int:
     for group_id, definition in converted_groups.items():
         nested = any("member_groups" in c for c in definition.get("criteria", []))
         path = next((g["path"] for g in groups if g["id"] == group_id), "")
-        (composite if nested else base)[group_id] = object_id("group", domain, path, group_id, args.id_format)
+        (composite if nested else base)[group_id] = object_id("group", domain_of(path, domain), path, group_id, args.id_format)
     service_ids = {
         s["id"]: object_id("service", domain, s.get("path", ""), s["id"], args.id_format)
         for s in services
@@ -8237,12 +8349,12 @@ def main() -> int:
         if is_system(policy):
             continue
         key = policy["id"]
-        policy_ids[key] = object_id("policy", domain, policy.get("path", ""), key, args.id_format)
+        policy_ids[key] = object_id("policy", domain_of(policy.get("path", ""), domain), policy.get("path", ""), key, args.id_format)
         for rule in policy.get("rules", []):
             rule_ids[f"{key}/{rule['id']}"] = {
                 "policy": key,
                 "rule": rule["id"],
-                "id": object_id("rule", domain, rule.get("path", ""), f"{key}/{rule['id']}", args.id_format),
+                "id": object_id("rule", domain_of(policy.get("path", ""), domain), rule.get("path", ""), f"{key}/{rule['id']}", args.id_format),
             }
 
     kinds = [
