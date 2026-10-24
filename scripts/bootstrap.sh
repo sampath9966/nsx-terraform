@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.2.9"
+VERSION="1.2.10"
 
 ROOT="$PWD"
 FORCE=0
@@ -2066,6 +2066,13 @@ openssl s_client -connect <manager>:443 -showcerts </dev/null 2>/dev/null |
 
 The SAN must list the name or address in `inventory/managers.yaml`; if it does
 not, replace the certificate on the manager. Do not turn verification off.
+
+Jobs reach managers directly, never through the internet proxy the runner may
+have: `scripts/with-credentials.sh` adds the manager's host (and
+`SDDC_MANAGER_HOST`) to `NO_PROXY`. A manager name sent to such a proxy fails
+as `remote error: tls: unrecognized name`, a 403 or a 502. Only where managers
+really are reached through a proxy, set the CI/CD variable
+`NSX_MANAGER_VIA_PROXY=1`.
 
 | Variable | Value | Flags |
 |---|---|---|
@@ -5111,6 +5118,38 @@ eval "$(python3 "$REPO_ROOT/scripts/ci-matrix.py" --export "$SITE")"
 [ -n "${NSX_HOST:-}" ] || die "site '$SITE' is not in inventory/managers.yaml"
 
 export NSXT_MANAGER_HOST="$NSX_HOST"
+
+# Managers (and SDDC Manager) sit on the management network. A job whose
+# HTTPS_PROXY is set for internet access would otherwise send them through
+# that proxy: Terraform and curl match NO_PROXY by name, and a CIDR entry such
+# as 10.0.0.0/8 only covers IP literals, never an FQDN. The proxy then fails
+# the request (often as "tls: unrecognized name" or a 403/502). Add the
+# hosts themselves. NSX_MANAGER_VIA_PROXY=1 keeps the proxy for networks that
+# really do reach managers through it.
+bypass_proxy() {
+	local h="$1" list
+	h="${h#*://}"
+	h="${h%%/*}"
+	case "$h" in
+	\[*)
+		h="${h#\[}"
+		h="${h%%]*}"
+		;;
+	*:*:*) ;;
+	*) h="${h%%:*}" ;;
+	esac
+	[ -n "$h" ] || return 0
+	list="${NO_PROXY:-${no_proxy:-}}"
+	case ",${list// /}," in
+	*",$h,"*) ;;
+	*) list="${list:+$list,}$h" ;;
+	esac
+	export NO_PROXY="$list" no_proxy="$list"
+}
+if [ "${NSX_MANAGER_VIA_PROXY:-}" != 1 ]; then
+	bypass_proxy "$NSX_HOST"
+	[ -z "${SDDC_MANAGER_HOST:-}" ] || bypass_proxy "$SDDC_MANAGER_HOST"
+fi
 
 # Keep the session alive across requests — materially faster on large plans.
 export NSXT_SESSION_AUTH="${NSXT_SESSION_AUTH:-true}"

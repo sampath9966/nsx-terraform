@@ -13,6 +13,12 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.2.10
+
+**Plan jobs failed with `remote error: tls: unrecognized name` on a network with an internet proxy.** The runner gives jobs the host's proxy and a `NO_PROXY` of private address ranges. Terraform, curl and Python match `NO_PROXY` against the name in the URL, and a range such as `10.0.0.0/8` only ever covers a literal IP address, so a manager named by FQDN was sent to the proxy, which refused it. `scripts/with-credentials.sh`, which every job that talks to NSX already runs through, now adds the manager's host from `inventory/managers.yaml` (and `SDDC_MANAGER_HOST`) to `NO_PROXY`, so managers are always reached directly. Downloads of providers and images still use the proxy. Where managers really are reached through a proxy, set `NSX_MANAGER_VIA_PROXY=1`.
+
+**Tests:** `tests/brownfield-provider.sh` reproduces the failure with the real provider against a proxy that refuses the handshake as a corporate proxy does (`tests/sni_reject_proxy.py`): an FQDN manager outside `NO_PROXY` fails with exactly this error, the same plan through `with-credentials.sh` succeeds with nothing reaching the proxy, and `NSX_MANAGER_VIA_PROXY=1` keeps the proxy.
+
 ## 1.2.9
 
 **Plan jobs failed with `HTTP remote state endpoint requires auth`.** The docs said jobs reach GitLab-managed state with their own token, but nothing set it: `TF_HTTP_USERNAME` and `TF_HTTP_PASSWORD` appeared only in comments. `scripts/tf.sh` now sets them to `gitlab-ci-token` and `CI_JOB_TOKEN` inside a GitLab job, so no state credential is stored anywhere; credentials you set yourself are left alone, and nothing is set outside CI. The end-to-end tests never ran a plan job (there is no NSX in CI), which is how this was missed.

@@ -232,6 +232,15 @@ check "passwords with quotes, dollars, backslashes and spaces arrive intact" tes
 check "a plan job cannot use the apply credential" grep -q "no NSX credentials" <<<"$(wc2 NSX_CRED_SCOPE=plan NSX_APPLY_USERNAME=w NSX_APPLY_PASSWORD=w)"
 check "an apply job cannot use the plan credential" grep -q "no NSX credentials" <<<"$(wc2 NSX_CRED_SCOPE=apply NSX_PLAN_USERNAME=r NSX_PLAN_PASSWORD=r)"
 check "a password never appears in an error message" bash -c '! grep -q SECRETVALUE <<<"$1"' _ "$(wc2 NSX_USERNAME=u NSX_PASSWORD=SECRETVALUE VAULT_ADDR=http://x)"
+np() { (cd "$T" && env -i PATH="$PATH" NSX_USERNAME=u NSX_PASSWORD=p "$@" scripts/with-credentials.sh hyd-gm01 -- sh -c 'printf "%s|%s" "$NO_PROXY" "$no_proxy"' 2>&1); }
+check "the manager is added to NO_PROXY, keeping what was there" test "$(np NO_PROXY=10.0.0.0/8)" = "10.0.0.0/8,gm.example.net|10.0.0.0/8,gm.example.net"
+check "...from no_proxy when only that is set" test "$(np no_proxy=localhost)" = "localhost,gm.example.net|localhost,gm.example.net"
+check "...not twice" test "$(np NO_PROXY=gm.example.net)" = "gm.example.net|gm.example.net"
+check "...and SDDC Manager too" test "$(np SDDC_MANAGER_HOST=sddc.example.net:443)" = "gm.example.net,sddc.example.net|gm.example.net,sddc.example.net"
+check "NSX_MANAGER_VIA_PROXY=1 leaves NO_PROXY alone" test "$(np NSX_MANAGER_VIA_PROXY=1 NO_PROXY=x)" = "x|"
+sed -i 's/host: gm.example.net/host: gm.example.net:8443/' "$T/inventory/managers.yaml"
+check "a port in the inventory host is not part of the NO_PROXY entry" test "$(np)" = "gm.example.net|gm.example.net"
+sed -i 's/host: gm.example.net:8443/host: gm.example.net/' "$T/inventory/managers.yaml"
 check "the wrapped command's exit status is preserved" bash -c '(cd "$1" && env -i PATH="$PATH" NSX_USERNAME=u NSX_PASSWORD=p scripts/with-credentials.sh hyd-gm01 -- sh -c "exit 7") >/dev/null 2>&1; [ $? -eq 7 ]' _ "$T"
 
 # Git is given only the runner's tls-ca-file. That file has to carry the host

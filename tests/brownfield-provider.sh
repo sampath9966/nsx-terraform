@@ -85,7 +85,11 @@ for ca in site other; do
 		-subj "/CN=$ca CA" >/dev/null 2>&1
 done
 openssl req -newkey rsa:2048 -nodes -keyout "$SCRATCH/key.pem" -out "$SCRATCH/srv.csr" -subj "/CN=127.0.0.1" >/dev/null 2>&1
-printf 'subjectAltName=IP:127.0.0.1\n' >"$SCRATCH/ext.cnf"
+# A name for this machine other than "localhost", which Terraform would never
+# send to a proxy: the proxy checks below need one.
+PNAME="$(hostname)"
+case "$(getent hosts "$PNAME" 2>/dev/null)" in 127.*) ;; *) PNAME="" ;; esac
+printf 'subjectAltName=IP:127.0.0.1%s\n' "${PNAME:+,DNS:$PNAME}" >"$SCRATCH/ext.cnf"
 openssl x509 -req -in "$SCRATCH/srv.csr" -CA "$SCRATCH/site-ca.pem" -CAkey "$SCRATCH/site-ca.key" -CAcreateserial \
 	-out "$SCRATCH/cert.pem" -days 1 -extfile "$SCRATCH/ext.cnf" >/dev/null 2>&1
 # Behind a TLS-inspecting proxy, provider downloads need that proxy's CA too:
@@ -131,6 +135,35 @@ check "the import applies" grep -q "Resources: 8 imported, 0 added, 0 changed, 0
 check "another manager sharing the stack is untouched" grep -q "plan-guard: allowed" <<<"$(tf plan local-security nyc1)"
 check "the next plan reports no changes" grep -q "No changes" <<<"$(tf plan local-security lon1)"
 rm -f stacks/local-security/import-*.tf
+
+echo "a proxy for the internet"
+if [ -n "$PNAME" ]; then
+	pport=$((port + 1))
+	python3 "$REPO/tests/sni_reject_proxy.py" "$SCRATCH/proxy.log" "$pport" &
+	proxy=$!
+	trap 'kill "$mock" "$proxy" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
+	sleep 1
+	cp inventory/managers.yaml "$SCRATCH/managers.bak"
+	sed -i "s/host: lon1.example.net/host: $PNAME:$port/" inventory/managers.yaml
+	viaproxy() {
+		env -u NSXT_MANAGER_HOST -u NSXT_USERNAME -u NSXT_PASSWORD -u no_proxy \
+			HTTPS_PROXY="http://127.0.0.1:$pport" https_proxy="http://127.0.0.1:$pport" NO_PROXY=10.0.0.0/8,172.16.0.0/12 \
+			NSX_LON1_USERNAME=u NSX_LON1_PASSWORD=p "$@" 2>&1
+	}
+	out="$(viaproxy NSXT_MANAGER_HOST="$PNAME:$port" NSXT_USERNAME=u NSXT_PASSWORD=p scripts/tf.sh plan local-security lon1)"
+	check "an FQDN manager outside NO_PROXY goes to the proxy and fails as 'tls: unrecognized name'" \
+		grep -q "tls: unrecognized name" <<<"$out"
+	check "...because a CIDR in NO_PROXY never covers a name" grep -q "CONNECT $PNAME:$port" "$SCRATCH/proxy.log"
+	: >"$SCRATCH/proxy.log"
+	out="$(viaproxy scripts/with-credentials.sh lon1 --from env -- scripts/tf.sh plan local-security lon1)"
+	check "with-credentials.sh sends the manager direct and the plan works" grep -q "No changes" <<<"$out"
+	check "...and nothing reached the proxy" test ! -s "$SCRATCH/proxy.log"
+	out="$(viaproxy NSX_MANAGER_VIA_PROXY=1 scripts/with-credentials.sh lon1 --from env -- scripts/tf.sh plan local-security lon1)"
+	check "NSX_MANAGER_VIA_PROXY=1 keeps the proxy for the manager" grep -q "CONNECT $PNAME:$port" "$SCRATCH/proxy.log"
+	cp "$SCRATCH/managers.bak" inventory/managers.yaml
+else
+	echo "  SKIP  no name for this machine resolves to 127.x (proxy checks need one)"
+fi
 
 echo "deletions"
 cp data/policies/legacy-app.yaml "$SCRATCH/policy.bak"
