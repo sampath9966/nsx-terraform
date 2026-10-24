@@ -128,7 +128,16 @@ check "the runner was registered with the local-image pull policy" docker exec n
 check "the runner passes the (blocked) proxy into jobs" docker exec nsx-gitlab-runner grep -q 'HTTPS_PROXY=http://127.0.0.1:9' /etc/gitlab-runner/config.toml
 check "the runner excludes every private range from that proxy" bash -c 't=$(docker exec nsx-gitlab-runner cat /etc/gitlab-runner/config.toml); printf "%s" "$t" | grep -q "10.0.0.0/8" && printf "%s" "$t" | grep -q "172.16.0.0/12" && printf "%s" "$t" | grep -q "192.168.0.0/16"'
 check "the clone script does not clear the host proxy" bash -c '! docker exec nsx-gitlab-runner cat /etc/gitlab-runner/config.toml | grep -F -q ".proxy"'
-check "the converge report warns that providers cannot be downloaded" grep -q "cannot download Terraform providers" "$SCRATCH/update.log"
+# fresh: the image was first built in step 1, with outside access, so the NSX
+# provider is inside it. upgrade: this release's image is first built here,
+# with none, so the provider cannot be fetched and the image is built without.
+if [ "$MODE" = fresh ]; then
+	check "the NSX provider is in the CI image" docker run --rm nsx-ci:1 sh -c 'ls /usr/local/share/terraform/plugins/registry.terraform.io/vmware/nsxt/*.zip'
+	check "the converge report says jobs need no registry for it" grep -q "the NSX provider is in the CI image" "$SCRATCH/update.log"
+else
+	check "the converge report warns the image has no NSX provider, with the fix" bash -c 'grep -q "has no NSX provider inside" "$1" && grep -q "NSX_TF_NETWORK_MIRROR" "$1"' _ "$SCRATCH/update.log"
+	check "...and that jobs cannot download it either" grep -q "cannot download Terraform providers" "$SCRATCH/update.log"
+fi
 
 started_runner="$(docker inspect -f '{{.State.StartedAt}}' nsx-gitlab-runner)"
 started_gitlab="$(docker inspect -f '{{.State.StartedAt}}' nsx-gitlab)"
@@ -152,8 +161,9 @@ check "(setup) the updated tree was pushed to GitLab" env GIT_SSL_CAINFO="$CA" g
 before_id="$(api "$API/pipelines?ref=main&per_page=1" | python3 "$HELPER" first-id)"
 api -X POST "$API/pipeline?ref=main" >/dev/null
 # The validate stage is offline (no Vault, no NSX), so it must pass. 'terraform' needs
-# providers, which this network cannot give it, so it must be a visible WARNING. The
-# plan stage needs credentials and is not expected to pass.
+# the provider: with it in the image (fresh) it passes with no internet; without it
+# (upgrade) it must be a visible WARNING. The plan stage needs credentials and is
+# not expected to pass.
 want="data terraform matrix"
 deadline=$((SECONDS + 900))
 pid="" states=""
@@ -170,10 +180,12 @@ done
 echo "    pipeline ${pid:-none}: ${states:-no jobs seen}"
 check "job 'data' succeeded on the runner with no internet" grep -q "data=success" <<<"$states"
 check "job 'matrix' succeeded on the runner with no internet" grep -q "matrix=success" <<<"$states"
-check "job 'terraform' ended as a visible warning, not a failure and not silent" grep -q "terraform=warning" <<<"$states"
 tf_job="$(api "$API/pipelines/$pid/jobs?per_page=100" | python3 "$HELPER" id terraform)"
-if [ -n "$tf_job" ]; then
-	api "$API/jobs/$tf_job/trace" >"$SCRATCH/tf-trace.txt"
+[ -n "$tf_job" ] && api "$API/jobs/$tf_job/trace" >"$SCRATCH/tf-trace.txt"
+if [ "$MODE" = fresh ]; then
+	check "job 'terraform' succeeded with no internet: init used the provider in the image" grep -q "terraform=success" <<<"$states"
+else
+	check "job 'terraform' ended as a visible warning, not a failure and not silent" grep -q "terraform=warning" <<<"$states"
 	check "the terraform job's log explains what to do" grep -q "NSX_TF_NETWORK_MIRROR" "$SCRATCH/tf-trace.txt"
 fi
 for j in $(api "$API/pipelines/$pid/jobs?per_page=100" | python3 "$HELPER" failed-hard); do
