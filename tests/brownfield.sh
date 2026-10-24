@@ -368,6 +368,18 @@ out="$(python3 scripts/plan-guard.py --site lon1 --stack local-security "$SCRATC
 check "an applied tranche's leftover file is pointed out" grep -q "imports nothing new, so that tranche is applied" <<<"$out"
 rm -f stacks/local-security/import-lon1-t.tf
 check "input that is not a plan is an error" bash -c '! echo nope | python3 scripts/plan-guard.py --site lon1 --stack local-security >/dev/null 2>&1'
+obs() { python3 scripts/plan-guard.py --site lon1 --stack local-security --observe "$1" >/dev/null 2>&1; echo $?; }
+plan "$SCRATCH/noop.json" "[{\"address\":\"$A\",\"mode\":\"managed\",\"change\":{\"actions\":[\"no-op\"]}},{\"address\":\"data.x.y\",\"mode\":\"data\",\"change\":{\"actions\":[\"read\"]}}]"
+check "observe (mirror mode): imports are allowed" test "$(obs "$SCRATCH/import.json")" -eq 0
+check "observe: a plan with nothing to change is allowed" test "$(obs "$SCRATCH/noop.json")" -eq 0
+check "observe: creates and updates are refused, even outside a tranche" test "$(obs "$SCRATCH/create-update.json")" -eq 2
+check "observe: an update during an import is refused" test "$(obs "$SCRATCH/import-update.json")" -eq 2
+check "observe: hand-backs (forget) are refused" test "$(obs "$SCRATCH/forget.json")" -eq 2
+printf 'lon1 local-security %s\n' "module.policies[\"p\"].nsxt_policy_security_policy_rule.this[\"r\"]" >allow-destroy.txt
+check "observe: a destroy is refused even when approved in allow-destroy.txt" test "$(obs "$SCRATCH/delete.json")" -eq 2
+rm -f allow-destroy.txt
+out="$(NSX_MODE=mirror python3 scripts/plan-guard.py --site lon1 --stack local-security --observe "$SCRATCH/create-update.json" 2>&1)"
+check "observe: the refusal explains a manager changed since its last sync" grep -q "changed in the UI after the last sync" <<<"$out"
 
 echo "tf.sh: one manager's state and plan never reach another"
 mkdir -p "$SCRATCH/fake"
@@ -400,7 +412,10 @@ check "...before anything is applied" bash -c '! grep -q "^apply" "$1"' _ "$FAKE
 rm -f stacks/local-security/tfplan.site
 check "a plan with no record of its manager is refused" grep -q "was made for 'an unknown manager'" <<<"$(APPROVE=yes tf apply local-security nyc1)"
 sed -i '/^  nyc1:$/a\    mode: mirror' inventory/managers.yaml
-check "nothing is applied to a manager in mode: mirror, whatever the plan" grep -q "nyc1 is in mode: mirror" <<<"$(APPROVE=yes tf apply local-security nyc1)"
+check "a manager in mode: mirror is refused the write credential, whatever the plan" grep -q "nyc1 is in mirror mode: only its state is updated, and only with the read-only credential" <<<"$(APPROVE=yes NSX_CRED_SCOPE=apply tf apply local-security nyc1)"
+check "...and refused without a scope at all" grep -q "only with the read-only credential" <<<"$(APPROVE=yes tf apply local-security nyc1)"
+check "NSX_MODE_<SITE> puts a manager in mirror mode without a commit" grep -q "lon1 is in mirror mode" <<<"$(APPROVE=yes NSX_MODE_LON1=mirror tf apply local-security lon1)"
+check "...and an unknown value is an error naming the variable" grep -q "NSX_MODE_LON1 must be one of: managed, mirror" <<<"$(APPROVE=yes NSX_MODE_LON1=observe tf apply local-security lon1)"
 sed -i '/^    mode: mirror$/d' inventory/managers.yaml
 tf plan local-security nyc1 >/dev/null
 # The test tree is on the placeholder local backend, which tf.sh only applies to

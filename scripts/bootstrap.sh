@@ -1369,34 +1369,38 @@ iterate on a conversion offline.
 
 ## Mirror mode: the whole manager, kept in step, until you cut over
 
-For a manager that engineers keep running from the UI while the repository
-catches up. Instead of choosing policies, the repository holds a copy of
-**everything** the importer can represent, refreshed on a schedule, and nothing
-is ever applied to that manager until you say so.
+For a manager that engineers keep running from the UI while the repository and
+Terraform's state catch up. Instead of choosing policies, the repository holds a
+copy of **everything** the importer can represent, refreshed on a schedule, and
+state follows it. Nothing is applied to NSX for that manager until you switch
+it to managed. The other managers carry on as normal: their merge requests are
+planned, merged and applied as usual.
 
-**Turn it on.** In `inventory/managers.yaml`, give the manager `mode: mirror`, in
-a merge request:
+**Turn it on, per manager.** Either way works; the variable wins:
 
-```yaml
-managers:
-  hyd-nonprod01:
-    role: lm
-    host: ...
-    mode: mirror
-```
+- the CI/CD variable `NSX_MODE_<SITE>` = `mirror` (*Settings → CI/CD →
+  Variables*; `hyd-gm01` is `NSX_MODE_HYD_GM01`): no commit, takes effect at the
+  next pipeline;
+- or `mode: mirror` for the manager in `inventory/managers.yaml`, in a merge
+  request.
 
 From then on, for that manager:
 
-- its plan jobs still run, and the child pipeline has **no apply job** for it
-  (GitHub Actions: it is left out of the apply matrix). `scripts/tf.sh apply`
-  refuses it too, whoever runs it;
-- its plans must be a pure import (`plan-guard`), so a green plan is the proof
-  that the copy would be taken over without changing anything.
+- **no apply job.** On the default branch it gets an automatic `sync-state` job
+  instead. That job applies its plan only if the plan just imports and refreshes
+  (`plan-guard --observe`: any create, update, destroy or hand-back is refused),
+  and only with the **read-only** plan credential, so it cannot write to NSX
+  even by mistake. `scripts/tf.sh apply` holds anyone to the same rules.
+  GitHub Actions leaves it out of the apply matrix.
+- **its plans never hold up the other managers.** It changes in the UI between
+  syncs, so on other merge requests and on the default branch its plan may fail,
+  shown as a warning. In its own mirror merge request the plan must pass.
 
 **Schedule the sync.** *Build → Pipeline schedules → New schedule*, on the
 default branch, with the variable `MIRROR_SITE` = `all` (every manager in mirror
-mode) or one manager's name. Every few hours is typical. *Run pipeline* with the
-same variable syncs on demand. The `mirror` job (`scripts/mirror.sh`):
+mode) or one manager's name, and `MIRROR_AUTO_MERGE` = `1` for state to follow
+without anyone merging. Every few hours is typical. *Run pipeline* with the same
+variables syncs on demand. The `mirror` job (`scripts/mirror.sh`):
 
 1. reads each manager with the read-only plan credential;
 2. rewrites that manager's mirror files from what it holds now:
@@ -1407,9 +1411,13 @@ same variable syncs on demand. The `mirror` job (`scripts/mirror.sh`):
 3. if that matches the default branch, does nothing (and closes a merge request
    still open for it); otherwise force-pushes the branch `mirror/<site>` and keeps
    **one** merge request for it up to date, listing what was added, changed and
-   deleted. Merge it to bring the repository up to date; with the schedule
-   variable `MIRROR_AUTO_MERGE` = `1` it is set to merge itself when its pipeline
-   passes.
+   deleted. With `MIRROR_AUTO_MERGE=1` it merges itself when its pipeline passes.
+
+Once merged, the default-branch pipeline's `sync-state` job brings state up to
+date: new objects are imported, edited ones are refreshed, deleted ones leave
+state. If an engineer changed the manager after the sync read it, the plan
+differs from the copy; it is refused, nothing is pushed back onto NSX, and the
+next sync brings the change in.
 
 It needs `NSX_ADOPT_TOKEN`, as the adopt job. An unchanged manager rewrites the
 same bytes, so a quiet manager produces no merge requests. Objects declared in any
@@ -1419,22 +1427,22 @@ listed as `NOT ADOPTED`, as everywhere else. Do not edit the mirror files: the
 next sync overwrites them.
 
 Two managers cannot both own an object with the same id (the data is keyed by
-id): the second is listed as `MANAGED` and left in its UI.
+id): the second is listed as `MANAGED` and left in its UI. An object edited in
+the UI into something the importer cannot represent leaves the copy but not
+state, so its plan shows a destroy and is refused every time: hand it back
+(below) to stop managing it.
 
 **Cut over** when the team is ready to stop changing that manager by hand:
 
 1. Agree a short freeze on UI changes for that manager.
-2. Run the sync (*Run pipeline*, `MIRROR_SITE` = the manager) and merge its merge
-   request, so the repository holds what the manager holds now.
-3. In a merge request, change the manager's `mode: mirror` to `mode: managed`.
-   Its plan must read `N to import, 0 to add, 0 to change, 0 to destroy`. If
-   anything else shows, someone changed the manager since step 2: sync again.
-4. Merge. The default-branch pipeline now has apply jobs for the manager; run
-   them. They record every object in state and change nothing in NSX. The next
-   plan must report **no changes**.
-5. In a separate merge request, delete `stacks/<stack>/import-<site>-mirror.tf`.
-   The data files stay; they are now the source of truth. Their first line may
-   stay or go: the mirror job refuses managers in `mode: managed`.
+2. Run the sync (*Run pipeline*, `MIRROR_SITE` = the manager), merge its merge
+   request, and let `sync-state` finish. The plan must report no changes.
+3. Set the manager to managed: `NSX_MODE_<SITE>` = `managed` (or delete the
+   variable and set `mode: managed` in the inventory, in a merge request). State
+   already holds everything, so there is nothing to apply.
+4. In a merge request, delete `stacks/<stack>/import-<site>-mirror.tf`. The data
+   files stay; they are now the source of truth. Their first line may stay or
+   go: the mirror job refuses managers in managed mode.
 
 From then on, changes go through merge requests. A change made in the UI shows
 in the next plan as a difference Terraform would undo, and `scripts/drift.sh`
@@ -2613,7 +2621,7 @@ write_file data/schema/managers.schema.json <<'SCAFFOLD_EOF'
           "enabled": { "type": "boolean" },
           "mode": {
             "enum": ["managed", "mirror"],
-            "description": "managed (the default): the pipeline plans and applies. mirror: scripts/mirror.sh keeps data/ a copy of the manager, plans only import, and nothing is ever applied. docs/IMPORT.md."
+            "description": "managed (the default): the pipeline plans and applies. mirror: scripts/mirror.sh keeps data/ a copy of the manager, and only its state is updated (imports and refreshes, read-only); nothing is applied to NSX. The CI/CD variable NSX_MODE_<SITE> overrides this. docs/IMPORT.md."
           },
           "stacks": {
             "type": "array",
@@ -5024,7 +5032,7 @@ uses_local_backend() { grep -q 'backend "local"' "$stack_dir/backend.tf" 2>/dev/
 # each plan and again before each apply, so a hand-run apply is held to it too.
 guard() {
 	(cd "$stack_dir" && terraform show -json tfplan) |
-		python3 "$REPO_ROOT/scripts/plan-guard.py" --site "$site" --stack "$stack"
+		python3 "$REPO_ROOT/scripts/plan-guard.py" --site "$site" --stack "$stack" "$@"
 }
 
 backend_args=(-backend-config="$backend_file")
@@ -5099,14 +5107,20 @@ apply)
 		echo "error: apply requires an explicit human decision. Re-run with APPROVE=yes after reviewing the plan." >&2
 		exit 1
 	fi
-	# A manager in mirror mode is run from the UI; data/ is only a copy of it.
+	# A manager in mirror mode is still run from the UI; data/ is a copy of it.
+	# Only its state is brought up to date: imports and refreshes, with the
+	# read-only identity, so even a mistake here cannot write to NSX.
+	observe=()
 	if [ "${NSX_MODE:-}" = mirror ]; then
-		echo "error: $site is in mode: mirror (inventory/managers.yaml): nothing is applied to it. To hand it to Terraform, set mode: managed in a merge request; docs/IMPORT.md, \"Mirror mode\"." >&2
-		exit 1
+		if [ "${NSX_CRED_SCOPE:-}" != plan ]; then
+			echo "error: $site is in mirror mode: only its state is updated, and only with the read-only credential (NSX_CRED_SCOPE=plan). Nothing else is applied to it until mode: managed; docs/IMPORT.md, \"Mirror mode\"." >&2
+			exit 1
+		fi
+		observe=(--observe)
 	fi
 	require_plan_for_site
 	ensure_init
-	if ! guard; then
+	if ! guard ${observe[@]+"${observe[@]}"}; then
 		echo "error: refusing to apply: the saved plan does not pass plan-guard (above)." >&2
 		exit 2
 	fi
@@ -5363,6 +5377,8 @@ scripts/gitlab-child-pipeline.py for GitLab.
 
 from __future__ import annotations
 
+import os
+import re
 import sys
 from pathlib import Path
 
@@ -5371,6 +5387,20 @@ from yamlcompat import load_yaml  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INVENTORY = REPO_ROOT / "inventory" / "managers.yaml"
+MODES = ("managed", "mirror")
+
+
+def mode_of(name: str, manager: dict) -> str:
+    """managed or mirror. The CI/CD variable NSX_MODE_<SITE> (hyd-gm01 is
+    NSX_MODE_HYD_GM01) wins over the inventory's mode, so one manager can be put
+    into, or taken out of, mirror mode without a commit."""
+    variable = "NSX_MODE_" + re.sub(r"[^A-Z0-9]", "_", name.upper())
+    override = os.environ.get(variable, "").strip()
+    mode = override or manager.get("mode", "managed")
+    if mode not in MODES:
+        source = variable if override else "inventory/managers.yaml"
+        sys.exit(f"error: {name}: mode {mode!r} from {source} must be one of: {', '.join(MODES)}")
+    return mode
 
 # A Global Manager has no VM inventory and no local networking, so local-tags,
 # local-network and platform are Local Manager stacks only.
@@ -5405,7 +5435,7 @@ def entries(stack_filter: str | None = None, strict: bool = False) -> list[dict]
                     "host": m.get("host", ""),
                     "tier": m.get("tier", ""),
                     "vcf_instance": m.get("vcf_instance", ""),
-                    "mode": m.get("mode", "managed"),
+                    "mode": mode_of(name, m),
                 }
             )
     return out
@@ -5433,7 +5463,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ci_matrix_lib import entries, managers  # noqa: E402
+from ci_matrix_lib import entries, managers, mode_of  # noqa: E402
 
 
 def export(site: str) -> int:
@@ -5449,7 +5479,7 @@ def export(site: str) -> int:
         "NSX_VAULT_PATH": m.get("vault_path", ""),
         "NSX_DOMAIN": m.get("domain", "default"),
         "NSX_VCF_INSTANCE": m.get("vcf_instance", ""),
-        "NSX_MODE": m.get("mode", "managed"),
+        "NSX_MODE": mode_of(site, m),
     }
     for key, value in pairs.items():
         print(f"export {key}={shlex.quote(str(value))}")
@@ -7916,12 +7946,13 @@ def main() -> int:
         ("rules", "module.policies[each.value.policy].nsxt_policy_security_policy_rule.this[each.value.rule]", rule_ids),
     ]
     header = (
-        f"# Mirror of {args.site}: every object in the mirror files, for import at cutover.\n"
+        f"# Mirror of {args.site}: every object in the mirror files, imported into state.\n"
         "# Regenerated by scripts/mirror.sh; do not edit.\n"
         "#\n"
-        f"# While {args.site} is in mode: mirror, plans show these as imports and no apply\n"
-        "# job exists. After mode: managed, one apply records them in state and changes\n"
-        "# nothing in NSX; then delete this file in its own merge request.\n"
+        f"# While {args.site} is in mirror mode, its sync-state job applies these imports\n"
+        "# (and nothing else) with the read-only credential; an object already in state\n"
+        "# is left as it is. After cutover to managed, delete this file in its own merge\n"
+        "# request.\n"
         f"#\n# id format: {args.id_format}.\n"
     ) if args.mirror else (
         f"# Generated by scripts/import-estate.py: tranche '{tranche}' for {args.site}.\n"
@@ -7999,7 +8030,7 @@ def main() -> int:
         return 0
     if args.mirror:
         print(f"mirror of {args.site} regenerated. While it is in mode: mirror, its plans must only import;")
-        print("nothing can be applied to it. Cutover: docs/IMPORT.md, \"Mirror mode\".")
+        print("only its state is updated, by import and refresh. Cutover: docs/IMPORT.md, \"Mirror mode\".")
         return 0
     print()
     print("next:")
@@ -8088,6 +8119,11 @@ Two rules, both mechanical so that nobody has to spot the problem in review:
 Handing an object back without deleting it (a removed block with
 destroy = false) shows as "forget" and is always allowed.
 
+--observe is stricter still, for a manager in mirror mode (scripts/tf.sh asks
+for it before applying to one): the plan may only import and leave alone.
+Every create, update, destroy (approved or not) and forget is refused, so what
+is applied can only bring Terraform's state up to date with NSX.
+
 Exit status: 0 the plan is allowed, 2 it is refused, 1 usage or input error.
 """
 
@@ -8095,6 +8131,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -8128,6 +8165,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--site", required=True)
     ap.add_argument("--stack", required=True)
+    ap.add_argument("--observe", action="store_true",
+                    help="mirror mode: only imports and no-ops; everything else is refused")
     ap.add_argument("plan_json", nargs="?", help="output of 'terraform show -json tfplan' (default: stdin)")
     args = ap.parse_args()
 
@@ -8155,6 +8194,9 @@ def main() -> int:
         importing = bool(c["change"].get("importing"))
         if importing:
             counts["import"] += 1
+        if args.observe and actions not in (["no-op"], ["read"]):
+            refused.append((address, f"{'/'.join(actions)} on a manager in mirror mode: only imports and refreshes are applied to it"))
+            continue
         if "delete" in actions:
             counts["destroy"] += 1
             kind = "replace" if "create" in actions else "destroy"
@@ -8178,13 +8220,14 @@ def main() -> int:
                 why = "the data does not match the live object yet" if importing else "a change mixed into an import tranche; adopt first, change in a later merge request"
                 refused.append((address, f"update during an import tranche: {why}"))
 
-    mode = "import tranche (must be pure)" if tranche else "normal"
+    mode = "mirror, observe only" if args.observe else "import tranche (must be pure)" if tranche else "normal"
     print(
         f"plan-guard {args.site}/{args.stack}, {mode}: "
         f"{counts['import']} import, {counts['create']} create, {counts['update']} update, "
         f"{counts['destroy']} destroy/replace, {counts['forget']} hand back"
     )
-    if leftover and not counts["import"]:
+    # A mirror's import file stays until cutover; it is not a finished tranche.
+    if leftover and not counts["import"] and os.environ.get("NSX_MODE") != "mirror":
         names = ", ".join(f"stacks/{args.stack}/{f.name}" for f in leftover)
         print(f"  note: {names} imports nothing new, so that tranche is applied. Delete the file(s)")
         print("        in their own merge request; until then this stack accepts imports only.")
@@ -8200,6 +8243,11 @@ def main() -> int:
     for address, why in refused:
         print(f"  x {address}")
         print(f"      {why}")
+    if os.environ.get("NSX_MODE") == "mirror":
+        print()
+        print(f"{args.site} is in mirror mode, so data/ is a copy of it. A difference here usually means it")
+        print("was changed in the UI after the last sync: the next sync brings that in. If it persists, the")
+        print("object named above cannot be copied exactly; hand it back (docs/IMPORT.md).")
     if destroy_lines:
         print()
         print("If, and only if, deleting those objects in NSX is the intent, approve each one")
@@ -8476,8 +8524,9 @@ write_file scripts/mirror.sh <<'SCAFFOLD_EOF'
 # objects engineers added, changed or deleted in the UI since the last merge.
 # When NSX matches the repository again, that merge request is closed.
 #
-# Only managers with mode: mirror are touched. Nothing is ever applied to them:
-# their plans only import, and no apply job exists until mode: managed.
+# Only managers in mirror mode are touched. Nothing is applied to NSX for them:
+# they have no apply job, and their sync-state job only imports and refreshes
+# Terraform's state, with the read-only credential, until mode: managed.
 #
 # Needs NSX_ADOPT_TOKEN, as the adopt job: a project access token with the api
 # and write_repository scopes. Masked and protected.
@@ -8504,12 +8553,12 @@ base="$(git rev-parse HEAD)"
 inventory="$(python3 - <<'PY'
 import sys
 sys.path.insert(0, "scripts")
-from ci_matrix_lib import managers
+from ci_matrix_lib import managers, mode_of
 for name, m in sorted(managers().items()):
     if m.get("enabled") is not False:
-        print(name, m.get("mode", "managed"))
+        print(name, mode_of(name, m))
 PY
-)"
+)" || die "cannot read the managers' modes (above)"
 mode_of() { awk -v s="$1" '$1 == s { print $2 }' <<<"$inventory"; }
 if [ "$MIRROR_SITE" = all ]; then
 	sites="$(awk '$2 == "mirror" { print $1 }' <<<"$inventory")"
@@ -8599,8 +8648,8 @@ for site in $sites; do
 		-c commit.gpgsign=false commit -q -m "Mirror $site from NSX
 
 Regenerated by scripts/mirror.sh in pipeline ${CI_PIPELINE_ID:-local}: what was
-added, changed or deleted in the NSX UI. $site is in mode: mirror, so this is
-never applied; its plans only import."
+added, changed or deleted in the NSX UI. $site is in mirror mode: nothing
+is applied to NSX; once merged, its state follows by import and refresh."
 	if ! push_branch "$branch"; then
 		echo "error: could not push $branch" >&2
 		failed+=("$site")
@@ -8623,9 +8672,9 @@ description = "\n".join([
     f"**{e['SITE']}** is in mirror mode: engineers change it in the NSX UI, and this merge request",
     "brings the repository up to date with what it holds now. It is regenerated on every sync until merged.",
     "",
-    "**Nothing is applied.** No apply job exists for a manager in mirror mode, and its plans may only import:",
-    "`scripts/plan-guard.py` fails the plan otherwise. A red plan here names an object that would not",
-    "import cleanly at cutover.",
+    "**Nothing is applied to NSX.** A manager in mirror mode has no apply job; once this is merged, its",
+    "`sync-state` job only imports and refreshes Terraform's state, with the read-only credential. The plan",
+    "here must only import: a red plan names an object that would not be taken over cleanly.",
     "",
     "| | file |", "|---|---|", *rows,
     "",
@@ -11540,6 +11589,12 @@ in Terraform.
 On a merge request it emits plan jobs only. On the default branch it emits plan
 jobs plus a MANUAL apply job per manager, each applying the plan artifact its
 own plan job produced — never a fresh one.
+
+A manager in mirror mode (inventory mode, or the CI/CD variable NSX_MODE_<SITE>)
+gets no apply job. On the default branch it gets an automatic sync-state job
+instead, which applies its plan only if that plan just imports and refreshes,
+with the read-only credential. Its plans do not hold up other managers' work:
+they may fail (shown as a warning) except in its own mirror merge request.
 """
 
 from __future__ import annotations
@@ -11553,6 +11608,7 @@ from ci_matrix_lib import entries  # noqa: E402
 
 DEFAULT_BRANCH = os.environ.get("CI_DEFAULT_BRANCH", "main")
 IS_DEFAULT_BRANCH = os.environ.get("CI_COMMIT_BRANCH") == DEFAULT_BRANCH
+MR_SOURCE = os.environ.get("CI_MERGE_REQUEST_SOURCE_BRANCH_NAME", "")
 
 # manual (default): merging queues the apply, and a human starts it with the
 # plan in front of them. auto: apply runs on merge, no second pause.
@@ -11631,16 +11687,40 @@ def main() -> int:
         out.append('      - "plan-$STACK-$SITE.txt"')
         out.append("    expire_in: 1 week")
         out.append("    when: always")
-        # A failed plan at one site must not hide the others.
-        out.append("  allow_failure: false")
+        # A failed plan at one site must not hide the others. A manager in
+        # mirror mode is the exception: it changes in the UI between syncs, and
+        # that must not block other managers' merge requests. Its own mirror
+        # merge request is held to a clean plan.
+        mirror = row.get("mode") == "mirror"
+        lenient = mirror and MR_SOURCE != f"mirror/{row['site']}"
+        out.append(f"  allow_failure: {'true' if lenient else 'false'}")
         out.append("")
 
         if not IS_DEFAULT_BRANCH:
             continue
-        # A manager in mirror mode is still run by hand in the UI: data/ only
-        # copies it, so nothing may be applied to it. Its plans still run, and
-        # prove the copy would import cleanly at cutover.
-        if row.get("mode") == "mirror":
+        if mirror:
+            # Still run from the UI: nothing is applied to it. Its state follows
+            # NSX instead: this plan is applied only if it just imports and
+            # refreshes (plan-guard --observe), with the read-only credential,
+            # so it cannot write to NSX. Automatic, as it changes nothing.
+            sync = job_name("sync-state", row)
+            out.append(f'"{sync}":')
+            out.append("  stage: apply")
+            out.append("  needs:")
+            out.append(f'    - job: "{plan}"')
+            out.append("      artifacts: true")
+            out.append("  allow_failure: true")
+            out.append(f"  resource_group: nsx-state-{row['site']}-{row['stack']}")
+            out.append("  variables:")
+            out.append(f'    SITE: "{row["site"]}"')
+            out.append(f'    STACK: "{row["stack"]}"')
+            out.append("    VAULT_TOKEN: $VAULT_PLAN_TOKEN")
+            out.append("    NSX_CRED_SCOPE: plan")
+            out.append("    APPROVE: \"yes\"")
+            out.append("  script:")
+            out.append('    - test -f "stacks/$STACK/tfplan" || { echo "no saved plan: its plan job failed; the next sync tries again" >&2; exit 1; }')
+            out.append('    - scripts/with-credentials.sh "$SITE" -- scripts/tf.sh apply "$STACK" "$SITE"')
+            out.append("")
             continue
 
         apply_job = job_name("apply", row)

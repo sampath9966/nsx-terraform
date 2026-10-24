@@ -15,17 +15,35 @@ cannot fix itself. Run it again after fixing whatever it reported.
 
 ## 1.3.0
 
-**Mirror mode: the whole manager in the repository, kept in step with the UI, until you cut over.** For a manager engineers still run from the UI. Give it `mode: mirror` in `inventory/managers.yaml` and schedule the new `mirror` job (*Build → Pipeline schedules*, variable `MIRROR_SITE` = `all` or a manager). Each sync reads the manager with the read-only plan credential and rewrites that manager's own files with every object the importer can represent exactly: groups, custom services, and distributed firewall policies and rules. Objects added in the UI are added, edited ones follow, deleted ones are removed. If the result matches the default branch nothing happens; otherwise the job force-pushes `mirror/<site>` and keeps one merge request up to date listing what was added, changed and deleted (`MIRROR_AUTO_MERGE=1` sets it to merge when its pipeline passes). An unchanged manager rewrites the same bytes, so a quiet manager produces no merge requests.
+**Mirror mode: the whole manager in the repository and in Terraform's state, following the UI, until you cut over.** For a manager engineers still run from the UI, while the other managers carry on as normal.
 
-Nothing is ever applied to a manager in mirror mode. The child pipeline has no apply job for it, GitHub Actions leaves it out of the apply matrix, and `scripts/tf.sh apply` refuses it whoever runs it. Its plans must be a pure import, so a green plan proves the copy would be taken over without changing anything. Cutover is a merge request changing `mode: mirror` to `mode: managed`: its plan imports everything, the apply records it in state and changes nothing in NSX, and the next plan reports no changes. `docs/IMPORT.md` has the steps, including the short UI freeze around cutover.
+**Turning it on.** Put a manager in mirror mode with the CI/CD variable `NSX_MODE_<SITE>` = `mirror`, with no commit (`hyd-gm01` is `NSX_MODE_HYD_GM01`), or with `mode: mirror` in `inventory/managers.yaml`. The variable wins. An unknown value stops the pipeline and names the variable.
 
-Mirror files start with `# nsx-mirror: <site>` and belong to the job: do not edit them. Objects declared in any other file (adopted by hand, or yours) are left to that file and reported as `MANAGED`. Objects that cannot be represented exactly stay in the UI and are reported as `NOT ADOPTED`, as with adoption. `scripts/import-estate.py --mirror` is the same conversion by hand. The inventory schema gains `mode` (`managed`, the default, or `mirror`), so nothing changes for a tree that does not use it.
+**The `mirror` job.** Schedule it under *Build → Pipeline schedules* with `MIRROR_SITE` = `all` or one manager, and `MIRROR_AUTO_MERGE` = `1` for hands-off. Each sync:
+- reads the manager with the read-only plan credential;
+- rewrites that manager's own files with every object the importer can represent exactly: groups, custom services, and distributed firewall policies and rules. Objects added, edited or deleted in the UI follow;
+- keeps one merge request up to date listing the changes, and does nothing when NSX matches the repository. An unchanged manager rewrites the same bytes.
+
+**State follows, NSX is never written.** On the default branch a mirror manager has no apply job. It gets an automatic `sync-state` job instead, which applies its plan only if the plan just imports and refreshes. `plan-guard --observe` refuses any create, update, destroy (approved or not) or hand-back, and `tf.sh` lets a mirror manager be applied only with the read-only credential. So new objects are imported, edited ones refreshed, and deleted ones leave state. A copy that is behind the UI is refused, never pushed back onto NSX, and the next sync brings the change in.
+
+**Other managers are not held up.** A mirror manager's plans may fail as a warning on other merge requests and on the default branch, so its UI churn never blocks other managers' work. Its own mirror merge request must plan cleanly. GitHub Actions leaves mirror managers out of the apply matrix.
+
+**Cutover.** Sync, check that the plan reports no changes, then switch the manager to managed. State already holds everything, so there is nothing to apply. Then delete the mirror's import file. `docs/IMPORT.md`, "Mirror mode", has the steps.
+
+**Mirror files.** They start with `# nsx-mirror: <site>` and belong to the job. Objects declared in other files are left to them (`MANAGED`); objects that cannot be represented exactly stay in the UI (`NOT ADOPTED`). `scripts/import-estate.py --mirror` is the same conversion by hand.
 
 **Tests:**
-- `tests/brownfield.sh` runs the job end to end against the mock manager, a bare git remote and a new fake GitLab API (`tests/fake_gitlab_api.py`). It covers: the first sync and its merge request; a second sync updating the same merge request with byte-identical files; nothing to do once merged (and the stale merge request closed); objects added, edited and deleted in the UI followed, import blocks and manifest included; auto-merge retried until GitLab accepts; managed managers refused; `MIRROR_SITE=all`; the token never in output; NSX only read; nothing applied whatever the plan.
-- `tests/ci-scripts.sh` covers the pipeline side: no apply job and no GitHub apply row for mirror managers, the schema, and the mirror job's rules.
-- `tests/brownfield-provider.sh` proves it with the real provider: the whole mirror plans as `8 to import, 0 to add, 0 to change, 0 to destroy`, apply is refused and no state is written; after `mode: managed` the same plan applies as imports only and the next plan reports no changes; NSX receives no write.
-- `tests/mock_nsx.py` now re-reads its data when it changes, to stand in for an engineer in the UI.
+- `tests/brownfield-provider.sh`, with the real provider:
+  - the whole copy plans as `8 to import, 0 to add, 0 to change, 0 to destroy`;
+  - the write credential is refused, and the read-only sync-state apply imports all 8;
+  - a UI change not yet synced is refused, by the plan and by the apply;
+  - after the sync, an edited group needs nothing and a new policy is imported, and state holds both;
+  - a policy deleted in the UI leaves state with nothing done in NSX;
+  - at cutover Terraform already holds everything;
+  - NSX receives no write.
+- `tests/brownfield.sh`: the mirror job end to end against the mock manager, a bare git remote and a new fake GitLab API (`tests/fake_gitlab_api.py`). Covers syncs, merge request updates and closure, add, edit and delete, auto-merge, `all`, managed managers refused, and token hygiene. Also `plan-guard --observe`, and `tf.sh` refusing the write credential and honouring `NSX_MODE_<SITE>`.
+- `tests/ci-scripts.sh`: the child pipeline. A mirror manager gets no apply job, an automatic read-only sync-state job, and a lenient plan except in its own mirror merge request. Managed managers keep manual applies and strict plans, the variable override works both ways, and an invalid value fails. Also the schema, the mirror job's rules, and the GitHub apply matrix.
+- `tests/mock_nsx.py` re-reads its data when it changes, to stand in for an engineer in the UI.
 
 ## 1.2.10
 

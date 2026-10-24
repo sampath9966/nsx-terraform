@@ -202,29 +202,79 @@ printf 'groups:\n  Ghost:\n    display_name: Ghost\n    owner: lm\n    sites: [l
 printf 'import {\n  for_each = var.site == "lon1" ? { "App-Web" = "/infra/domains/default/groups/App-Web" } : {}\n  to       = module.base_groups.nsxt_policy_group.this[each.key]\n  id       = each.value\n}\n' >stacks/local-security/import-lon1-ghost.tf
 check "a create during an import tranche is refused" grep -q "create during an import tranche" <<<"$(tf plan local-security lon1)"
 
-echo "mirror mode: the whole manager, then cutover"
-# A tree of its own, with no state yet: a manager still run from the UI.
+echo "mirror mode: state follows the UI until cutover"
+# A tree of its own, with no state yet: a manager still run from the UI. The
+# mock serves $T/reports/lon1-raw.json and re-reads it when it changes, so
+# editing that file is an engineer working in the UI.
+UI="$T/reports/lon1-raw.json"
 T2="$SCRATCH/tree2"
 generate "$T2" --no-examples
 cd "$T2" || exit 1
 printf 'managers:\n  lon1:\n    role: lm\n    host: 127.0.0.1:%s\n    site: lon1\n    vcf_instance: vcf-a\n    vault_path: secret/nsx/lon1\n    tier: prod\n    mode: mirror\n' "$port" >inventory/managers.yaml
 printf 'terraform {\n  backend "local" {}\n}\n' >stacks/local-security/backend_override.tf
-printf 'path = "%s/mirror-lon1.tfstate"\n' "$SCRATCH" >envs/lon1.backend.hcl
-mkdir -p reports
-out="$(env -u NSXT_MANAGER_HOST NSX_LON1_USERNAME=u NSX_LON1_PASSWORD=p scripts/with-credentials.sh lon1 --from env -- \
-	python3 scripts/import-estate.py --site lon1 --dump-only "$SCRATCH/mirror-cap.json" 2>&1 &&
-	python3 scripts/import-estate.py --site lon1 --from-dump "$SCRATCH/mirror-cap.json" --mirror 2>&1)"
-check "the mirror reads the whole manager through the same trust as plans" grep -q "mirror of lon1 regenerated" <<<"$out"
+# The placeholder backend: tf.sh keeps this manager's state here.
+STATE="$T2/.local-state/lon1-local-security.tfstate"
+printf 'path = "%s"\n' "$STATE" >envs/lon1.backend.hcl
+check "(setup) the tree is on the placeholder local backend" grep -q 'backend "local"' stacks/local-security/backend.tf
+sync() { # what the mirror job does: read the manager, rewrite the copy
+	env -u NSXT_MANAGER_HOST NSX_LON1_USERNAME=u NSX_LON1_PASSWORD=p scripts/with-credentials.sh lon1 --from env -- \
+		python3 scripts/import-estate.py --site lon1 --dump-only "$SCRATCH/mirror-cap.json" >/dev/null 2>&1 &&
+		python3 scripts/import-estate.py --site lon1 --from-dump "$SCRATCH/mirror-cap.json" --mirror 2>&1
+}
+observe() { APPROVE=yes NSX_CRED_SCOPE=plan tf apply local-security lon1; } # the sync-state job
+in_state() { python3 -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1]))["resources"]))' "$STATE" 2>/dev/null; }
+ui() { python3 - "$UI" "$1" <<'PY'
+import json, sys
+path, what = sys.argv[1], sys.argv[2]
+d = json.load(open(path)); D = "/infra/domains/default"
+if what == "edit-and-add":
+    for g in d["groups"]:
+        if g["id"] == "App-DB":
+            g["expression"][0]["value"] = "app|db-v2"
+    d["policies"].append({"id": "new-app", "path": f"{D}/security-policies/new-app", "display_name": "new-app",
+        "category": "Application", "sequence_number": 20, "stateful": True, "tcp_strict": True, "locked": False,
+        "scope": [f"{D}/groups/App-All"],
+        "rules": [{"id": "n1", "path": f"{D}/security-policies/new-app/rules/n1", "display_name": "n1", "sequence_number": 10,
+                   "action": "ALLOW", "direction": "IN_OUT", "ip_protocol": "IPV4_IPV6", "logged": False, "disabled": False,
+                   "sources_excluded": False, "destinations_excluded": False, "source_groups": [f"{D}/groups/App-Web"],
+                   "destination_groups": [f"{D}/groups/App-DB"], "services": ["ANY"], "scope": [f"{D}/groups/App-All"],
+                   "profiles": ["ANY"]}]})
+elif what == "delete":
+    d["policies"] = [p for p in d["policies"] if p["id"] != "new-app"]
+json.dump(d, open(path, "w"))
+PY
+}
+cp "$UI" "$SCRATCH/ui.orig"
+
+check "the mirror reads the whole manager through the same trust as plans" grep -q "mirror of lon1 regenerated" <<<"$(sync)"
 out="$(tf plan local-security lon1)"
-check "the real provider plans the whole mirror as a pure import" grep -q "Plan: 8 to import, 0 to add, 0 to change, 0 to destroy" <<<"$out"
-check "...which plan-guard accepts" grep -q "plan-guard: allowed" <<<"$out"
-check "nothing is applied while the manager is in mode: mirror" grep -q "lon1 is in mode: mirror" <<<"$(APPROVE=yes tf apply local-security lon1)"
-check "...and no state was written" test ! -s "$SCRATCH/mirror-lon1.tfstate"
-sed -i 's/^    mode: mirror$/    mode: managed/' inventory/managers.yaml
+check "the real provider plans the whole copy as a pure import" grep -q "Plan: 8 to import, 0 to add, 0 to change, 0 to destroy" <<<"$out"
+check "the write credential is refused for a manager in mirror mode" grep -q "only with the read-only credential" <<<"$(APPROVE=yes NSX_CRED_SCOPE=apply tf apply local-security lon1)"
+check "...and nothing reached state" bash -c '[ ! -s "$1" ] || [ "$(python3 -c "import json,sys;print(len(json.load(open(sys.argv[1]))[\"resources\"]))" "$1")" = 0 ]' _ "$STATE"
+check "the sync-state apply (read-only) imports everything into state" grep -q "Resources: 8 imported, 0 added, 0 changed, 0 destroyed" <<<"$(observe)"
+check "...the state file holds it" grep -q "legacy-app" <<<"$(in_state)"
+check "...after which the plan reports no changes" grep -q "No changes" <<<"$(tf plan local-security lon1)"
+
+ui edit-and-add
 out="$(tf plan local-security lon1)"
-check "cutover (mode: managed): the same plan, still a pure import" grep -q "Plan: 8 to import, 0 to add, 0 to change, 0 to destroy" <<<"$out"
-check "...applies as imports only" grep -q "Resources: 8 imported, 0 added, 0 changed, 0 destroyed" <<<"$(APPROVE=yes tf apply local-security lon1)"
-check "...and Terraform now owns the manager with nothing left to change" grep -q "No changes" <<<"$(tf plan local-security lon1)"
+check "a UI change not yet synced: the stale copy is refused, never pushed onto NSX" bash -c 'grep -q "plan-guard: REFUSED" <<<"$1" && grep -q "changed in the UI after the last sync" <<<"$1"' _ "$out"
+check "...and the sync-state apply refuses it too" grep -q "refusing to apply" <<<"$(observe)"
+sync >/dev/null
+out="$(tf plan local-security lon1)"
+check "after the sync: the edit needs nothing, the new policy is imported" grep -q "Plan: 2 to import, 0 to add, 0 to change, 0 to destroy" <<<"$out"
+check "...the sync-state apply records it" grep -q "Resources: 2 imported, 0 added, 0 changed, 0 destroyed" <<<"$(observe)"
+check "...and state now holds the edited group and the new policy" bash -c 'grep -q "app|db-v2" <<<"$1" && grep -q "new-app" <<<"$1"' _ "$(in_state)"
+
+ui delete
+sync >/dev/null
+out="$(tf plan local-security lon1)"
+check "a policy deleted in the UI: nothing to do in NSX" grep -q "0 import, 0 create, 0 update, 0 destroy/replace" <<<"$out"
+observe >/dev/null
+check "...and it is gone from state" bash -c '! grep -q "new-app" <<<"$1" && grep -q "legacy-app" <<<"$1"' _ "$(in_state)"
+
+out="$(NSX_MODE_LON1=managed tf plan local-security lon1)"
+check "cutover (NSX_MODE_LON1=managed, or mode: managed): Terraform already holds it all" grep -q "No changes" <<<"$out"
+cp "$SCRATCH/ui.orig" "$UI"
 cd "$T" || exit 1
 
 writes="$(grep WRITE "$SCRATCH/requests.log" | grep -vc "/api/session/create" || true)"
