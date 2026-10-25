@@ -221,7 +221,7 @@ sync() { # what the mirror job does: read the manager, rewrite the copy
 		python3 scripts/import-estate.py --site lon1 --dump-only "$SCRATCH/mirror-cap.json" >/dev/null 2>&1 &&
 		python3 scripts/import-estate.py --site lon1 --from-dump "$SCRATCH/mirror-cap.json" --mirror 2>&1
 }
-observe() { APPROVE=yes NSX_CRED_SCOPE=plan tf apply local-security lon1; } # the sync-state job
+observe() { APPROVE=yes NSX_CRED_SCOPE=plan scripts/sync-state.sh lon1 local-security 2>&1; } # the sync-state job: plans and applies
 in_state() { python3 -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1]))["resources"]))' "$STATE" 2>/dev/null; }
 ui() { python3 - "$UI" "$1" <<'PY'
 import json, sys

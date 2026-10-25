@@ -173,7 +173,23 @@ git_quiet -C "$T" commit -m "after update"
 # The harness pushes straight to main; a consumer opens a merge request. gitlab-setup.sh
 # protects main against direct pushes, so the harness lifts that for this project only.
 api -X DELETE "$API/protected_branches/main" >/dev/null
-check "(setup) the updated tree was pushed to GitLab" env GIT_SSL_CAINFO="$CA" git -C "$T" push -q "https://root:$tok@127.0.0.1:8443/root/nsx-terraform.git" HEAD:main
+# GitLab caches branch protection: a push right after the DELETE can still meet
+# the old rule. Wait for the API to say main is unprotected, then push, retrying
+# briefly; on a final failure git's own message is printed.
+for _ in $(seq 1 15); do
+	[ "$(api -o /dev/null -w '%{http_code}' "$API/protected_branches/main")" = 404 ] && break
+	sleep 2
+done
+push_main() {
+	local i
+	for i in 1 2 3 4 5; do
+		env GIT_SSL_CAINFO="$CA" git -C "$T" push -q "https://root:$tok@127.0.0.1:8443/root/nsx-terraform.git" HEAD:main 2>"$SCRATCH/push.err" && return 0
+		sleep $((i * 3))
+	done
+	sed 's/^/    /' "$SCRATCH/push.err" | sed "s/$tok/***/g" >&2
+	return 1
+}
+check "(setup) the updated tree was pushed to GitLab" push_main
 before_id="$(api "$API/pipelines?ref=main&per_page=1" | python3 "$HELPER" first-id)"
 api -X POST "$API/pipeline?ref=main" >/dev/null
 # The validate stage is offline (no Vault, no NSX), so it must pass. 'terraform' needs
