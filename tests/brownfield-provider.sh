@@ -491,7 +491,13 @@ d["policies"] += [
                 rule("CSS", "same-b", 470, [G("Empty-Placeholder")], ["ANY"], [f"{SV}/FTP-ALG", f"{SV}/IGMP-Any"]),
                 rule("CSS", "pods", 900, [G("Pods")], ["ANY"], ["ANY"])], desc='quoted "text"\nand a line'),
     pol("CSS-LbTAAIz-d", [rule("CSS-LbTAAIz-d", "r1", 10, [G("Not-Scope")], ["ANY"], ["ANY"]),
-                          rule("CSS-LbTAAIz-d", "r2", 20, [G("Name-Prefix")], ["ANY"], [f"{SV}/HTTPS"])]),
+                          rule("CSS-LbTAAIz-d", "r2", 20, [G("Name-Prefix")], ["ANY"], [f"{SV}/HTTPS"]),
+                          dict(rule("CSS-LbTAAIz-d", "inline", 30, [G("Name-Prefix")], ["ANY"], ["ANY"]),
+                               service_entries=[{"resource_type": "L4PortSetServiceEntry", "display_name": "t8080", "l4_protocol": "TCP",
+                                                 "destination_ports": ["8080", "8443"], "source_ports": []},
+                                                {"resource_type": "ICMPTypeServiceEntry", "display_name": "echo", "protocol": "ICMPv4",
+                                                 "icmp_type": 8}])]),
+    pol("Empty-Placeholder-Pol", []),
 ]
 json.dump(d, open(sys.argv[1], "w"))
 PY
@@ -513,6 +519,57 @@ out="$(tf plan local-security lon1)"
 check "the real provider plans it as a pure import: two HTTPS, empty and IP-only groups, MAC, ALG, IGMP, GRE, sequence 0" bash -c 'grep -qE "Plan: [0-9]+ to import, 0 to add, 0 to change, 0 to destroy" <<<"$1" && grep -q "plan-guard: allowed" <<<"$1"' _ "$out"
 check "...and it applies as imports only" grep -qE "Resources: [0-9]+ imported, 0 added, 0 changed, 0 destroyed" <<<"$(APPROVE=yes tf apply local-security lon1)"
 check "...after which the plan is empty: everything read back as written" grep -q "No changes" <<<"$(tf plan local-security lon1)"
+check "...a rule with ports written in it and an empty policy among them" bash -c 'grep -q "^  inline:" "data/policies/CSS-LbTAAIz-d.yaml" && test -f "data/policies/Empty-Placeholder-Pol.yaml"'
+
+# The same ids in a second domain: a group and a policy with the ids of ones in
+# default, managed side by side under <id>@<domain> keys with their NSX ids.
+python3 - "$UI" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1])); O = "/infra/domains/other"
+d["groups"].append({"id": "Name-Prefix", "path": f"{O}/groups/Name-Prefix", "display_name": "Name-Prefix",
+                    "expression": [{"resource_type": "Condition", "key": "Tag", "member_type": "VirtualMachine", "operator": "EQUALS", "value": "app|other"}]})
+d["policies"].append({"id": "CSS", "path": f"{O}/security-policies/CSS", "display_name": "CSS", "category": "Application", "sequence_number": 5,
+    "stateful": True, "tcp_strict": True, "locked": False, "scope": ["ANY"],
+    "rules": [{"id": "o1", "path": f"{O}/security-policies/CSS/rules/o1", "display_name": "o1", "sequence_number": 10, "action": "ALLOW",
+               "direction": "IN_OUT", "ip_protocol": "IPV4_IPV6", "logged": False, "disabled": False, "sources_excluded": False,
+               "destinations_excluded": False, "source_groups": [f"{O}/groups/Name-Prefix"], "destination_groups": ["ANY"],
+               "services": ["ANY"], "scope": ["ANY"], "profiles": ["ANY"]}]})
+json.dump(d, open(sys.argv[1], "w"))
+PY
+python3 - <<'PY'
+import json
+open("data/groups/other-domain.yaml", "w").write(
+    "groups:\n  Name-Prefix@other:\n    display_name: Name-Prefix\n    nsx_id: Name-Prefix\n    domain: other\n    owner: lm\n"
+    "    sites: [lon1]\n    criteria:\n      - conditions:\n          - {key: Tag, member_type: VirtualMachine, operator: EQUALS, value: \"app|other\"}\n")
+open("data/policies/CSS@other.yaml", "w").write(
+    "policy:\n  id: CSS\n  name: CSS\n  category: Application\n  owner: lm\n  domain: other\n  sites: [lon1]\n  sequence_number: 5\n"
+    "  rule_management: standalone\n  scope: [ANY]\nrules:\n  o1:\n    name: o1\n    sequence_number: 10\n    action: ALLOW\n"
+    "    direction: IN_OUT\n    source_groups: [Name-Prefix@other]\n    logged: false\n    scope: [ANY]\n")
+m = json.load(open("data/.import-manifest.json"))
+m["imported"] += ["data/groups/other-domain.yaml", "data/policies/CSS@other.yaml"]
+json.dump(m, open("data/.import-manifest.json", "w"), indent=2)
+O = "/infra/domains/other"
+open("stacks/local-security/import-lon1-other.tf", "w").write(f'''import {{
+  to = module.base_groups.nsxt_policy_group.this["Name-Prefix@other"]
+  id = "{O}/groups/Name-Prefix"
+}}
+
+import {{
+  to = module.policies["CSS@other"].nsxt_policy_parent_security_policy.this
+  id = "{O}/security-policies/CSS"
+}}
+
+import {{
+  to = module.policies["CSS@other"].nsxt_policy_security_policy_rule.this["o1"]
+  id = "{O}/security-policies/CSS/rules/o1"
+}}
+''')
+PY
+check "(setup) the second domain's copies validate beside the first ones" bash -c 'NSX_YAML_FALLBACK=1 python3 scripts/validate-data.py 2>&1 | grep -q "0 error(s)"'
+out="$(tf plan local-security lon1)"
+check "the real provider imports the same ids from another domain, by their NSX ids, beside the default ones" bash -c 'grep -q "Plan: 3 to import, 0 to add, 0 to change, 0 to destroy" <<<"$1" && grep -q "/infra/domains/other/groups/Name-Prefix" <<<"$1"' _ "$out"
+check "...it applies as imports only" grep -q "Resources: 3 imported, 0 added, 0 changed, 0 destroyed" <<<"$(APPROVE=yes tf apply local-security lon1)"
+check "...and the next plan is empty: both copies of each id read back as written" grep -q "No changes" <<<"$(tf plan local-security lon1)"
 cp "$SCRATCH/ui.before-prod" "$UI"
 cd "$T" || exit 1
 

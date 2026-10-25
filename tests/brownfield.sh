@@ -107,9 +107,9 @@ echo "importer: never lossy"
 check "an identity (AD) group is not adopted, and says why" grep -q "group Mac: membership by IdentityGroupExpression" <<<"$out"
 check "a group nesting it is not adopted" grep -q "group Nests-Mac: nests Mac" <<<"$out"
 check "a service with an entry type that cannot be represented is not adopted" grep -q "service GRE: service entries of type NestedServiceServiceEntry" <<<"$out"
-check "a rule with inline service entries stays in the UI" grep -q "rule legacy-app/inline: inline service entries" <<<"$out"
+check "a rule with ports written in it is adopted" bash -c '! grep -q "rule legacy-app/inline" <<<"$1"' _ "$out"
 check "rules using unadoptable objects stay in the UI" bash -c 'grep -q "rule legacy-app/printers: uses Nests-Mac" <<<"$1" && grep -q "rule legacy-app/gre: uses GRE" <<<"$1"' _ "$out"
-check "the rest of the policy is still adopted" bash -c 'grep -q "^  web-to-db:" <<<"$1" && grep -q "^  jump-https:" <<<"$1" && ! grep -q "^  inline:" <<<"$1"' _ "$P"
+check "...with the rest of the policy" bash -c 'grep -q "^  web-to-db:" <<<"$1" && grep -q "^  jump-https:" <<<"$1" && grep -q "^  inline:" <<<"$1"' _ "$P"
 check "a requested policy whose Apply To is unadoptable is refused, nothing written" bash -c '! out="$(python3 scripts/import-estate.py --site lon1 --from-dump reports/lon1-raw.json --policy mac-scoped 2>&1)" && grep -q "Nothing was written" <<<"$out" && ! test -f data/policies/mac-scoped.yaml'
 check "the result validates" bash -c 'python3 scripts/validate-data.py >/dev/null 2>&1 || python3 scripts/validate-data.py 2>&1 | grep -q "0 error"'
 
@@ -567,7 +567,7 @@ check "a rule using a global group data/ does not declare stays in the UI, and s
 check "a rule and a policy applied to ANY are written as ANY, not as a missing Apply To" bash -c 'python3 -c "import yaml,sys;d=yaml.safe_load(open(\"data/policies/g-pol.yaml\"));sys.exit(0 if d[\"rules\"][\"g1\"][\"scope\"]==[\"ANY\"] else 1)"' 
 check "no raw policy path is written anywhere" bash -c '! grep -rn "/global-infra/\|\"/infra/\| /infra/" data/groups data/policies data/services'
 check "the copy validates, HTTPS named by both managers included" python3 scripts/validate-data.py
-check "the LM stack resolves GM-owned names to their global paths, and never manages them" bash -c 'grep -q "global_group_paths" stacks/local-security/main.tf && grep -q "/global-infra/domains/\${try(g.domain, \"default\")}/groups/\${k}" stacks/local-security/main.tf && grep -q "if try(g.owner, \"lm\") == \"lm\"" stacks/local-security/main.tf'
+check "the LM stack resolves GM-owned names to their global paths, and never manages them" bash -c 'grep -q "global_group_paths" stacks/local-security/main.tf && grep -q "/global-infra/domains/\${try(g.domain, \"default\")}/groups/\${try(g.nsx_id, k)}" stacks/local-security/main.tf && grep -q "if try(g.owner, \"lm\") == \"lm\"" stacks/local-security/main.tf'
 before="$(cat data/groups/*.yaml data/services/*.yaml data/policies/*.yaml stacks/*/import-*.tf | sha256sum)"
 mir gm1 >/dev/null; mir lon1 >/dev/null
 check "syncing both again changes nothing" test "$(cat data/groups/*.yaml data/services/*.yaml data/policies/*.yaml stacks/*/import-*.tf | sha256sum)" = "$before"
@@ -609,8 +609,15 @@ gm = {"domain": "default", "domains": ["default", "WL-Mum"],
       "policies": [pol(GD, "g-pol", [
                        rule(GD, "g-pol", "uses-location-group", [f"{GD}/groups/VM-Jump"], [f"{WD}/groups/M-App"], 100),
                        rule(GD, "g-pol", "ips", ["172.19.20.57", "10.1.0.0/16"], ["172.17.9.10-172.17.9.20"], 200),
-                       rule(GD, "g-pol", "uses-clash", [f"{WD}/groups/Clash"], ["ANY"], 300)]),
-                   pol(WD, "mum-pol", [rule(WD, "mum-pol", "m1", [f"{WD}/groups/M-App"], ["ANY"], 100)])]}
+                       rule(GD, "g-pol", "uses-clash", [f"{WD}/groups/Clash"], ["ANY"], 300),
+                       dict(rule(GD, "g-pol", "inline-ports", ["ANY"], [f"{GD}/groups/Clash"], 400), services=["ANY"],
+                            service_entries=[{"resource_type": "L4PortSetServiceEntry", "display_name": "t8080", "l4_protocol": "TCP",
+                                              "destination_ports": ["8080"], "source_ports": []}])]),
+                   pol(WD, "mum-pol", [rule(WD, "mum-pol", "m1", [f"{WD}/groups/M-App"], ["ANY"], 100)]),
+                   # The same policy id in two domains, and a policy NSX holds empty.
+                   pol(GD, "CSS", [rule(GD, "CSS", "c1", [f"{GD}/groups/Clash"], ["ANY"], 100)]),
+                   pol(WD, "CSS", [rule(WD, "CSS", "c1", [f"{WD}/groups/Clash"], ["ANY"], 100)]),
+                   pol(GD, "placeholder", [])]}
 json.dump(gm, open("reports/gm1.json", "w"))
 lm = {"domain": "default",
       "groups": [grp(LD, "L-App", cond("app|l"))], "services": [],
@@ -622,13 +629,17 @@ out="$(mir lon1)"
 G="$(cat data/groups/imported-gm1-mirror.yaml)"
 check "a group of VMs picked one by one is adopted, as external ids" bash -c 'python3 -c "import yaml,sys;g=yaml.safe_load(sys.stdin)[\"groups\"][\"VM-Jump\"];c=g[\"criteria\"][0];sys.exit(0 if c[\"member_type\"]==\"VirtualMachine\" and len(c[\"external_ids\"])==2 and g[\"why_static\"] else 1)" <<<"$1"' _ "$G"
 check "a rule with IP addresses, a CIDR and a range is adopted, with them as written" bash -c 'python3 -c "import yaml,sys;r=yaml.safe_load(open(\"data/policies/g-pol.yaml\"))[\"rules\"][\"ips\"];sys.exit(0 if r[\"source_groups\"]==[\"172.19.20.57\",\"10.1.0.0/16\"] and r[\"destination_groups\"]==[\"172.17.9.10-172.17.9.20\"] else 1)"'
-check "a location domain's group is adopted, keeping its domain" bash -c 'python3 -c "import yaml,sys;g=yaml.safe_load(sys.stdin)[\"groups\"][\"M-App\"];sys.exit(0 if g[\"domain\"]==\"WL-Mum\" else 1)" <<<"$1"' _ "$G"
-check "...and a global rule using it is adopted" bash -c 'python3 -c "import yaml,sys;r=yaml.safe_load(open(\"data/policies/g-pol.yaml\"))[\"rules\"][\"uses-location-group\"];sys.exit(0 if r[\"destination_groups\"]==[\"M-App\"] else 1)"'
-check "a location domain's policy is adopted in its domain" bash -c 'python3 -c "import yaml,sys;p=yaml.safe_load(open(\"data/policies/mum-pol.yaml\"))[\"policy\"];sys.exit(0 if p[\"domain\"]==\"WL-Mum\" else 1)"'
-check "an id in two domains: the global domain's is adopted, the other stays in the UI, and says why" bash -c 'python3 -c "import yaml,sys;g=yaml.safe_load(sys.stdin)[\"groups\"][\"Clash\"];sys.exit(0 if \"domain\" not in g else 1)" <<<"$1" && grep -q "group Clash: its id is also a group in domain default" <<<"$2"' _ "$G" "$out_gm"
-check "...with the rule using the other one" bash -c 'grep -q "rule g-pol/uses-clash: uses Clash" <<<"$1"' _ "$out_gm"
-check "a Local Manager rule using a location domain's global group is adopted" bash -c 'python3 -c "import yaml,sys;r=yaml.safe_load(open(\"data/policies/l-pol.yaml\"))[\"rules\"][\"r1\"];sys.exit(0 if r[\"source_groups\"]==[\"M-App\"] else 1)"'
-check "import ids keep each object's own domain" bash -c 'grep -q "/global-infra/domains/WL-Mum/groups/M-App" stacks/global-security/import-gm1-mirror.tf && grep -q "/global-infra/domains/WL-Mum/security-policies/mum-pol\"" stacks/global-security/import-gm1-mirror.tf'
+check "a location domain's group is adopted as <id>@<domain>, with its domain and its NSX id" bash -c 'python3 -c "import yaml,sys;g=yaml.safe_load(sys.stdin)[\"groups\"][\"M-App@WL-Mum\"];sys.exit(0 if g[\"domain\"]==\"WL-Mum\" and g[\"nsx_id\"]==\"M-App\" else 1)" <<<"$1"' _ "$G"
+check "...and a global rule using it is adopted, naming it by that key" bash -c 'python3 -c "import yaml,sys;r=yaml.safe_load(open(\"data/policies/g-pol.yaml\"))[\"rules\"][\"uses-location-group\"];sys.exit(0 if r[\"destination_groups\"]==[\"M-App@WL-Mum\"] else 1)"'
+check "a location domain's policy is adopted in its domain, in <id>@<domain>.yaml, with its NSX id" bash -c 'python3 -c "import yaml,sys;p=yaml.safe_load(open(\"data/policies/mum-pol@WL-Mum.yaml\"))[\"policy\"];sys.exit(0 if p[\"domain\"]==\"WL-Mum\" and p[\"id\"]==\"mum-pol\" else 1)"'
+check "the same group id in two domains: both adopted, each under its own key" bash -c 'python3 -c "import yaml,sys;g=yaml.safe_load(sys.stdin)[\"groups\"];sys.exit(0 if \"domain\" not in g[\"Clash\"] and g[\"Clash@WL-Mum\"][\"nsx_id\"]==\"Clash\" else 1)" <<<"$1" && ! grep -q "NOT ADOPTED" <<<"$2"' _ "$G" "$out_gm"
+check "...and the rule using the other one is adopted, naming that one" bash -c 'python3 -c "import yaml,sys;r=yaml.safe_load(open(\"data/policies/g-pol.yaml\"))[\"rules\"][\"uses-clash\"];sys.exit(0 if r[\"source_groups\"]==[\"Clash@WL-Mum\"] else 1)"'
+check "the same policy id in two domains: both adopted, one file each" bash -c 'python3 -c "import yaml,sys;a=yaml.safe_load(open(\"data/policies/CSS.yaml\"));b=yaml.safe_load(open(\"data/policies/CSS@WL-Mum.yaml\"));sys.exit(0 if a[\"policy\"][\"id\"]==b[\"policy\"][\"id\"]==\"CSS\" and b[\"policy\"][\"domain\"]==\"WL-Mum\" and a[\"rules\"][\"c1\"][\"source_groups\"]==[\"Clash\"] and b[\"rules\"][\"c1\"][\"source_groups\"]==[\"Clash@WL-Mum\"] else 1)"'
+check "a policy NSX holds empty is adopted, empty" bash -c 'python3 -c "import yaml,sys;d=yaml.safe_load(open(\"data/policies/placeholder.yaml\"));sys.exit(0 if not d.get(\"rules\") else 1)"'
+check "a rule with ports written in it is adopted, with them" bash -c 'python3 -c "import yaml,sys;r=yaml.safe_load(open(\"data/policies/g-pol.yaml\"))[\"rules\"][\"inline-ports\"];e=r[\"service_entries\"][\"l4_port_set\"][0];sys.exit(0 if e[\"protocol\"]==\"TCP\" and e[\"destination_ports\"]==[\"8080\"] else 1)"'
+check "a Local Manager rule using a location domain's global group is adopted" bash -c 'python3 -c "import yaml,sys;r=yaml.safe_load(open(\"data/policies/l-pol.yaml\"))[\"rules\"][\"r1\"];sys.exit(0 if r[\"source_groups\"]==[\"M-App@WL-Mum\"] else 1)"'
+check "...and the Local Manager stack finds it by its NSX id, in its domain" bash -c 'grep -q "groups/\${try(g.nsx_id, k)}" stacks/local-security/main.tf'
+check "import ids keep each object's own domain and NSX id" bash -c 'grep -q "\"Clash@WL-Mum\" *= \"/global-infra/domains/WL-Mum/groups/Clash\"" stacks/global-security/import-gm1-mirror.tf && grep -q "/global-infra/domains/WL-Mum/security-policies/mum-pol\"" stacks/global-security/import-gm1-mirror.tf'
 check "it all validates" python3 scripts/validate-data.py
 check "the group module builds external ids" grep -q "external_id_expression" modules/group/main.tf
 check "the policy module takes an address in a rule without looking it up as a group" bash -c 'grep -q "ip_literal" modules/dfw-policy/main.tf'
