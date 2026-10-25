@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.5.3"
+VERSION="1.5.4"
 
 ROOT="$PWD"
 FORCE=0
@@ -3731,7 +3731,7 @@ locals {
   # logical name resolved to a policy path here, so no raw /infra/... path ever
   # appears in data/. A group of the same name wins over a literal.
   resolvable = concat(keys(var.group_paths), ["ANY"])
-  ip_literal = "^([0-9]{1,3}(\\.[0-9]{1,3}){3}(/[0-9]{1,2})?(-[0-9]{1,3}(\\.[0-9]{1,3}){3})?|[0-9A-Fa-f]*:[0-9A-Fa-f:.]*(/[0-9]{1,3})?(-[0-9A-Fa-f]*:[0-9A-Fa-f:.]*)?)$"
+  ip_literal = "^([0-9]{1,3}(\\.[0-9]{1,3}){3}(/[0-9]{1,2})?( *- *[0-9]{1,3}(\\.[0-9]{1,3}){3})?|[0-9A-Fa-f]*:[0-9A-Fa-f:.]*(/[0-9]{1,3})?( *- *[0-9A-Fa-f]*:[0-9A-Fa-f:.]*)?)$"
 
   policy_scope = [for g in var.policy.scope : var.group_paths[g] if g != "ANY"]
 
@@ -6491,10 +6491,14 @@ from yamlcompat import load_yaml  # noqa: E402
 
 
 def is_ip_literal(value: str) -> bool:
-    """An address, CIDR or range (a-b), as NSX takes in a rule's source or destination."""
+    """An address, CIDR or range (a-b, or a - b as the NSX UI writes it), as NSX
+    takes in a rule's source or destination."""
+    parts = value.split("-", 1)
+    if parts[0] != parts[0].lstrip() or parts[-1] != parts[-1].rstrip():
+        return False
     try:
-        for part in value.split("-", 1):
-            ipaddress.ip_network(part, strict=False)
+        for part in parts:
+            ipaddress.ip_network(part.strip(), strict=False)
         return True
     except ValueError:
         return False
@@ -8038,10 +8042,14 @@ def domain_of(path: str, default: str) -> str:
 
 
 def is_ip_literal(value: str) -> bool:
-    """An address, CIDR or range (a-b), as NSX takes in a rule's source or destination."""
+    """An address, CIDR or range (a-b, or a - b as the NSX UI writes it), as NSX
+    takes in a rule's source or destination."""
+    parts = value.split("-", 1)
+    if parts[0] != parts[0].lstrip() or parts[-1] != parts[-1].rstrip():
+        return False
     try:
-        for part in value.split("-", 1):
-            ipaddress.ip_network(part, strict=False)
+        for part in parts:
+            ipaddress.ip_network(part.strip(), strict=False)
         return True
     except ValueError:
         return False

@@ -13,6 +13,10 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.5.4
+
+**IP ranges written with spaces are adopted.** The NSX UI stores a range typed in a rule's source or destination as `13.126.23.128 - 13.126.23.135`, with spaces around the dash. The importer, the validator and the policy module only knew `a-b`, so such a rule stayed in the UI as "refers to 13.126.23.128 - 13.126.23.135, which hyd-gm01 does not hold". The range is now adopted exactly as NSX holds it, so the plan stays a pure import.
+
 ## 1.5.3
 
 **The same id in several Global Manager domains is several objects, all adopted.** On a Global Manager the same group and policy names exist in `default` and in each location domain (`H-TIG-PR-AZAC01`, `CSS`, `PSG`...). data/ named objects by id alone, so 1.5.0 left every second copy in the UI, and with it every rule using one and every policy left with no rule: most of hyd-gm01. data/ now keys objects as NSX does, by domain and id: in `default` by the id, in any other domain as `<id>@<domain>` (`CSS@app_non_pord.yaml`, group `H-TIG-PR-AZAC01@WL-Hyd`) with `nsx_id:` and `domain:`. Always, not only on a clash, so a key never changes later (a changed key would be a destroy and create). The group module creates by `nsx_id`, the Local Manager stack finds Global Manager groups by `nsx_id` in their domain, and policy ids are unique per domain in the validator.
