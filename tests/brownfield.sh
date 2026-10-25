@@ -608,7 +608,7 @@ gm = {"domain": "default", "domains": ["default", "WL-Mum"],
       "services": [],
       "policies": [pol(GD, "g-pol", [
                        rule(GD, "g-pol", "uses-location-group", [f"{GD}/groups/VM-Jump"], [f"{WD}/groups/M-App"], 100),
-                       rule(GD, "g-pol", "ips", ["172.19.20.57", "10.1.0.0/16"], ["172.17.9.10-172.17.9.20"], 200),
+                       rule(GD, "g-pol", "ips", ["172.19.20.57", "10.1.0.0/16"], ["172.17.9.10-172.17.9.20", "13.126.23.128 - 13.126.23.135"], 200),
                        rule(GD, "g-pol", "uses-clash", [f"{WD}/groups/Clash"], ["ANY"], 300),
                        dict(rule(GD, "g-pol", "inline-ports", ["ANY"], [f"{GD}/groups/Clash"], 400), services=["ANY"],
                             service_entries=[{"resource_type": "L4PortSetServiceEntry", "display_name": "t8080", "l4_protocol": "TCP",
@@ -628,7 +628,7 @@ out_gm="$(mir gm1)"
 out="$(mir lon1)"
 G="$(cat data/groups/imported-gm1-mirror.yaml)"
 check "a group of VMs picked one by one is adopted, as external ids" bash -c 'python3 -c "import yaml,sys;g=yaml.safe_load(sys.stdin)[\"groups\"][\"VM-Jump\"];c=g[\"criteria\"][0];sys.exit(0 if c[\"member_type\"]==\"VirtualMachine\" and len(c[\"external_ids\"])==2 and g[\"why_static\"] else 1)" <<<"$1"' _ "$G"
-check "a rule with IP addresses, a CIDR and a range is adopted, with them as written" bash -c 'python3 -c "import yaml,sys;r=yaml.safe_load(open(\"data/policies/g-pol.yaml\"))[\"rules\"][\"ips\"];sys.exit(0 if r[\"source_groups\"]==[\"172.19.20.57\",\"10.1.0.0/16\"] and r[\"destination_groups\"]==[\"172.17.9.10-172.17.9.20\"] else 1)"'
+check "a rule with IP addresses, a CIDR and ranges (also spaced, as the UI writes them) is adopted, with them as written" bash -c 'python3 -c "import yaml,sys;r=yaml.safe_load(open(\"data/policies/g-pol.yaml\"))[\"rules\"][\"ips\"];sys.exit(0 if r[\"source_groups\"]==[\"172.19.20.57\",\"10.1.0.0/16\"] and r[\"destination_groups\"]==[\"172.17.9.10-172.17.9.20\",\"13.126.23.128 - 13.126.23.135\"] else 1)"'
 check "a location domain's group is adopted as <id>@<domain>, with its domain and its NSX id" bash -c 'python3 -c "import yaml,sys;g=yaml.safe_load(sys.stdin)[\"groups\"][\"M-App@WL-Mum\"];sys.exit(0 if g[\"domain\"]==\"WL-Mum\" and g[\"nsx_id\"]==\"M-App\" else 1)" <<<"$1"' _ "$G"
 check "...and a global rule using it is adopted, naming it by that key" bash -c 'python3 -c "import yaml,sys;r=yaml.safe_load(open(\"data/policies/g-pol.yaml\"))[\"rules\"][\"uses-location-group\"];sys.exit(0 if r[\"destination_groups\"]==[\"M-App@WL-Mum\"] else 1)"'
 check "a location domain's policy is adopted in its domain, in <id>@<domain>.yaml, with its NSX id" bash -c 'python3 -c "import yaml,sys;p=yaml.safe_load(open(\"data/policies/mum-pol@WL-Mum.yaml\"))[\"policy\"];sys.exit(0 if p[\"domain\"]==\"WL-Mum\" and p[\"id\"]==\"mum-pol\" else 1)"'

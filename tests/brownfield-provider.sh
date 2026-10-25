@@ -418,7 +418,7 @@ def rule(i, seq, src, dst):
 d["policies"].append({"id": "_Shapes App", "path": f"{LD}/security-policies/_Shapes App", "display_name": "_Shapes App",
     "category": "Application", "sequence_number": 40, "stateful": True, "tcp_strict": True, "locked": False, "scope": ["ANY"],
     "rules": [rule("vm-members", 100, [f"{LD}/groups/_Exchange-GW_VM's"], [f"{LD}/groups/App-DB"]),
-              rule("addresses", 200, ["172.19.20.57", "10.1.0.0/16"], ["172.17.9.10-172.17.9.20", f"{LD}/groups/App-DB"]),
+              rule("addresses", 200, ["172.19.20.57", "10.1.0.0/16"], ["172.17.9.10-172.17.9.20", "13.126.23.128 - 13.126.23.135", f"{LD}/groups/App-DB"]),
               rule("location-group", 300, [f"{WD}/groups/M-App"], [f"{LD}/groups/App-DB"])]})
 json.dump(d, open(sys.argv[1], "w"))
 PY
