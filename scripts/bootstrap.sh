@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.5.2"
+VERSION="1.5.3"
 
 ROOT="$PWD"
 FORCE=0
@@ -1444,10 +1444,12 @@ it:
 
 - The GM's copy is read from the global tree (`/global-infra`), in every domain:
   `default` (or the inventory's `domain`) first, then each location domain such
-  as `WL-Mum`. Its objects are `owner: gm`; one outside `default` keeps its
-  `domain:`, so it is created there and Local Managers find it under that
-  domain. data/ names objects by id alone, so an id found in two domains is
-  taken from the first and left in the UI in the other. A Local Manager also lists
+  as `WL-Mum`. Its objects are `owner: gm`. data/ keys them as NSX does, by
+  domain and id: an object in `default` by its id, one in any other domain as
+  `<id>@<domain>` (`CSS@app_non_pord`, `H-TIG-PR-AZAC01@WL-Hyd`) with `nsx_id:`
+  and `domain:`, always, so the same id in several domains is several objects
+  and a key never changes. Rules name them by those keys; Local Managers find
+  them by their NSX id in their domain. A Local Manager also lists
   the GM's objects; its copy never takes them (`NOT ADOPTED ... belongs to the
   Global Manager`).
 - A site-local rule that uses a global group or service names it, and the
@@ -1545,9 +1547,9 @@ any setting it does not manage:
   equals (the provider cannot carry it); and groups that nest one of those;
 - services with a nested-service entry, or an ALG entry with other than one
   destination port;
-- rules with inline service entries, or that use one of the above. The rest of
-  their policy is still adopted: Terraform manages rules one by one and leaves
-  the others alone;
+- rules that use one of the above (ports written in the rule itself are taken,
+  as `service_entries`). The rest of their policy is still adopted: Terraform
+  manages rules one by one and leaves the others alone;
 - a policy whose Apply To uses one of the above.
 
 ## 3. Read what it produced
@@ -2799,6 +2801,11 @@ write_file data/schema/group.schema.json <<'SCAFFOLD_EOF'
             "description": "gm: created on the Global Manager, usable by GM policies. lm: site-local."
           },
           "domain": { "type": "string" },
+          "nsx_id": {
+            "type": "string",
+            "pattern": "^[^/]{1,255}$",
+            "description": "The group's id in NSX, when the key is not: <id>@<domain> for a group outside the default domain."
+          },
           "sites": {
             "type": "array",
             "items": { "type": "string" },
@@ -2949,7 +2956,6 @@ write_file data/schema/policy.schema.json <<'SCAFFOLD_EOF'
     },
     "rules": {
       "type": "object",
-      "minProperties": 1,
       "propertyNames": { "pattern": "^[^/]{1,255}$" },
       "additionalProperties": {
         "type": "object",
@@ -2973,6 +2979,7 @@ write_file data/schema/policy.schema.json <<'SCAFFOLD_EOF'
           "sources_excluded": { "type": "boolean" },
           "destinations_excluded": { "type": "boolean" },
           "services": { "type": "array", "items": { "type": "string" } },
+          "service_entries": {"type": "object", "additionalProperties": false, "minProperties": 1, "description": "Ports written in the rule itself (the UI's raw port-protocol): the same entries a custom service holds.", "properties": {"l4_port_set": {"type": "array", "items": {"type": "object", "required": ["protocol", "destination_ports"], "additionalProperties": false, "properties": {"display_name": {"type": "string"}, "protocol": {"enum": ["TCP", "UDP"]}, "destination_ports": {"type": "array", "items": {"type": "string"}}, "source_ports": {"type": "array", "items": {"type": "string"}}}}}, "icmp": {"type": "array", "items": {"type": "object", "required": ["protocol"], "additionalProperties": false, "properties": {"display_name": {"type": "string"}, "protocol": {"enum": ["ICMPv4", "ICMPv6"]}, "icmp_type": {"type": "string"}, "icmp_code": {"type": "string"}}}}, "ip_protocol": {"type": "array", "items": {"type": "object", "required": ["protocol"], "additionalProperties": false, "properties": {"display_name": {"type": "string"}, "protocol": {"type": "integer", "minimum": 0}}}}, "algorithm": {"type": "array", "items": {"type": "object", "required": ["algorithm", "destination_port"], "additionalProperties": false, "properties": {"display_name": {"type": "string"}, "algorithm": {"enum": ["ORACLE_TNS", "FTP", "SUN_RPC_TCP", "SUN_RPC_UDP", "MS_RPC_TCP", "MS_RPC_UDP", "NBNS_BROADCAST", "NBDG_BROADCAST", "TFTP"]}, "destination_port": {"type": "string"}, "source_ports": {"type": "array", "items": {"type": "string"}}}}}, "igmp": {"type": "array", "items": {"type": "object", "additionalProperties": false, "properties": {"display_name": {"type": "string"}}}}, "ether_type": {"type": "array", "items": {"type": "object", "required": ["ether_type"], "additionalProperties": false, "properties": {"display_name": {"type": "string"}, "ether_type": {"type": "integer", "minimum": 0}}}}}},
           "scope": {
             "type": "array",
             "minItems": 1,
@@ -3406,7 +3413,9 @@ locals {
 resource "nsxt_policy_group" "this" {
   for_each = var.groups
 
-  nsx_id       = each.key
+  # The key is the id, or <id>@<domain> outside the default domain, where
+  # nsx_id holds the id.
+  nsx_id       = try(each.value.nsx_id, each.key)
   display_name = each.value.display_name
   description  = try(each.value.description, null)
   domain       = try(each.value.domain, var.domain)
@@ -3844,6 +3853,72 @@ resource "nsxt_policy_security_policy_rule" "this" {
   destinations_excluded = try(each.value.destinations_excluded, false)
   services              = local.rule_services[each.key]
   profiles              = try(each.value.profiles, null)
+
+  # Ports written in the rule itself, as a service holds them.
+  dynamic "service_entries" {
+    for_each = length(try(each.value.service_entries, {})) > 0 ? [each.value.service_entries] : []
+
+    content {
+      dynamic "l4_port_set_entry" {
+        for_each = try(service_entries.value.l4_port_set, [])
+
+        content {
+          display_name      = try(l4_port_set_entry.value.display_name, "${each.key}-${l4_port_set_entry.key}")
+          protocol          = l4_port_set_entry.value.protocol
+          destination_ports = l4_port_set_entry.value.destination_ports
+          source_ports      = try(l4_port_set_entry.value.source_ports, null)
+        }
+      }
+
+      dynamic "icmp_entry" {
+        for_each = try(service_entries.value.icmp, [])
+
+        content {
+          display_name = try(icmp_entry.value.display_name, "${each.key}-icmp-${icmp_entry.key}")
+          protocol     = icmp_entry.value.protocol
+          icmp_type    = try(icmp_entry.value.icmp_type, null)
+          icmp_code    = try(icmp_entry.value.icmp_code, null)
+        }
+      }
+
+      dynamic "ip_protocol_entry" {
+        for_each = try(service_entries.value.ip_protocol, [])
+
+        content {
+          display_name = try(ip_protocol_entry.value.display_name, "${each.key}-ip-${ip_protocol_entry.key}")
+          protocol     = ip_protocol_entry.value.protocol
+        }
+      }
+
+      dynamic "algorithm_entry" {
+        for_each = try(service_entries.value.algorithm, [])
+
+        content {
+          display_name     = try(algorithm_entry.value.display_name, "${each.key}-alg-${algorithm_entry.key}")
+          algorithm        = algorithm_entry.value.algorithm
+          destination_port = algorithm_entry.value.destination_port
+          source_ports     = try(algorithm_entry.value.source_ports, null)
+        }
+      }
+
+      dynamic "igmp_entry" {
+        for_each = try(service_entries.value.igmp, [])
+
+        content {
+          display_name = try(igmp_entry.value.display_name, "${each.key}-igmp-${igmp_entry.key}")
+        }
+      }
+
+      dynamic "ether_type_entry" {
+        for_each = try(service_entries.value.ether_type, [])
+
+        content {
+          display_name = try(ether_type_entry.value.display_name, "${each.key}-ether-${ether_type_entry.key}")
+          ether_type   = ether_type_entry.value.ether_type
+        }
+      }
+    }
+  }
 
   dynamic "tag" {
     for_each = try(each.value.tags, [])
@@ -4723,7 +4798,7 @@ locals {
   # /global-infra. A site-local rule may use one by name; this stack never
   # manages it (owner: gm is filtered out above), so it cannot fight the GM.
   global_group_paths = {
-    for k, g in local.groups_all : k => "/global-infra/domains/${try(g.domain, "default")}/groups/${k}"
+    for k, g in local.groups_all : k => "/global-infra/domains/${try(g.domain, "default")}/groups/${try(g.nsx_id, k)}"
     if try(g.owner, "lm") == "gm"
   }
 
@@ -6961,14 +7036,21 @@ def check_policies(
 
         policy = doc.get("policy") or {}
         rules = doc.get("rules") or {}
+        if not rules and where not in imported:
+            # NSX may hold an empty policy, and an adopted one is kept; one
+            # written here with no rules is a mistake.
+            report.error(where, "no rules: a policy written here needs at least one.")
         owner = policy.get("owner")
         policy_id = policy.get("id")
         policy_sites = policy.get("sites") or []
 
         if policy_id:
-            if policy_id in seen_ids:
-                report.error(where, f"policy id {policy_id!r} is also used in {seen_ids[policy_id]}")
-            seen_ids[policy_id] = where
+            # Unique per domain, as in NSX: CSS in default and CSS in another
+            # domain are two policies.
+            id_key = (policy.get("domain") or "default", policy_id)
+            if id_key in seen_ids:
+                report.error(where, f"policy id {policy_id!r} is also used in {seen_ids[id_key]}")
+            seen_ids[id_key] = where
             check_key_style(where, "policy id", policy_id, imported, report)
 
         # A policy is reused, not recreated. Two data files describing the same
@@ -6978,7 +7060,7 @@ def check_policies(
         # lookup for you.
         # NSX itself allows two policies with one display name (different ids):
         # two such policies adopted from a manager are both real, and both stay.
-        name_key = (policy.get("name"), policy.get("category"), owner, tuple(sorted(policy_sites)))
+        name_key = (policy.get("name"), policy.get("category"), owner, tuple(sorted(policy_sites)), policy.get("domain") or "default")
         if policy.get("name") and name_key in seen_names and not (where in imported and seen_names[name_key] in imported):
             report.error(
                 where,
@@ -8100,7 +8182,9 @@ def convert_group(group: dict, path_to_name: dict, owner: str, sites: list[str])
         elif kind == "ConjunctionOperator":
             conjunction = expression.get("conjunction_operator")
 
-    out: dict = {"display_name": group.get("display_name", group["id"]), "owner": owner}
+    out: dict = {"display_name": group.get("display_name", group.get("_nsx_id", group["id"])), "owner": owner}
+    if group.get("_nsx_id"):
+        out["nsx_id"] = group["_nsx_id"]  # the key is <id>@<domain>
     if group.get("description"):
         out["description"] = group["description"]
     if owner == "lm":
@@ -8157,6 +8241,10 @@ def convert_rule(rule: dict, group_paths: dict, service_paths: dict) -> dict:
         converted["destination_groups"] = destinations
     if services:
         converted["services"] = services
+    if rule.get("service_entries"):
+        # Ports written in the rule itself: the same entries a service holds.
+        entries = convert_service({"id": rule["id"], "service_entries": rule["service_entries"]})
+        converted["service_entries"] = {k: v for k, v in entries.items() if k not in ("display_name", "description")}
     if rule.get("sources_excluded"):
         converted["sources_excluded"] = True
     if rule.get("destinations_excluded"):
@@ -8181,8 +8269,8 @@ def convert_rule(rule: dict, group_paths: dict, service_paths: dict) -> dict:
 
 def convert_policy(policy: dict, group_paths: dict, service_paths: dict, owner: str, sites: list[str]) -> dict:
     header: dict = {
-        "id": policy["id"],
-        "name": policy.get("display_name", policy["id"]),
+        "id": policy.get("_nsx_id", policy["id"]),  # NSX's id; the file name is the key
+        "name": policy.get("display_name", policy.get("_nsx_id", policy["id"])),
         "category": policy.get("category", "Application"),
         "owner": owner,
     }
@@ -8376,8 +8464,8 @@ def unsupported_objects(groups: list[dict], services: list[dict], start: dict[st
 
 
 def rule_unsupported(rule: dict, bad: dict[str, str]) -> str | None:
-    if rule.get("service_entries"):
-        return "inline service entries"
+    if rule.get("service_entries") and (why := service_unsupported({"service_entries": rule["service_entries"]})):
+        return "inline " + why
     used = sorted({p for f in ("source_groups", "destination_groups", "scope", "services") for p in rule.get(f) or [] if p in bad})
     if used:
         return "uses " + "; ".join(f"{u.rsplit('/', 1)[-1]} ({bad[u]})" for u in used)
@@ -8515,7 +8603,7 @@ def federation(role: str, site: str, groups: list, services: list, policies: lis
         # read-only. Its own rules may use those that data/ declares as owner: gm.
         for gid, definition in declared["groups"].items():
             if definition.get("owner", "lm") == "gm":
-                group_paths[f"/global-infra/domains/{definition.get('domain', 'default')}/groups/{gid}"] = gid
+                group_paths[f"/global-infra/domains/{definition.get('domain', 'default')}/groups/{definition.get('nsx_id', gid)}"] = gid
         for sid, definition in declared["services"].items():
             if definition.get("owner", "gm") == "gm":
                 service_paths[f"/global-infra/services/{sid}"] = sid
@@ -8579,7 +8667,10 @@ def existing_keys(exclude: frozenset[Path] | set[Path] = frozenset()) -> dict[st
         if f in exclude:
             continue
         doc = load_yaml(f.read_text()) or {}
-        found["policies"].add(str((doc.get("policy") or {}).get("id") or f.stem))
+        header = doc.get("policy") or {}
+        pid = str(header.get("id") or f.stem)
+        where_ = header.get("domain") or "default"
+        found["policies"].add(pid if where_ == "default" else f"{pid}@{where_}")
     return found
 
 
@@ -8691,35 +8782,27 @@ def main() -> int:
     all_policies = [p for p in estate.get("policies", []) if str(p.get("path", tree)).startswith(tree)]
 
     own: set[Path] = mirror_files(args.site) if args.mirror else set()
+    # data/ keys objects as NSX does, by domain and id: in 'default' by its id,
+    # in any other domain as <id>@<domain>, with the id as nsx_id. Always, not
+    # only when an id appears in two domains, so a key never changes later (a
+    # new key would be a destroy and create). From here on o["id"] is the key.
+    for o in all_groups + all_policies:
+        where_ = domain_of(o.get("path", ""), "default")
+        if where_ != "default" and "_nsx_id" not in o:
+            o["_nsx_id"] = o["id"]
+            o["id"] = f"{o['id']}@{where_}"
     # References are converted to names using everything that was read, so a
     # rule can name a group this tranche does not adopt.
     group_paths = {g["path"]: g["id"] for g in all_groups if g.get("path")}
     service_paths = {s["path"]: s["id"] for s in all_services if s.get("path")}
     federated = federation(role, args.site, all_groups, all_services, all_policies,
                            declared_objects(exclude=own), group_paths, service_paths)
-    # data/ is keyed by id; NSX keys by domain and id. The same id in a second
-    # domain (Global Manager) stays in the UI rather than become a second object
-    # under one name. The manager's own domain was read first, so it keeps its own.
-    first: dict[tuple[str, str], str] = {}
-    clashing_policies: dict[str, str] = {}
-    for kind, objects in (("group", all_groups), ("policy", all_policies)):
-        for o in objects:
-            here = domain_of(o.get("path", ""), domain)
-            there = first.setdefault((kind, o["id"]), here)
-            if there != here:
-                why = f"its id is also a {kind} in domain {there}, and data/ names objects by id alone"
-                if kind == "group":
-                    federated.setdefault(o["path"], why)
-                else:
-                    clashing_policies[o["path"]] = why
 
     if args.list:
         return survey(args.site, all_groups, all_services, all_policies, federated)
     sites = [args.site]
     owner = "gm" if role == "gm" else "lm"
 
-    clashing = [p for p in all_policies if p.get("path") in clashing_policies]
-    all_policies = [p for p in all_policies if p.get("path") not in clashing_policies]
     groups, services, policies = all_groups, all_services, all_policies
     skipped: list[str] = []
     if args.mirror:
@@ -8764,7 +8847,6 @@ def main() -> int:
     bad = unsupported_objects(all_groups, all_services, federated)
     kept_in_ui: list[str] = [f"{o.get('resource_type', 'object')} {o.get('id')}: belongs to the Global Manager ({o.get('path')})"
                              for o in foreign]
-    kept_in_ui += [f"policy {p['id']}: {clashing_policies[p['path']]}" for p in clashing]
     # A local object shadowed by another manager's id is reported here, not as MANAGED.
     for kind, objects in (("group", all_groups), ("service", all_services)):
         for o in objects:
@@ -8799,9 +8881,9 @@ def main() -> int:
                 notes.append(f"rule {policy['id']}/{rule['id']}: {why}; stays in the UI, the rest of the policy is adopted")
             else:
                 rules.append(rule)
-        if not rules:
-            # A policy with no rule to adopt stays whole in the UI: data/ holds no
-            # empty policies.
+        if not rules and policy.get("rules"):
+            # A policy none of whose rules can be adopted stays whole in the UI.
+            # One that NSX itself holds empty is taken as it is.
             reason = f"policy {policy['id']}: none of its {len(policy.get('rules', []))} rule(s) can be adopted"
             if policy["id"] in args.policy:
                 sys.exit(f"error: {reason}. Nothing was written.")
@@ -8890,7 +8972,8 @@ def main() -> int:
     for group_id, definition in converted_groups.items():
         nested = any("member_groups" in c for c in definition.get("criteria", []))
         path = next((g["path"] for g in groups if g["id"] == group_id), "")
-        (composite if nested else base)[group_id] = object_id("group", domain_of(path, domain), path, group_id, args.id_format)
+        nsx = next((g.get("_nsx_id", g["id"]) for g in groups if g["id"] == group_id), group_id)
+        (composite if nested else base)[group_id] = object_id("group", domain_of(path, domain), path, nsx, args.id_format)
     service_ids = {
         s["id"]: object_id("service", domain, s.get("path", ""), s["id"], args.id_format)
         for s in services
@@ -8902,12 +8985,13 @@ def main() -> int:
         if is_system(policy):
             continue
         key = policy["id"]
-        policy_ids[key] = object_id("policy", domain_of(policy.get("path", ""), domain), policy.get("path", ""), key, args.id_format)
+        nsx = policy.get("_nsx_id", key)
+        policy_ids[key] = object_id("policy", domain_of(policy.get("path", ""), domain), policy.get("path", ""), nsx, args.id_format)
         for rule in policy.get("rules", []):
             rule_ids[f"{key}/{rule['id']}"] = {
                 "policy": key,
                 "rule": rule["id"],
-                "id": object_id("rule", domain_of(policy.get("path", ""), domain), rule.get("path", ""), f"{key}/{rule['id']}", args.id_format),
+                "id": object_id("rule", domain_of(policy.get("path", ""), domain), rule.get("path", ""), f"{nsx}/{rule['id']}", args.id_format),
             }
 
     kinds = [
@@ -9894,9 +9978,8 @@ def mirror_objects(files: dict[str, str], site: str) -> dict[tuple[str, str], di
             for key, value in (doc.get("custom") or {}).items():
                 out[("service", str(key))] = value
         elif path.startswith("data/policies/"):
-            header = doc.get("policy") or {}
-            pid = str(header.get("id") or Path(path).stem)
-            out[("policy", pid)] = header
+            pid = Path(path).stem  # the key: <id>, or <id>@<domain> outside default
+            out[("policy", pid)] = doc.get("policy") or {}
             for key, value in (doc.get("rules") or {}).items():
                 out[("rule", f"{pid}/{key}")] = value
     return out
@@ -9959,17 +10042,24 @@ def describe(before, after) -> str:
     return text if len(text) <= 240 else text[:237] + "..."
 
 
+def data_key(obj: dict) -> str:
+    """The key data/ gives an object: its id, or <id>@<domain> outside 'default'."""
+    found = re.match(r"^/(?:global-)?infra/domains/([^/]+)/", obj.get("path") or "")
+    where = found.group(1) if found else "default"
+    return obj.get("id", "") if where == "default" else f"{obj.get('id', '')}@{where}"
+
+
 def nsx_index(dump: dict) -> dict[tuple[str, str], dict]:
-    """(kind, id) -> the object as NSX returned it, for who changed it and when."""
+    """(kind, key) -> the object as NSX returned it, for who changed it and when."""
     out: dict[tuple[str, str], dict] = {}
     for g in dump.get("groups", []):
-        out.setdefault(("group", g.get("id", "")), g)
+        out.setdefault(("group", data_key(g)), g)
     for s in dump.get("services", []):
         out.setdefault(("service", s.get("id", "")), s)
     for p in dump.get("policies", []):
-        out.setdefault(("policy", p.get("id", "")), p)
+        out.setdefault(("policy", data_key(p)), p)
         for r in p.get("rules", []):
-            out.setdefault(("rule", f"{p.get('id')}/{r.get('id')}"), r)
+            out.setdefault(("rule", f"{data_key(p)}/{r.get('id')}"), r)
     return out
 
 

@@ -13,6 +13,16 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.5.3
+
+**The same id in several Global Manager domains is several objects, all adopted.** On a Global Manager the same group and policy names exist in `default` and in each location domain (`H-TIG-PR-AZAC01`, `CSS`, `PSG`...). data/ named objects by id alone, so 1.5.0 left every second copy in the UI, and with it every rule using one and every policy left with no rule: most of hyd-gm01. data/ now keys objects as NSX does, by domain and id: in `default` by the id, in any other domain as `<id>@<domain>` (`CSS@app_non_pord.yaml`, group `H-TIG-PR-AZAC01@WL-Hyd`) with `nsx_id:` and `domain:`. Always, not only on a clash, so a key never changes later (a changed key would be a destroy and create). The group module creates by `nsx_id`, the Local Manager stack finds Global Manager groups by `nsx_id` in their domain, and policy ids are unique per domain in the validator.
+
+**Rules with ports written in them are adopted** (the UI's raw port-protocol in a rule): written as the rule's `service_entries`, in the same form as a service (TCP/UDP, ICMP, IP protocol, ALG, IGMP, EtherType).
+
+**A policy NSX holds empty is adopted**, empty. One written here still needs a rule.
+
+Proven with the real provider: the same group and policy ids in two domains imported side by side by their NSX ids, a rule with ports in it and an empty policy, then no changes.
+
 ## 1.5.2
 
 **Each stack of a manager has its own GitLab state.** `envs/<site>.backend.hcl` names one state per manager, but a manager has several stacks (a Local Manager: local-security, local-network, local-tags, platform). With GitLab-managed state they all used that one state: one stack's sync changed it under the others (`Error: Saved plan is stale` in their sync-state jobs), and once objects were imported each stack's plan would have seen the others' objects as its own, to destroy (plan-guard would have refused, every time). `scripts/tf.sh` now gives each stack its own state beside the manager's, `<name>-<stack>`; a name that already ends in a stack (`hyd-np01-local-security`, as in the example) stays that stack's own, unchanged. A state that every stack shared and that still holds objects stops every plan and apply of that manager, saying how many and how to move them, instead of being left behind: untracked, they would be created again over the live ones. An empty one is simply left behind.
