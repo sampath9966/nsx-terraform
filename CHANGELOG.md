@@ -13,6 +13,14 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.8.0
+
+**Zero-trust guardrails, set by the security team, checked on every merge request.** `data/guardrails.yaml` (created when missing) holds eleven guardrails, each mapped to NIST SP 800-207 and 800-53: any-to-any-on-any and production to non-production are enforced by default; any service, source or destination, rules applied to everything, addresses instead of attributes, unlogged drops, policies without their own final deny and static groups are warnings. Levels are enforce, warn or off, estate-wide and per manager. A rule may carry an exception, which needs an owner, a ticket and an expiry, and fails again once expired. Rules adopted from NSX are counted as findings, a backlog, never a failed pipeline. docs/GUARDRAILS.md.
+
+**A change made in NSX is never silently undone.** A plan that would put back what someone changed in NSX, though data/ does not ask for it, is refused, naming the object and field. Keep the change with the new `accept` job (`ACCEPT_SITE`, `ACCEPT_KEYS`; `scripts/accept-drift.py`): one read per object, a merge request writing what NSX holds into data/ and keeping what NSX does not (owner, sites, schedule, exception). Or undo it on purpose with a line in `allow-revert.txt`. Proven with the real provider.
+
+**Plans in firewall terms.** Each plan job posts, above the raw plan, what changes in firewall terms: rules added (what they allow), changed (field by field, groups and services by name), deleted (with the approval they need), imports counted, and objects changed in NSX since Terraform last saw them flagged (`scripts/plan-summary.py`, `scripts/tf.sh summary`).
+
 ## 1.7.0
 
 **Every change made outside Git is found, at the cost of a few API calls.** The new `watch` job (`scripts/nsx-watch.py`) compares what NSX holds with data/, converted exactly as the importer converts it, without Terraform: every 5 minutes the objects modified in the last 20 minutes, in one search call; nightly (`WATCH_FULL=1`) everything in one hierarchical read, which also finds objects deleted in NSX and objects created outside Git. Raised as `nsx-drift` issues with who and when. Not drift: another tool's objects, the pipeline's own changes (`NSX_PIPELINE_USERS`), a pending apply (data/ committed after NSX last changed), membership, renumbering. A log alert (VCF Operations for Logs) can trigger it within a minute. docs/WATCH.md.

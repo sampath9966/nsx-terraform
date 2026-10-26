@@ -246,7 +246,7 @@ is_estate_data() {
 # changed after, as everything there.
 is_starter() {
 	case "$1" in
-	inventory/ownership.yaml) return 0 ;;
+	inventory/ownership.yaml | data/guardrails.yaml) return 0 ;;
 	esac
 	return 1
 }

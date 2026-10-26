@@ -55,6 +55,8 @@ echo "== scheduled rules: the schedule, the time follower, expiry, converting ti
 tests/schedule.sh || rc=1
 echo "== change watch: NSX compared with data/ for an API call"
 tests/watch.sh || rc=1
+echo "== governance: guardrails, no silent reverts, plans in firewall terms"
+tests/govern.sh || rc=1
 
 # CI parity: a CI image without PyYAML reads YAML with Terraform's yamldecode,
 # or, with no terraform either, with the built-in reader. The suites that read
@@ -66,11 +68,13 @@ if [ -z "${NSX_YAML_FALLBACK:-}" ]; then
 		NSX_YAML_FALLBACK=1 tests/change-control.sh || rc=1
 		NSX_YAML_FALLBACK=1 tests/schedule.sh || rc=1
 		NSX_YAML_FALLBACK=1 tests/watch.sh || rc=1
+		NSX_YAML_FALLBACK=1 tests/govern.sh || rc=1
 	fi
 	echo "== again, reading YAML with neither PyYAML nor terraform (the built-in reader)"
 	NSX_YAML_FALLBACK=1 NSX_YAML_NO_TERRAFORM=1 tests/brownfield.sh || rc=1
 	NSX_YAML_FALLBACK=1 NSX_YAML_NO_TERRAFORM=1 tests/schedule.sh || rc=1
 	NSX_YAML_FALLBACK=1 NSX_YAML_NO_TERRAFORM=1 tests/watch.sh || rc=1
+	NSX_YAML_FALLBACK=1 NSX_YAML_NO_TERRAFORM=1 tests/govern.sh || rc=1
 fi
 
 if [ "${1:-}" = "--provider" ]; then

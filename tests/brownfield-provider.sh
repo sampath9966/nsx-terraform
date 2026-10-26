@@ -695,7 +695,10 @@ out="$(APPROVE=yes tf apply local-security lon1)"
 check "the rule was changed in the UI since: the apply is refused, and says to plan with refresh" bash -c 'grep -q "1 changed in NSX since" <<<"$1" && grep -q "refusing to apply over a change made in NSX" <<<"$1" && ! grep -q "Apply complete" <<<"$1"' _ "$out"
 out="$(tf plan local-security lon1)"
 check "a plan with refresh sees the UI change too" bash -c 'grep -q "0 to add, 1 to change, 0 to destroy" <<<"$1" && grep -q "changed in the UI" <<<"$1"' _ "$out"
+check "...and, applied as it is, would undo that UI change: refused until approved" bash -c '! APPROVE=yes scripts/tf.sh apply local-security lon1 >/dev/null 2>&1'
+printf 'lon1 local-security module.policies["sched"].nsxt_policy_security_policy_rule.this["s1"]\n' >allow-revert.txt
 APPROVE=yes tf apply local-security lon1 >/dev/null
+rm allow-revert.txt
 sed -i 's/    logged: false/    logged: true/' data/policies/sched.yaml
 NSX_PLAN_REFRESH=changed tf plan local-security lon1 >/dev/null
 before="$(wc -l <"$SCRATCH/requests.log")"
@@ -704,6 +707,24 @@ check "with nothing changed since, the apply checks the one object it changes, a
 check "...reading that object alone before writing it" bash -c '[ "$(tail -n +"$(( $2 + 1 ))" "$1" | grep "^GET" | grep "/infra/" | grep -vc "/sched/rules/s1")" = 0 ]' _ "$SCRATCH/requests.log" "$before"
 rm -f "$SCRATCH/requests.log.writable"
 rm -f "$SCRATCH/requests.log.writable"
+
+echo "a change made in NSX is never silently undone; accepting it is one step"
+touch "$SCRATCH/requests.log.writable"
+curl -sk -X PATCH -H 'Content-Type: application/json' --data '{"notes": "an engineer fixed this in the UI"}' \
+	"https://127.0.0.1:$port/policy/api/v1/infra/domains/default/security-policies/sched/rules/s1" >/dev/null
+rm -f "$SCRATCH/requests.log.writable"
+out="$(tf plan local-security lon1)"
+check "the plan that would undo it is refused, naming the field and both ways out" bash -c 'grep -q "would undo a change made in NSX outside this repository: notes: NSX has \"an engineer fixed this in the UI\"" <<<"$1" && grep -q "allow-revert.txt" <<<"$1"' _ "$out"
+out="$(python3 scripts/accept-drift.py --site lon1 rule=sched/s1 2>&1)"
+check "accept-drift writes what NSX holds into data/, keeping the rule's schedule" bash -c 'grep -q "accepted  rule sched/s1" <<<"$1" && grep -q "notes: an engineer fixed this in the UI" data/policies/sched.yaml && grep -q "timezone: UTC" data/policies/sched.yaml' _ "$out"
+check "...in one NSX read (and a login)" grep -q "(2 NSX call(s))" <<<"$out"
+check "...and the plan then changes nothing" grep -q "No changes" <<<"$(tf plan local-security lon1)"
+check "(the copy validates)" python3 scripts/validate-data.py
+sed -i 's/    logged: true/    logged: false/' data/policies/sched.yaml
+tf plan local-security lon1 >/dev/null
+out="$(tf summary local-security lon1)"
+check "a real plan reads in firewall terms" grep -q "| changed | \`rule sched/s1\` | logged true → false" <<<"$out"
+sed -i 's/    logged: false/    logged: true/' data/policies/sched.yaml
 # An engineer switches it on in the UI outside its window: the drift check raises it, high.
 export NSX_SCHEDULE_NOW=2026-11-03T12:00:00Z
 touch "$SCRATCH/requests.log.writable"; tf follow local-security lon1 >/dev/null; rm -f "$SCRATCH/requests.log.writable"
