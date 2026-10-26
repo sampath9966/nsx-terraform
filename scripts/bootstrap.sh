@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.6.0"
+VERSION="1.7.0"
 
 ROOT="$PWD"
 FORCE=0
@@ -1146,6 +1146,7 @@ write_file .gitignore <<'SCAFFOLD_EOF'
 # Saved plans are sensitive artifacts, not review attachments.
 tfplan
 tfplan.site
+tfplan.refresh
 *.tfplan
 plan.json
 plan.txt
@@ -1317,6 +1318,89 @@ indent_size = 4
 
 [Makefile]
 indent_style = tab
+SCAFFOLD_EOF
+
+write_file docs/WATCH.md <<'SCAFFOLD_EOF'
+# Finding every change made outside Git, at the cost of a few API calls
+
+Everything changes through a merge request. Anything else, made in the UI,
+through the API or by another tool, is found and raised as an `nsx-drift`
+issue: who, what, when. This page is how that is done without loading the
+managers: the cost grows with how often things change, not with the size of
+the estate.
+
+## The checks, and what each costs
+
+| What | When | NSX calls |
+|---|---|---|
+| `watch` job, incremental: objects modified in the last 20 minutes, compared with data/ | every 5 minutes (`WATCH_SITE`) | 1 search, plus 1 login |
+| `watch` job, full: everything, also deletions and objects created outside Git | nightly (`WATCH_SITE`, `WATCH_FULL=1`) | 1 hierarchical read, plus 1 login |
+| `mirror` job, nothing modified since the last copy | its schedule | 1 search: the full read is skipped |
+| `mirror` job, something modified | its schedule, and nightly with `MIRROR_FULL=1` | 1 hierarchical read |
+| `schedule` job, no rule to switch | every 5 minutes | 0 |
+| A plan with `NSX_PLAN_REFRESH=changed` | each merge request | 0 reads; before the apply, 1 per object it changes |
+| A plan with refresh (the default) | each merge request | 1 per managed object |
+| `drift` job: Terraform's refresh-only plan | weekly is plenty, as a second opinion | 1 per managed object |
+
+Every script reports its NSX calls; above `NSX_API_BUDGET` per run (10 by
+default) it warns. One login per manager per run (a session), not credentials
+on every call: with LDAP or vIDM accounts each authenticated call is a
+directory lookup on the manager.
+
+## What is compared, and what is not drift
+
+The watch converts what NSX holds exactly as the importer does and compares it
+with data/, with the modules' defaults filled in on both sides, so a
+difference is a real one. Not drift:
+
+- **Another tool's objects** (inventory/ownership.yaml): NCP, vSphere with
+  Tanzu, VCF Automation.
+- **The pipeline's own changes**: objects last modified by an account in
+  `NSX_PIPELINE_USERS` (the apply credential's user, comma separated).
+- **A pending apply**: data/ was committed after NSX last changed the object.
+- **Membership**: a group's members changing with the estate. Only its
+  definition is compared.
+- **Renumbering**: only a change in rule order is.
+
+A scheduled rule is compared with what its schedule says now; on outside its
+window is a `[HIGH]` issue (docs/SCHEDULES.md).
+
+## Within a minute: a log alert triggers the watch (optional)
+
+NSX logs every change it accepts. VCF Operations for Logs (Aria Operations
+for Logs in VCF 5.2), which VCF deploys and the managers forward to, can
+start the watch the moment one arrives, at no API cost:
+
+1. GitLab: *Settings → CI/CD → Pipeline trigger tokens*, add one.
+2. VCF Operations for Logs: an alert on the NSX managers' audit messages for
+   create, update and delete, with a webhook to
+   `https://<gitlab>/api/v4/projects/<id>/trigger/pipeline` and the form fields
+   `token=<trigger token>`, `ref=main`, `variables[WATCH_SITE]=<manager>`.
+
+The watch job runs on `trigger` pipelines too. Without a log destination the
+5-minute schedule does the same, later.
+
+## Cheaper plans
+
+`NSX_PLAN_REFRESH=changed` (a CI/CD variable) plans without reading NSX: the
+watch keeps NSX and data/ compared in the meantime. Before an apply,
+`scripts/revision-check.py` reads each object the plan changes and compares its
+NSX revision with the one Terraform last saw; one changed since means the
+apply is refused, with who changed it, and a plan with refresh is needed. Leave
+it at the default (`full`) until the watch has run clean for a while.
+
+## Setting it up
+
+*Build → Pipeline schedules*, on the default branch:
+
+| Schedule | Variables |
+|---|---|
+| every 5 minutes | `WATCH_SITE=all` |
+| nightly | `WATCH_SITE=all`, `WATCH_FULL=1` |
+| nightly (managers still in mirror mode) | `MIRROR_SITE=all`, `MIRROR_FULL=1` |
+| every 5 minutes (scheduled rules) | `SCHEDULE_FOLLOW=1` |
+
+They need `NSX_BOT_TOKEN` (api scope) to raise issues, and `NSX_PIPELINE_USERS`.
 SCAFFOLD_EOF
 
 write_file docs/SCHEDULES.md <<'SCAFFOLD_EOF'
@@ -1878,6 +1962,7 @@ describing no real site. Replace it, or regenerate with `--no-examples`.
 | `docs/TAGGING.md` | Who applies tags: the two variants, the ownership constraint, how the boundary is enforced. |
 | `docs/IMPORT.md` | Adopting an estate that already exists — the tranche workflow. |
 | `docs/SCHEDULES.md` | Rules that are on only at certain times, and rules that expire. |
+| `docs/WATCH.md` | Finding every change made outside Git, and what each check costs in NSX API calls. |
 | `docs/SETUP.md` | Standing this up end to end: prerequisites, the decisions that are yours, backend choice, first contact with a manager. |
 | `docs/GITOPS.md` | How a rule edit becomes a merge request, a plan, an approval and an apply — and what the approver is looking for. |
 | `docs/ACCEPTANCE.md` | **What "it works" means and how to prove it** — the staged plan from offline checks to a real apply. Read before promising this to anyone. |
@@ -1896,6 +1981,7 @@ By question:
 | Decide who tags workloads | `docs/TAGGING.md` |
 | Adopt an existing estate | `docs/IMPORT.md` |
 | Open a rule only at certain times, or until a date | `docs/SCHEDULES.md` |
+| Catch every UI or API change, cheaply | `docs/WATCH.md` |
 | Find a command | `docs/ARCHITECTURE.md` §16 — every command that exists |
 | Know what is still undecided | `docs/ARCHITECTURE.md` §14 |
 
@@ -5739,7 +5825,17 @@ plan)
 	ensure_init
 	rm -f "$plan_file" "$plan_site_file"
 	schedule_vars
-	run plan -out=tfplan -parallelism="$PARALLELISM" -input=false "$@"
+	# NSX_PLAN_REFRESH=changed: no refresh, so a plan costs no NSX read per
+	# managed object. The change watch keeps NSX and data/ compared meanwhile,
+	# and the apply checks each object it changes first (revision-check.py).
+	refresh=()
+	if [ "${NSX_PLAN_REFRESH:-full}" = changed ]; then
+		refresh=(-refresh=false)
+		printf 'changed\n' >"$plan_file.refresh"
+	else
+		rm -f "$plan_file.refresh"
+	fi
+	run plan -out=tfplan -parallelism="$PARALLELISM" -input=false ${refresh[@]+"${refresh[@]}"} "$@"
 	printf '%s\n' "$site" >"$plan_site_file"
 	echo
 	if ! guard; then
@@ -5790,8 +5886,15 @@ apply)
 		echo "error: stack $stack is still on the placeholder local backend. State carries the security posture of the estate and needs a remote, encrypted, locked backend before any real apply. Set ALLOW_LOCAL_STATE=1 only for a lab." >&2
 		exit 1
 	fi
+	# A plan made without refresh: what it changes must not have changed in NSX
+	# since Terraform last read it. One read per object it changes.
+	if [ -f "$plan_file.refresh" ]; then
+		if ! (cd "$stack_dir" && terraform show -json tfplan) | python3 "$REPO_ROOT/scripts/revision-check.py" --site "$site"; then
+			exit 2
+		fi
+	fi
 	run apply -parallelism="$PARALLELISM" -input=false tfplan
-	rm -f "$plan_file" "$plan_site_file"
+	rm -f "$plan_file" "$plan_site_file" "$plan_file.refresh"
 	;;
 follow)
 	# The time follower: switch the scheduled rules whose schedule changed since
@@ -8042,7 +8145,8 @@ def dump(doc: dict) -> str:
 
 def _scalar(value: str) -> str:
     # Quote anything YAML would read as other than a plain string.
-    if value == "" or value[0] in "!&*{}[]|>%@`\"'" or ": " in value or value.strip() != value:
+    if value == "" or value[0] in "!&*{}[]|>%@`\"'" or ": " in value or value.strip() != value \
+            or value.lower() in ("true", "false", "null", "yes", "no", "on", "off", "~", "y", "n"):
         return '"' + value.replace('"', '\\"') + '"'
     return value
 
@@ -8254,15 +8358,15 @@ def nsx_ca_file() -> str | None:
     return None
 
 
-def api_get(host: str, path: str, user: str, password: str, insecure: bool) -> dict:
-    url = f"https://{host}{path}"
-    request = urllib.request.Request(url, headers={"Accept": "application/json"})
-    credentials = urllib.parse.quote(user), urllib.parse.quote(password)
-    import base64
+# Every call to NSX is counted (CALLS) and reported, so a job's cost is known.
+# One login per manager per run: a session, reused, instead of credentials on
+# every call (each of which, with remote authentication, is an LDAP or vIDM
+# lookup on the manager). Where a session cannot be had, basic authentication.
+CALLS = 0
+SESSIONS: dict[tuple[str, str], dict[str, str] | None] = {}
 
-    token = base64.b64encode(f"{user}:{password}".encode()).decode()
-    request.add_header("Authorization", f"Basic {token}")
 
+def _context(insecure: bool) -> ssl.SSLContext:
     context = ssl.create_default_context()
     # Python 3.13 turned on RFC 5280 strict checks, which reject internal CAs that
     # lack a keyUsage extension. Terraform's Go TLS stack accepts them, and so did
@@ -8275,28 +8379,129 @@ def api_get(host: str, path: str, user: str, password: str, insecure: bool) -> d
     if insecure:
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
+    return context
 
+
+def _unreachable(host: str, exc: urllib.error.URLError) -> None:
+    hint = ""
+    if "CERTIFICATE_VERIFY_FAILED" in str(exc.reason):
+        hint = (
+            "\n       The manager is presenting a certificate this machine does not trust. Point "
+            f"NSX_CA_FILE_{re.sub(r'[^A-Z0-9]', '_', CA_SITE.upper())} (or NSX_CA_FILE) at the PEM of "
+            "its CA, or of the certificate itself if it is self-signed. --insecure is for a lab only."
+        )
+    sys.exit(f"error: cannot reach {host}: {exc.reason}{hint}")
+
+
+def session(host: str, user: str, password: str, insecure: bool) -> dict[str, str] | None:
+    """Headers of a session on this manager, created once; None: use basic auth."""
+    global CALLS
+    if (host, user) in SESSIONS:
+        return SESSIONS[(host, user)]
+    data = urllib.parse.urlencode({"j_username": user, "j_password": password}).encode()
+    request = urllib.request.Request(f"https://{host}/api/session/create", data=data, method="POST",
+                                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+    headers = None
     try:
-        with urllib.request.urlopen(request, context=context, timeout=60) as response:
+        CALLS += 1
+        with urllib.request.urlopen(request, context=_context(insecure), timeout=60) as response:
+            cookie = "; ".join(c.split(";", 1)[0] for c in response.headers.get_all("Set-Cookie") or [])
+            xsrf = response.headers.get("X-XSRF-TOKEN")
+            if cookie:
+                headers = {"Cookie": cookie, **({"X-XSRF-TOKEN": xsrf} if xsrf else {})}
+    except urllib.error.HTTPError:
+        headers = None  # sessions not allowed for this account: basic authentication
+    except urllib.error.URLError as exc:
+        _unreachable(host, exc)
+    SESSIONS[(host, user)] = headers
+    return headers
+
+
+def api_get(host: str, path: str, user: str, password: str, insecure: bool, missing_ok: bool = False) -> dict:
+    """GET one path. missing_ok: a 400/404 answers {} instead of stopping."""
+    global CALLS
+    import base64
+
+    request = urllib.request.Request(f"https://{host}{path}", headers={"Accept": "application/json"})
+    headers = session(host, user, password, insecure)
+    if headers:
+        for name, value in headers.items():
+            request.add_header(name, value)
+    else:
+        request.add_header("Authorization", "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode())
+    try:
+        CALLS += 1
+        with urllib.request.urlopen(request, context=_context(insecure), timeout=120) as response:
             return json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
+        if missing_ok and exc.code in (400, 404):
+            return {}
+        if exc.code in (401, 403) and headers:
+            SESSIONS[(host, user)] = None  # the session expired or is refused: once more, without it
+            return api_get(host, path, user, password, insecure, missing_ok)
         sys.exit(f"error: {exc.code} from {path}: {exc.read()[:300].decode(errors='replace')}")
     except urllib.error.URLError as exc:
-        hint = ""
-        if "CERTIFICATE_VERIFY_FAILED" in str(exc.reason):
-            hint = (
-                "\n       The manager is presenting a certificate this machine does not trust. Point "
-                f"NSX_CA_FILE_{re.sub(r'[^A-Z0-9]', '_', CA_SITE.upper())} (or NSX_CA_FILE) at the PEM of "
-                "its CA, or of the certificate itself if it is self-signed. --insecure is for a lab only."
-            )
-        sys.exit(f"error: cannot reach {host}: {exc.reason}{hint}")
+        _unreachable(host, exc)
+    return {}
+
+
+def hierarchy(tree: dict) -> dict[str, list[dict]]:
+    """Domains, groups, policies (rules inside), services, from one hierarchical
+    read: each object sits in its parent's children as Child<Type> -> <Type>."""
+    found: dict[str, list[dict]] = {"Domain": [], "Group": [], "SecurityPolicy": [], "Service": []}
+
+    def walk(node: dict, policy: dict | None) -> None:
+        for child in node.get("children") or []:
+            kind = str(child.get("resource_type", ""))[len("Child"):]
+            obj = child.get(kind)
+            if not isinstance(obj, dict):
+                continue
+            obj = dict(obj)
+            inner = obj.pop("children", None)
+            if kind == "Rule" and policy is not None:
+                # A rule may come both inline and as a child: once.
+                rules = policy.setdefault("rules", [])
+                if not any(r.get("id") == obj.get("id") for r in rules):
+                    rules.append(obj)
+            elif kind in found:
+                if kind == "SecurityPolicy":
+                    obj["rules"] = list(obj.get("rules") or [])
+                found[kind].append(obj)
+            walk({"children": inner or []}, obj if kind == "SecurityPolicy" else policy)
+
+    walk(tree, None)
+    return found
 
 
 def fetch_estate(host: str, user: str, password: str, base: str, domain: str, insecure: bool) -> dict:
     """Groups, services and policies. On a Global Manager, from every domain: a
     global policy's rules may use a location domain's groups (e.g. WL-Mum), and
     location domains hold policies of their own. A Local Manager has only
-    'default' (its view of the Global Manager's domains is not its own)."""
+    'default' (its view of the Global Manager's domains is not its own).
+
+    One hierarchical read where the manager offers it: the whole tree in one
+    call. Otherwise (NSX_READ=paged forces it) list by list and a call per
+    policy, as before."""
+    before = CALLS
+    if os.environ.get("NSX_READ", "hierarchical") != "paged":
+        for query in ("type_filter=Domain;Group;SecurityPolicy;Rule;Service",
+                      "filter=Type-Domain|Group|SecurityPolicy|Rule|Service"):
+            tree = api_get(host, f"{base}?{query}", user, password, insecure, True)  # missing_ok
+            found = hierarchy(tree) if tree.get("children") else {}
+            if found.get("Domain"):
+                domains = [domain]
+                if base == GM_BASE:
+                    domains += sorted(d["id"] for d in found["Domain"] if d.get("id") and d["id"] != domain)
+                within = lambda o: domain_of(o.get("path", ""), "") in domains  # noqa: E731
+                groups = [g for g in found["Group"] if within(g)]
+                policies = [p for p in found["SecurityPolicy"] if within(p)]
+                services = found["Service"]
+                print(f"reading {host} ({base}, domain(s) {', '.join(domains)}): {len(groups)} group(s), "
+                      f"{len(policies)} policy/policies, {len(services)} service(s), "
+                      f"in {CALLS - before} call(s) (hierarchical read)", file=sys.stderr)
+                return {"groups": groups, "services": services, "policies": policies, "domain": domain,
+                        "domains": domains, "calls": CALLS - before}
+
     def results(path: str) -> list:
         # The policy API pages lists (1000 per page by default). Follow the cursor,
         # or a large estate is silently cut short.
@@ -8317,8 +8522,8 @@ def fetch_estate(host: str, user: str, password: str, base: str, domain: str, in
     groups: list = []
     policies: list = []
     for d in domains:
-        found = results(f"{base}/domains/{urllib.parse.quote(d, safe='')}/groups")
-        groups += found
+        found_groups = results(f"{base}/domains/{urllib.parse.quote(d, safe='')}/groups")
+        groups += found_groups
         count = 0
         for summary in results(f"{base}/domains/{urllib.parse.quote(d, safe='')}/security-policies"):
             # The list endpoint omits rules; fetch each policy in full.
@@ -8333,11 +8538,12 @@ def fetch_estate(host: str, user: str, password: str, base: str, domain: str, in
                 )
             )
             count += 1
-        print(f"  domain {d}: {len(found)} group(s), {count} policy/policies", file=sys.stderr)
+        print(f"  domain {d}: {len(found_groups)} group(s), {count} policy/policies", file=sys.stderr)
     services = results(f"{base}/services")
-    print(f"  {len(services)} service(s)", file=sys.stderr)
+    print(f"  {len(services)} service(s), in {CALLS - before} call(s) (paged read)", file=sys.stderr)
 
-    return {"groups": groups, "services": services, "policies": policies, "domain": domain, "domains": domains}
+    return {"groups": groups, "services": services, "policies": policies, "domain": domain, "domains": domains,
+            "calls": CALLS - before}
 
 
 def domain_of(path: str, default: str) -> str:
@@ -8381,7 +8587,8 @@ def scalar(value) -> str:
         text == ""
         or text[0] in NEEDS_QUOTE
         or text.strip() != text
-        or text.lower() in ("true", "false", "null", "yes", "no", "on", "off", "~")
+        # YAML 1.1 booleans too (y, n), which Terraform's yamldecode still reads as such.
+        or text.lower() in ("true", "false", "null", "yes", "no", "on", "off", "~", "y", "n")
         or any(c in text for c in ":#'\"\\,[]{}")  # also safe inside a [flow, list]
         or any(ord(c) < 32 or ord(c) == 127 for c in text)
         or _looks_numeric(text)
@@ -10316,6 +10523,22 @@ for site in $sites; do
 	git checkout -q -f -B "$branch" "$base"
 
 	dump="$work/$site.json"
+	# Nothing modified in NSX since the last copy: nothing to read in full. One
+	# search call instead of the whole manager. Deletions do not show in it, so
+	# a nightly schedule sets MIRROR_FULL=1.
+	# Only when the copy on the default branch is complete: no merge request of
+	# this mirror is open, and the importer has not changed since the copy (a
+	# newer one may take objects the last could not).
+	last="$(git log -1 --format=%ct -- "data/groups/imported-$site-mirror.yaml" "data/services/imported-$site-mirror.yaml" "stacks/*/import-$site-mirror.tf" 2>/dev/null || true)"
+	tool="$(git log -1 --format=%ct -- scripts/import-estate.py inventory/ownership.yaml 2>/dev/null || true)"
+	pending="$(gitlab GET "/merge_requests?state=opened&source_branch=$branch&target_branch=$target" | json_field iid 2>/dev/null || true)"
+	if [ "${MIRROR_FULL:-}" != 1 ] && [ -n "$last" ] && [ "$last" -gt "${tool:-0}" ] && [ -z "$pending" ] && [ -x scripts/nsx-watch.py ]; then
+		NSX_CRED_SCOPE=plan scripts/with-credentials.sh "$site" -- python3 scripts/nsx-watch.py --site "$site" --changed-since "$((last - 3600))"
+		if [ $? -eq 3 ]; then
+			echo "$site: nothing modified in NSX since its last copy; not read in full (MIRROR_FULL=1 forces it)."
+			continue
+		fi
+	fi
 	if ! NSX_CRED_SCOPE=plan scripts/with-credentials.sh "$site" -- \
 		python3 scripts/import-estate.py --site "$site" --dump-only "$dump"; then
 		failed+=("$site")
@@ -10874,7 +11097,7 @@ def cell(text: str) -> str:
 
 
 def issue_body(site: str, items: list[dict], mode: str, link: str) -> str:
-    source = "the mirror sync" if mode == "mirror" else "a drift check (refresh-only plan)"
+    source = {"mirror": "the mirror sync", "watch": "the change watch (scripts/nsx-watch.py)"}.get(mode, "a drift check (refresh-only plan)")
     rows = [f"| {i['change']} | `{cell(i['key'])}` | {cell(i['detail'])} | {cell(i['who']) or '?'} | {i['at'] or '?'} |"
             for i in items[:MAX_ROWS]]
     if len(items) > MAX_ROWS:
@@ -11547,6 +11770,466 @@ if __name__ == "__main__":
 SCAFFOLD_EOF
 mark_executable scripts/convert-time-windows.py
 
+write_file scripts/nsx-watch.py <<'SCAFFOLD_EOF'
+#!/usr/bin/env python3
+"""Find changes made in NSX outside this repository, at a cost of one API call.
+
+For a manager in mode: managed, every object NSX holds is compared with what
+data/ says it should be, converted the same way the importer converts, so a
+difference is a real one:
+
+  scripts/nsx-watch.py --site S                 incremental: objects modified in
+                                                NSX in the last --lookback minutes
+                                                (default 20), in ONE search call
+  scripts/nsx-watch.py --site S --full          everything, in ONE hierarchical
+                                                read: also objects deleted in NSX,
+                                                and objects created outside Git
+  scripts/nsx-watch.py --site S --changed-since EPOCH
+                                                exit 0 if anything was modified
+                                                since then, 3 if nothing (mirror.sh
+                                                skips a full read when nothing has)
+
+Raised as nsx-drift issues, as the drift check raises them (scripts/drift-issue.py):
+changed, deleted, created outside Git, each with who and when as NSX records
+them. Not drift: an object another tool owns (inventory/ownership.yaml), one a
+pipeline account last changed (NSX_PIPELINE_USERS), and one whose data/ file was
+committed after NSX last changed it (its apply is pending). A scheduled rule is
+compared with what its schedule says now.
+
+Run inside scripts/with-credentials.sh (read-only plan credential). Prints the
+number of NSX calls; above NSX_API_BUDGET (per run, default 10) it warns.
+--report-only lists what it found and raises nothing. Exit status: 0 done, 1
+error, 3 (--changed-since) nothing changed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from yamlcompat import load_all, load_yaml  # noqa: E402
+
+KINDS = ("Group", "SecurityPolicy", "Rule", "Service")
+
+
+def load(name: str, file: str):
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parent / file)
+    module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
+
+
+ie = load("import_estate", "import-estate.py")
+schedule = load("nsx_schedule", "schedule.py")
+
+
+# --------------------------------------------------------------------------
+# What data/ says this manager holds
+# --------------------------------------------------------------------------
+
+def desired(site: str, role: str) -> dict:
+    """identity -> (data key, definition, data file), for every object this
+    manager's security stack manages; plus path -> key for references."""
+    tree = "/global-infra" if role == "gm" else "/infra"
+
+    def mine(d: dict) -> bool:
+        if role == "gm":
+            return d.get("owner") == "gm"
+        sites = d.get("sites") or []
+        return d.get("owner", "lm") == "lm" and (site in sites or "*" in sites)
+
+    out: dict = {"objects": {}, "paths": {}, "services": {}}
+    files = sorted((REPO_ROOT / "data" / "groups").glob("*.yaml"))
+    for f, doc in zip(files, load_all([f.read_text() for f in files]) if files else []):
+        doc = doc or {}
+        for section in ("groups", "references"):
+            for key, g in (doc.get(section) or {}).items():
+                g = g if isinstance(g, dict) else {}
+                where, nsx = g.get("domain") or "default", str(g.get("nsx_id", key))
+                prefix = "/global-infra" if g.get("owner") == "gm" else "/infra"
+                out["paths"][f"{prefix}/domains/{where}/groups/{nsx}"] = str(key)
+                if section == "groups" and mine(g):
+                    out["objects"][("group", where, nsx)] = (str(key), g, f"data/groups/{f.name}")
+    files = sorted((REPO_ROOT / "data" / "services").glob("*.yaml"))
+    for f, doc in zip(files, load_all([f.read_text() for f in files]) if files else []):
+        doc = doc or {}
+        for key in doc.get("predefined_ids") or {}:
+            out["services"][f"{tree}/services/{key}"] = str(key)
+        for key, name in (doc.get("predefined") or {}).items():
+            out["services"][f"name:{name}"] = str(key)
+        for key, sv in (doc.get("custom") or {}).items():
+            sv = sv if isinstance(sv, dict) else {}
+            prefix = "/global-infra" if sv.get("owner", "gm") == "gm" else "/infra"
+            out["services"][f"{prefix}/services/{key}"] = str(key)
+            if (role == "gm" and sv.get("owner", "gm") == "gm") or (role != "gm" and sv.get("owner", "gm") == "lm" and (
+                    site in (sv.get("sites") or ["*"]) or "*" in (sv.get("sites") or ["*"]))):
+                out["objects"][("service", str(key))] = (str(key), sv, f"data/services/{f.name}")
+    files = sorted((REPO_ROOT / "data" / "policies").glob("*.yaml"))
+    for f, doc in zip(files, load_all([f.read_text() for f in files]) if files else []):
+        doc = doc or {}
+        header = doc.get("policy") or {}
+        if not mine(header) or header.get("rule_management", "standalone") != "standalone":
+            continue
+        where, pid = header.get("domain") or "default", str(header.get("id") or f.stem)
+        out["objects"][("policy", where, pid)] = (f.stem, header, f"data/policies/{f.name}")
+        for key, rule in (doc.get("rules") or {}).items():
+            rule = rule if isinstance(rule, dict) else {}
+            out["objects"][("rule", where, pid, str(rule.get("nsx_id", key)))] = (f"{f.stem}/{key}", rule, f"data/policies/{f.name}")
+    return out
+
+
+# --------------------------------------------------------------------------
+# One comparable form for both sides, with the modules' defaults filled in
+# --------------------------------------------------------------------------
+
+def norm_list(values) -> list:
+    return sorted(json.dumps(v, sort_keys=True) if not isinstance(v, str) else v for v in values or [] if v != "ANY")
+
+
+def rule_form(r: dict, off: bool | None = None) -> dict:
+    return {
+        "name": r.get("name"), "description": r.get("description"), "sequence_number": r.get("sequence_number"),
+        "action": r.get("action", "ALLOW"), "direction": r.get("direction", "IN_OUT"),
+        "ip_version": r.get("ip_version", "IPV4_IPV6"),
+        "source_groups": norm_list(r.get("source_groups")), "destination_groups": norm_list(r.get("destination_groups")),
+        "services": norm_list(r.get("services")), "service_entries": r.get("service_entries") or {},
+        "sources_excluded": bool(r.get("sources_excluded", False)), "destinations_excluded": bool(r.get("destinations_excluded", False)),
+        "disabled": bool(r.get("disabled", False)) if off is None else off,
+        "logged": bool(r.get("logged", True)), "notes": r.get("notes"), "log_label": r.get("log_label"),
+        "profiles": norm_list(r.get("profiles")), "scope": norm_list(r.get("scope")), "tags": norm_list(r.get("tags")),
+    }
+
+
+def group_form(g: dict) -> dict:
+    criteria = []
+    for c in g.get("criteria") or []:
+        c = dict(c)
+        if "conditions" in c:
+            c["conditions"] = [{"key": x.get("key", "Tag"), "member_type": x.get("member_type", "VirtualMachine"),
+                                "operator": x.get("operator", "EQUALS"), "value": str(x.get("value", ""))} for x in c["conditions"]]
+        for k in ("ip_addresses", "mac_addresses", "external_ids", "member_groups"):
+            if k in c:
+                c[k] = sorted(str(v) for v in c[k])
+        criteria.append(c)
+    return {"display_name": g.get("display_name"), "description": g.get("description"),
+            "conjunction": g.get("conjunction") if len(criteria) > 1 else None,
+            "group_type": g.get("group_type"), "criteria": criteria, "tags": norm_list(g.get("tags"))}
+
+
+def policy_form(p: dict) -> dict:
+    return {"name": p.get("name"), "description": p.get("description"), "category": p.get("category"),
+            "sequence_number": p.get("sequence_number", 100), "stateful": p.get("stateful", True) is not False,
+            "locked": bool(p.get("locked", False)), "comments": p.get("comments"),
+            "scope": norm_list(p.get("scope")), "tags": norm_list(p.get("tags"))}
+
+
+def service_form(s: dict) -> dict:
+    return {k: v for k, v in s.items() if k not in ("owner", "sites")}
+
+
+# --------------------------------------------------------------------------
+# Reading NSX: one call
+# --------------------------------------------------------------------------
+
+def search(host: str, user: str, password: str, insecure: bool, role: str, since_ms: int) -> list[dict]:
+    """Objects of the kinds data/ manages, modified since since_ms: one search
+    call (more only past a thousand results)."""
+    base = "/global-manager/api/v1" if role == "gm" else "/policy/api/v1"
+    query = f"resource_type:({' OR '.join(KINDS)}) AND _last_modified_time:[{since_ms} TO *]"
+    out, cursor = [], None
+    while True:
+        params = {"query": query, **({"cursor": cursor} if cursor else {})}
+        page = ie.api_get(host, f"{base}/search/query?{urllib.parse.urlencode(params)}", user, password, insecure)
+        out.extend(page.get("results") or [])
+        cursor = page.get("cursor")
+        if not cursor or not page.get("results"):
+            return out
+
+
+def identity(o: dict, policy_of: dict) -> tuple | None:
+    kind = o.get("resource_type")
+    path = str(o.get("path", ""))
+    where = ie.domain_of(path, "default")
+    if kind == "Group":
+        return ("group", where, str(o.get("id")))
+    if kind == "SecurityPolicy":
+        return ("policy", where, str(o.get("id")))
+    if kind == "Rule":
+        parts = path.split("/")
+        pid = parts[parts.index("security-policies") + 1] if "security-policies" in parts else policy_of.get(path, "")
+        return ("rule", where, pid, str(o.get("id")))
+    if kind == "Service":
+        return ("service", str(o.get("id")))
+    return None
+
+
+def compare(site: str, role: str, objects: list[dict], full: bool) -> list[dict]:
+    """Drift items, as scripts/drift-issue.py raises them."""
+    want = desired(site, role)
+    tree = "/global-infra/" if role == "gm" else "/infra/"
+    rules_ = ie.ownership_rules()
+    pipeline = {u.strip() for u in os.environ.get("NSX_PIPELINE_USERS", "").split(",") if u.strip()}
+    now = schedule.parse_now(None)
+    off_now = {}
+    for r in schedule.scheduled_rules("global-security" if role == "gm" else "local-security", site):
+        off_now[r["policy"] + "/" + r["rule"]] = r["disabled"] or not schedule.active(r["schedule"], now)
+
+    def svc_key(path: str) -> str:
+        return want["services"].get(path) or path.rsplit("/", 1)[-1]
+
+    def to_data_rule(r: dict) -> dict:
+        names = lambda paths, f: [p if p == "ANY" else f(p) for p in paths or []]  # noqa: E731
+        converted = ie.convert_rule(dict(r, id=r.get("id")), want["paths"], {})
+        converted["services"] = [svc_key(p) for p in r.get("services") or [] if p != "ANY"]
+        converted["source_groups"] = names(r.get("source_groups"), lambda p: want["paths"].get(p, p))
+        converted["destination_groups"] = names(r.get("destination_groups"), lambda p: want["paths"].get(p, p))
+        return converted
+
+    def data_services(r: dict) -> list[str]:
+        out = []
+        for name in r.get("services") or []:
+            hit = next((k for k, v in want["services"].items() if v == name), None)
+            out.append(name if hit is None else (hit[5:] if hit.startswith("name:") else want["services"][hit]))
+        return out
+
+    def committed(file: str) -> int:
+        found = subprocess.run(["git", "log", "-1", "--format=%ct", "--", file], cwd=REPO_ROOT,
+                               capture_output=True, text=True).stdout.strip()
+        return int(found or 0)
+
+    items, seen = [], set()
+    for o in objects:
+        if not str(o.get("path", "")).startswith(tree) or ie.is_system(o) or ie.owned_elsewhere(o, rules_):
+            continue
+        ident = identity(o, {})
+        if ident is None:
+            continue
+        seen.add(ident)
+        who, at, seconds = ie_when(o)
+        entry = want["objects"].get(ident)
+        if entry is None:
+            if ident[0] == "rule" and ("policy", ident[1], ident[2]) not in want["objects"]:
+                continue  # a rule of an unmanaged policy: reported with its policy
+            items.append(item(ident, "created outside Git", "not in data/", who, at, o))
+            continue
+        key, definition, file = entry
+        if o.get("_last_modified_user") in pipeline:
+            continue
+        if ident[0] == "rule":
+            nsx_side = rule_form(to_data_rule(o))
+            data_side = rule_form(dict(definition, name=definition.get("name", key.split("/", 1)[1]),
+                                       services=data_services(definition)), off_now.get(key))
+        elif ident[0] == "group":
+            nsx_side = group_form(ie.convert_group(o, want["paths"], "", []))
+            data_side = group_form(definition)
+        elif ident[0] == "policy":
+            header = ie.convert_policy(dict(o, rules=[]), want["paths"], {}, "", [])["policy"]
+            nsx_side, data_side = policy_form(header), policy_form(definition)
+        else:
+            nsx_side, data_side = service_form(ie.convert_service(o)), service_form(definition)
+        if nsx_side == data_side:
+            continue
+        differs = {k for k in data_side if data_side.get(k) != nsx_side.get(k)}
+        on_schedule = ident[0] == "rule" and key in off_now and differs == {"disabled"}
+        if seconds is not None and not on_schedule and committed(file) > seconds:
+            continue  # data/ changed after NSX did: its apply is pending
+        detail = describe_diff(data_side, nsx_side)
+        high = ident[0] == "rule" and data_side["disabled"] and not nsx_side["disabled"] and key in off_now
+        items.append(item(ident, "changed", detail, who, at, o, key, "high" if high else ""))
+    if full:
+        for ident, (key, _, _) in sorted(want["objects"].items(), key=lambda kv: str(kv[0])):
+            if ident not in seen and not (ident[0] == "rule" and ("policy",) + ident[1:3] not in seen):
+                items.append(item(ident, "deleted", "", "", "", {}, key))
+    return items
+
+
+def ie_when(o: dict):
+    stamp = o.get("_last_modified_time") or o.get("_create_time")
+    seconds = stamp / 1000 if isinstance(stamp, (int, float)) else None
+    at = time.strftime("%Y-%m-%d %H:%M", time.gmtime(seconds)) if seconds else ""
+    return str(o.get("_last_modified_user") or o.get("_create_user") or ""), at, seconds
+
+
+def describe_diff(want: dict, have: dict) -> str:
+    parts = []
+    for k in sorted(set(want) | set(have)):
+        if want.get(k) == have.get(k):
+            continue
+        a, b = want.get(k), have.get(k)
+        if isinstance(a, list) and isinstance(b, list) and all(isinstance(x, str) for x in a + b):
+            parts.append(f"{k} " + " ".join([f"+{x}" for x in b if x not in a] + [f"-{x}" for x in a if x not in b]))
+        elif isinstance(a, (dict, list)) or isinstance(b, (dict, list)):
+            parts.append(f"{k} changed")
+        else:
+            parts.append(f"{k} {a} → {b}")
+    text = "; ".join(parts) or "changed"
+    return text if len(text) <= 240 else text[:237] + "..."
+
+
+def item(ident: tuple, change: str, detail: str, who: str, at: str, o: dict, key: str = "", severity: str = "") -> dict:
+    kind = ident[0]
+    label = key or (ident[-1] if kind != "rule" else f"{ident[2]}/{ident[3]}")
+    version = drift.digest([o.get("_revision"), o.get("_last_modified_time"), detail]) if o else "0" * 16
+    return {"key": f"{kind} {label}", "kind": kind, "id": label, "change": change, "detail": detail,
+            "who": who, "at": at, "version": version, "path": o.get("path", ""), "severity": severity}
+
+
+drift = load("drift_issue", "drift-issue.py")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--site", required=True)
+    ap.add_argument("--full", action="store_true")
+    ap.add_argument("--lookback", type=int, default=int(os.environ.get("NSX_WATCH_LOOKBACK", "20")), help="minutes")
+    ap.add_argument("--changed-since", type=int, metavar="EPOCH")
+    ap.add_argument("--from-dump", help="compare a capture instead of reading NSX (tests, and a second look)")
+    ap.add_argument("--report-only", action="store_true")
+    ap.add_argument("--link", default=os.environ.get("CI_JOB_URL", ""))
+    args = ap.parse_args()
+    ie.CA_SITE = args.site
+    inventory = (load_yaml((REPO_ROOT / "inventory" / "managers.yaml").read_text()) or {}).get("managers") or {}
+    manager = inventory.get(args.site) or {}
+    role = manager.get("role", "lm")
+    host = os.environ.get("NSXT_MANAGER_HOST") or manager.get("host")
+    user, password = os.environ.get("NSXT_USERNAME"), os.environ.get("NSXT_PASSWORD")
+    insecure = os.environ.get("NSXT_ALLOW_UNVERIFIED_SSL", "").strip().lower() in ("true", "1", "yes")
+    if not args.from_dump and not (host and user and password):
+        sys.exit(f"error: no credentials. Wrap the call: scripts/with-credentials.sh {args.site} -- scripts/nsx-watch.py --site {args.site}")
+
+    if args.changed_since is not None:
+        found = search(host, user, password, insecure, role, args.changed_since * 1000)
+        tree = "/global-infra/" if role == "gm" else "/infra/"
+        found = [o for o in found if str(o.get("path", "")).startswith(tree) and not ie.is_system(o)]
+        print(f"watch: {len(found)} object(s) modified on {args.site} since {time.strftime('%Y-%m-%d %H:%M', time.gmtime(args.changed_since))} UTC"
+              f" ({ie.CALLS} NSX call(s))")
+        return 0 if found else 3
+
+    if args.from_dump:
+        estate = json.loads(Path(args.from_dump).read_text())
+        objects = estate.get("groups", []) + estate.get("services", []) + [
+            dict(p, resource_type="SecurityPolicy") for p in estate.get("policies", [])] + [
+            dict(r, resource_type="Rule") for p in estate.get("policies", []) for r in p.get("rules", [])]
+        objects = [dict(o, resource_type=o.get("resource_type") or ("Group" if "/groups/" in o.get("path", "") else "Service"))
+                   for o in objects]
+    elif args.full:
+        estate = ie.fetch_estate(host, user, password, ie.GM_BASE if role == "gm" else ie.LM_BASE,
+                                 manager.get("domain") or "default", insecure)
+        objects = [dict(g, resource_type="Group") for g in estate["groups"]] + \
+                  [dict(s, resource_type="Service") for s in estate["services"]] + \
+                  [dict(p, resource_type="SecurityPolicy") for p in estate["policies"]] + \
+                  [dict(r, resource_type="Rule") for p in estate["policies"] for r in p.get("rules", [])]
+    else:
+        since = int((time.time() - args.lookback * 60) * 1000)
+        objects = search(host, user, password, insecure, role, since)
+    items = compare(args.site, role, objects, args.full or bool(args.from_dump))
+    budget = int(os.environ.get("NSX_API_BUDGET", "10"))
+    print(f"watch {'full' if args.full else 'incremental'} of {args.site}: {len(objects)} object(s) read, "
+          f"{len(items)} difference(s), {ie.CALLS} NSX call(s)")
+    if ie.CALLS > budget:
+        print(f"warning: {ie.CALLS} NSX calls is over this run's budget of {budget} (NSX_API_BUDGET)")
+    for i in items:
+        print(f"  {i['change']:20} {i['key']}  {i['detail']}  {i['who']} {i['at']}".rstrip())
+    if not items or args.report_only:
+        return 0
+    gitlab = drift.GitLab()
+    seen = gitlab.reported(args.site)
+    new = [i for i in items if (drift.digest(i["key"]), i["version"]) not in seen]
+    if not new:
+        print(f"watch: each of the {len(items)} difference(s) is already in an nsx-drift issue.")
+        return 0
+    high = any(i.get("severity") == "high" for i in new)
+    stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+    issue, _ = gitlab.call("POST", "/issues", {
+        "title": ("[HIGH] " if high else "") + f"NSX drift on {args.site}: {len(new)} change(s) made outside the repository, {stamp}",
+        "description": drift.issue_body(args.site, new, "watch", args.link),
+        "labels": f"{drift.LABEL},site:{args.site}" + (",severity::high" if high else ""),
+    })
+    print(f"watch: {len(new)} change(s) to investigate: {(issue or {}).get('web_url', 'issue raised')}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+SCAFFOLD_EOF
+mark_executable scripts/nsx-watch.py
+
+write_file scripts/revision-check.py <<'SCAFFOLD_EOF'
+#!/usr/bin/env python3
+"""Before an apply of a plan made without refresh (NSX_PLAN_REFRESH=changed):
+has anything the plan changes been changed in NSX since Terraform last read it?
+
+  terraform show -json tfplan | scripts/revision-check.py --site S
+
+For each object the plan updates or deletes, NSX's revision now is compared
+with the revision in Terraform's state: one read per such object, nothing for
+the rest of the manager. A difference means someone changed it after the plan's
+view of it: the apply is refused, with who and when, and a plan with refresh
+is needed. Exit status: 0 nothing moved, 2 something did, 1 error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import os
+import sys
+import urllib.parse
+from pathlib import Path
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--site", required=True)
+    ap.add_argument("plan_json", nargs="?")
+    args = ap.parse_args()
+    plan = json.loads(Path(args.plan_json).read_text() if args.plan_json else sys.stdin.read())
+    spec = importlib.util.spec_from_file_location("import_estate", Path(__file__).resolve().parent / "import-estate.py")
+    ie = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+    spec.loader.exec_module(ie)  # type: ignore[union-attr]
+    ie.CA_SITE = args.site
+    host, user, password = (os.environ.get(k, "") for k in ("NSXT_MANAGER_HOST", "NSXT_USERNAME", "NSXT_PASSWORD"))
+    insecure = os.environ.get("NSXT_ALLOW_UNVERIFIED_SSL", "").strip().lower() in ("true", "1", "yes")
+    moved = []
+    checked = 0
+    for change in plan.get("resource_changes") or []:
+        actions = change.get("change", {}).get("actions") or []
+        before = change.get("change", {}).get("before") or {}
+        if not ({"update", "delete"} & set(actions)) or not before.get("path") or before.get("revision") is None:
+            continue
+        prefix = "/global-manager/api/v1" if str(before["path"]).startswith("/global-infra/") else "/policy/api/v1"
+        live = ie.api_get(host, prefix + urllib.parse.quote(before["path"]), user, password, insecure, True)
+        checked += 1
+        if not live:
+            moved.append((change["address"], "deleted in NSX", "", ""))
+        elif live.get("_revision") != before["revision"]:
+            who, at, _ = (str(live.get("_last_modified_user") or "?"), live.get("_last_modified_time"), None)
+            moved.append((change["address"], f"revision {before['revision']} -> {live.get('_revision')}", who, at))
+    print(f"revision check {args.site}: {checked} object(s) the plan changes, {len(moved)} changed in NSX since; {ie.CALLS} NSX call(s)")
+    for address, what, who, at in moved:
+        print(f"  x {address}: {what} {('by ' + who) if who else ''}".rstrip())
+    if moved:
+        print("refusing to apply over a change made in NSX after the plan's view of it. Plan again with refresh:")
+        print("  NSX_PLAN_REFRESH=full scripts/tf.sh plan <stack> <site>")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+SCAFFOLD_EOF
+mark_executable scripts/revision-check.py
+
 write_file scripts/drift.sh <<'SCAFFOLD_EOF'
 #!/usr/bin/env bash
 #
@@ -11653,6 +12336,49 @@ if [ "${#failed[@]}" -gt 0 ]; then
 fi
 SCAFFOLD_EOF
 mark_executable scripts/schedule-job.sh
+
+write_file scripts/watch-job.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# The 'watch' job: find changes made in NSX outside this repository, for
+# managers in mode: managed, at the cost of one NSX API call each
+# (scripts/nsx-watch.py), and raise them as nsx-drift issues.
+#
+#   WATCH_SITE   a manager, several separated by spaces, or 'all'
+#   WATCH_FULL   1: read everything (one hierarchical read): also deletions, and
+#                objects created outside Git. Nightly.
+#
+# Managers in mode: mirror are left to the mirror job. Exit status: 0 done,
+# changes or not; 1 a manager could not be read.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT" || exit 1
+
+[ -n "${WATCH_SITE:-}" ] || {
+	echo "error: WATCH_SITE is not set: a manager in mode: managed, several, or 'all'" >&2
+	exit 1
+}
+full=()
+[ "${WATCH_FULL:-}" = 1 ] && full=(--full)
+failed=()
+checked=0
+for site in $(python3 scripts/ci-matrix.py --format lines --managed-only | awk '{ print $1 }' | sort -u); do
+	if [ "$WATCH_SITE" != all ] && [[ " $WATCH_SITE " != *" $site "* ]]; then
+		continue
+	fi
+	echo "=== $site"
+	checked=$((checked + 1))
+	NSX_CRED_SCOPE=plan scripts/with-credentials.sh "$site" -- python3 scripts/nsx-watch.py --site "$site" ${full[@]+"${full[@]}"} || failed+=("$site")
+done
+[ "$checked" -gt 0 ] || echo "no manager in mode: managed matches WATCH_SITE='$WATCH_SITE' (managers in mirror mode: the mirror job)"
+if [ "${#failed[@]}" -gt 0 ]; then
+	echo "error: not checked: ${failed[*]} (above)" >&2
+	exit 1
+fi
+SCAFFOLD_EOF
+mark_executable scripts/watch-job.sh
 
 write_file scripts/drift-job.sh <<'SCAFFOLD_EOF'
 #!/usr/bin/env bash
@@ -14701,7 +15427,8 @@ write_file .gitlab-ci.yml <<'SCAFFOLD_EOF'
 # mirror mode. Drift: a schedule with DRIFT_SITE runs only the 'drift' job,
 # which raises changes made in NSX as nsx-drift issues. docs/IMPORT.md.
 # Scheduled rules: a schedule with SCHEDULE_FOLLOW=1 runs only the 'schedule'
-# job, which switches them on and off. docs/SCHEDULES.md.
+# job, which switches them on and off. docs/SCHEDULES.md. Change watch: a
+# schedule or trigger with WATCH_SITE runs only the 'watch' job. docs/WATCH.md.
 #
 # Change control (NSX_APPLY_MODE=approval): a pipeline schedule with
 # APPROVAL_SWEEP=1 runs only the 'approvals' job, which starts the apply of
@@ -14818,6 +15545,24 @@ drift:
   rules:
     - if: $DRIFT_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
+# --- watch: changes made in NSX, found for one API call ----------------------
+# A pipeline schedule every 5 minutes with WATCH_SITE (a manager in mode:
+# managed, several, or 'all'), and one nightly with WATCH_FULL=1 as well. Or a
+# pipeline trigger from a log alert (VCF Operations for Logs) with WATCH_SITE,
+# for a change found within a minute. Read-only. docs/WATCH.md.
+
+watch:
+  stage: adopt
+  variables:
+    NSX_CRED_SCOPE: plan
+    VAULT_TOKEN: $VAULT_PLAN_TOKEN
+  script:
+    - scripts/watch-job.sh
+  resource_group: nsx-watch
+  interruptible: false
+  rules:
+    - if: $WATCH_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "trigger") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
 # --- schedule: rules that are on only at certain times ------------------------
 # A pipeline schedule every 5 minutes with SCHEDULE_FOLLOW=1, on the default
 # branch. Switches the scheduled rules of every manager in mode: managed as
@@ -14855,6 +15600,8 @@ data:
       when: never
     - if: $SCHEDULE_FOLLOW && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
+    - if: $WATCH_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "trigger")
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -14882,6 +15629,8 @@ terraform:
       when: never
     - if: $SCHEDULE_FOLLOW && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
+    - if: $WATCH_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "trigger")
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -14908,6 +15657,8 @@ matrix:
       when: never
     - if: $SCHEDULE_FOLLOW && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
+    - if: $WATCH_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "trigger")
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -14933,6 +15684,8 @@ managers:
     - if: $DRIFT_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
     - if: $SCHEDULE_FOLLOW && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+      when: never
+    - if: $WATCH_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "trigger")
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

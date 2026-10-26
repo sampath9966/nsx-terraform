@@ -18,12 +18,31 @@ def load():
     stamp = os.stat(sys.argv[1]).st_mtime_ns
     if stamp == loaded: return
     dump = json.load(open(sys.argv[1])); objs.clear(); loaded = stamp
-    for g in dump["groups"]: objs["/policy/api/v1" + g["path"]] = dict(g, resource_type="Group", _revision=1)
-    for s in dump["services"]: objs["/policy/api/v1" + s["path"]] = dict(s, resource_type="Service", _revision=1)
+    rev = lambda o: o.get("_revision", 1)
+    for g in dump["groups"]: objs["/policy/api/v1" + g["path"]] = dict(g, resource_type="Group", _revision=rev(g))
+    for s in dump["services"]: objs["/policy/api/v1" + s["path"]] = dict(s, resource_type="Service", _revision=rev(s))
     for p in dump["policies"]:
-        body = dict(p, resource_type="SecurityPolicy", _revision=1); objs["/policy/api/v1" + p["path"]] = body
-        for r in p["rules"]: objs["/policy/api/v1" + r["path"]] = dict(r, resource_type="Rule", _revision=1)
+        body = dict(p, resource_type="SecurityPolicy", _revision=rev(p)); objs["/policy/api/v1" + p["path"]] = body
+        for r in p["rules"]: objs["/policy/api/v1" + r["path"]] = dict(r, resource_type="Rule", _revision=rev(r))
 load()
+def tree():
+    """Infra -> Domain -> Group, SecurityPolicy -> Rule; Infra -> Service."""
+    child = lambda kind, obj, children=None: {"resource_type": f"Child{kind}", kind: dict(obj, **({"children": children} if children else {}))}
+    domains = {}
+    for key, o in objs.items():
+        found = re.match(r"^/policy/api/v1/infra/domains/([^/]+)/", key)
+        if found: domains.setdefault(found.group(1), [])
+    for key, o in objs.items():
+        found = re.match(r"^/policy/api/v1/infra/domains/([^/]+)/(groups|security-policies)/[^/]+$", key)
+        if not found: continue
+        if o["resource_type"] == "Group":
+            domains[found.group(1)].append(child("Group", o))
+        else:
+            rules = [child("Rule", r) for k, r in objs.items() if k.startswith(key + "/rules/")]
+            domains[found.group(1)].append(child("SecurityPolicy", {k: v for k, v in o.items() if k != "rules"}, rules))
+    children = [child("Domain", {"id": d, "path": f"/infra/domains/{d}", "resource_type": "Domain"}, c) for d, c in sorted(domains.items())]
+    children += [child("Service", o) for k, o in objs.items() if o.get("resource_type") == "Service"]
+    return {"resource_type": "Infra", "id": "infra", "children": children}
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def send(self, code, body):
@@ -33,9 +52,23 @@ class H(BaseHTTPRequestHandler):
         load()
         path = urllib.parse.unquote(self.path.split("?")[0]); log.write(f"GET {self.path}\n"); log.flush()
         if path in ("/api/v1/node", "/api/v1/node/version"): return self.send(200, {"node_version": "4.1.2.0.0", "product_version": "4.1.2.0.0"})
+        # The hierarchical read: the whole tree in one call, as NSX 4.2 serves it.
+        # A file <request-log>.paged makes the mock refuse it, like a manager
+        # without it, so the paged read is tested too.
+        if path == "/policy/api/v1/infra" and "type_filter=" in self.path:
+            if os.path.exists(sys.argv[2] + ".paged"):
+                return self.send(400, {"error_message": "mock: no hierarchical read"})
+            return self.send(200, tree())
         if path in objs: return self.send(200, objs[path])
         if path == "/policy/api/v1/infra/services":
             found = [o for k, o in objs.items() if "/infra/services/" in k]
+            return self.send(200, {"results": found, "result_count": len(found)})
+        if path.startswith("/policy/api/v1/search") and "_last_modified_time" in urllib.parse.unquote(self.path):
+            # The change watch: objects of these kinds modified since a time.
+            query = urllib.parse.unquote_plus(self.path.partition("query=")[2].split("&")[0])
+            kinds = re.search(r"resource_type:\(([^)]*)\)", query).group(1).split(" OR ")
+            since = int(re.search(r"_last_modified_time:\[(\d+) TO", query).group(1))
+            found = [o for o in objs.values() if o.get("resource_type") in kinds and (o.get("_last_modified_time") or 0) >= since]
             return self.send(200, {"results": found, "result_count": len(found)})
         if path.startswith("/policy/api/v1/search"):
             # Honour the display_name in the query, as the real search API does.

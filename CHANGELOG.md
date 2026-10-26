@@ -13,6 +13,16 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.7.0
+
+**Every change made outside Git is found, at the cost of a few API calls.** The new `watch` job (`scripts/nsx-watch.py`) compares what NSX holds with data/, converted exactly as the importer converts it, without Terraform: every 5 minutes the objects modified in the last 20 minutes, in one search call; nightly (`WATCH_FULL=1`) everything in one hierarchical read, which also finds objects deleted in NSX and objects created outside Git. Raised as `nsx-drift` issues with who and when. Not drift: another tool's objects, the pipeline's own changes (`NSX_PIPELINE_USERS`), a pending apply (data/ committed after NSX last changed), membership, renumbering. A log alert (VCF Operations for Logs) can trigger it within a minute. docs/WATCH.md.
+
+**Reading costs a call, not a call per policy.** The importer, the mirror and the conversion of time windows read a manager in one hierarchical call where NSX offers it (4.2 does), list by list otherwise (`NSX_READ=paged`); every script reports its NSX calls and warns above `NSX_API_BUDGET`. One login per manager per run (a session) instead of credentials on every call. The mirror skips its full read when nothing was modified since its last copy (one search call); `MIRROR_FULL=1` nightly catches deletions.
+
+**Cheaper plans, opt-in.** `NSX_PLAN_REFRESH=changed` plans without reading NSX; before the apply, `scripts/revision-check.py` reads only the objects the plan changes and refuses the apply if any changed in NSX since Terraform last saw it, naming who. Proven with the real provider.
+
+**Fixed:** a value written as plain `n` or `y` (a rule's notes, a group name) is quoted: Terraform's yamldecode reads it as a boolean.
+
 ## 1.6.0
 
 **Rules that are on only at certain times, enforced identically on a Global and a Local Manager.** A rule in data/ takes a `schedule:`: an IANA time zone, windows (days, from, to, past midnight allowed), `starts`, `expires`, an `owner` and a `ticket`. Outside its windows, before it starts and once it expires, the rule is disabled: for an ALLOW rule, closed. NSX holds no time window (a Local Manager's own exist only there, and Terraform cannot express them): every plan of a security stack sets each scheduled rule's `disabled` as its schedule says at that moment. docs/SCHEDULES.md.

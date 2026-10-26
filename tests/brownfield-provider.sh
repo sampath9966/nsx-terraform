@@ -589,6 +589,22 @@ cd "$T" || exit 1
 writes="$(grep WRITE "$SCRATCH/requests.log" | grep -vc "/api/session/create" || true)"
 check "NSX received no write at all (login sessions aside)" test "$writes" -eq 0
 
+echo "reading cost: the whole manager in one call, one login"
+cd "$T" || exit 1
+before="$(wc -l <"$SCRATCH/requests.log")"
+out="$(python3 scripts/import-estate.py --site lon1 --dump-only "$SCRATCH/cost-h.json" 2>&1)"
+check "a capture reads the whole manager in one call (hierarchical read), after one login" bash -c 'grep -q "in 2 call(s) (hierarchical read)" <<<"$1" && [ "$(tail -n +"$(( $3 + 1 ))" "$2" | grep -c "^GET")" = 1 ] && [ "$(tail -n +"$(( $3 + 1 ))" "$2" | grep -c "session/create")" = 1 ]' _ "$out" "$SCRATCH/requests.log" "$before"
+touch "$SCRATCH/requests.log.paged"
+out="$(python3 scripts/import-estate.py --site lon1 --dump-only "$SCRATCH/cost-p.json" 2>&1)"
+rm -f "$SCRATCH/requests.log.paged"
+check "a manager without the hierarchical read is read list by list, to the same objects" bash -c 'grep -q "(paged read)" <<<"$1" && python3 - "$2" "$3" <<'"'"'PY'"'"'
+import json, sys
+a, b = (json.load(open(f)) for f in sys.argv[1:3])
+key = lambda d: (sorted(g["path"] for g in d["groups"]), sorted(s["path"] for s in d["services"]),
+                 sorted((p["path"], sorted(r["path"] for r in p["rules"])) for p in d["policies"]))
+sys.exit(0 if key(a) == key(b) else 1)
+PY' _ "$out" "$SCRATCH/cost-h.json" "$SCRATCH/cost-p.json"
+
 echo "the time follower: a scheduled rule switched on and off by the real provider, and nothing else"
 # The one place this suite lets the mock accept a write: an existing rule's update.
 T6="$SCRATCH/tree6"
@@ -666,6 +682,27 @@ before="$(wc -l <"$SCRATCH/requests.log")"
 out="$(tf follow local-security lon1)"
 check "inside its window again the follower switches it back on" bash -c 'grep -q "Resources: 0 added, 1 changed, 0 destroyed" <<<"$1" && tail -n +"$(( $3 + 1 ))" "$2" | grep "^BODY" | grep -q "\"disabled\": false"' _ "$out" "$SCRATCH/requests.log" "$before"
 check "...and a normal plan then agrees with NSX and the schedule: no changes" grep -q "No changes" <<<"$(tf plan local-security lon1)"
+
+echo "a plan without refresh (NSX_PLAN_REFRESH=changed): no read per object; the apply checks what it changes"
+sed -i 's/    logged: true/    logged: false/' data/policies/sched.yaml
+before="$(wc -l <"$SCRATCH/requests.log")"
+out="$(NSX_PLAN_REFRESH=changed tf plan local-security lon1)"
+check "the plan reads no object from NSX, and shows the change" bash -c 'grep -q "0 to add, 1 to change, 0 to destroy" <<<"$1" && ! tail -n +"$(( $3 + 1 ))" "$2" | grep "^GET" | grep -q "/infra/"' _ "$out" "$SCRATCH/requests.log" "$before"
+touch "$SCRATCH/requests.log.writable"
+curl -sk -X PATCH -H 'Content-Type: application/json' --data '{"notes": "changed in the UI"}' \
+	"https://127.0.0.1:$port/policy/api/v1/infra/domains/default/security-policies/sched/rules/s1" >/dev/null
+out="$(APPROVE=yes tf apply local-security lon1)"
+check "the rule was changed in the UI since: the apply is refused, and says to plan with refresh" bash -c 'grep -q "1 changed in NSX since" <<<"$1" && grep -q "refusing to apply over a change made in NSX" <<<"$1" && ! grep -q "Apply complete" <<<"$1"' _ "$out"
+out="$(tf plan local-security lon1)"
+check "a plan with refresh sees the UI change too" bash -c 'grep -q "0 to add, 1 to change, 0 to destroy" <<<"$1" && grep -q "changed in the UI" <<<"$1"' _ "$out"
+APPROVE=yes tf apply local-security lon1 >/dev/null
+sed -i 's/    logged: false/    logged: true/' data/policies/sched.yaml
+NSX_PLAN_REFRESH=changed tf plan local-security lon1 >/dev/null
+before="$(wc -l <"$SCRATCH/requests.log")"
+out="$(APPROVE=yes tf apply local-security lon1)"
+check "with nothing changed since, the apply checks the one object it changes, and applies" bash -c 'grep -q "revision check lon1: 1 object(s) the plan changes, 0 changed in NSX since" <<<"$1" && grep -q "1 changed, 0 destroyed" <<<"$1"' _ "$out"
+check "...reading that object alone before writing it" bash -c '[ "$(tail -n +"$(( $2 + 1 ))" "$1" | grep "^GET" | grep "/infra/" | grep -vc "/sched/rules/s1")" = 0 ]' _ "$SCRATCH/requests.log" "$before"
+rm -f "$SCRATCH/requests.log.writable"
 rm -f "$SCRATCH/requests.log.writable"
 # An engineer switches it on in the UI outside its window: the drift check raises it, high.
 export NSX_SCHEDULE_NOW=2026-11-03T12:00:00Z

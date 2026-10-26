@@ -127,7 +127,7 @@ import importlib.util, sys
 spec = importlib.util.spec_from_file_location("imp", "scripts/import-estate.py")
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 calls = []
-def fake(host, path, user, password, insecure):
+def fake(host, path, *a):
     calls.append(path)
     if path.endswith("/groups"): return {"results": [{"id": "a"}], "cursor": "c1"}
     if "cursor=c1" in path: return {"results": [{"id": "b"}], "cursor": "c2"}
@@ -343,6 +343,7 @@ import json, time
 d = json.load(open("reports/lon1-raw.json"))
 fresh = next(p for p in d["policies"] if p["id"] == "fresh-app")
 second = json.loads(json.dumps(fresh["rules"][0]).replace('"' + fresh["rules"][0]["id"] + '"', '"second-rule"'))
+second["path"] = fresh["rules"][0]["path"].rsplit("/", 1)[0] + "/second-rule"
 second["sequence_number"] = fresh["rules"][0]["sequence_number"] + 100
 second["_last_modified_user"], second["_last_modified_time"] = "carol", int(time.time() * 1000)
 fresh["rules"].append(second)
@@ -723,7 +724,7 @@ python3 - <<'PY'
 import json
 GD = "/global-infra/domains/default"
 c = lambda v: [{"resource_type": "Condition", "key": "Tag", "member_type": "VirtualMachine", "operator": "EQUALS", "value": v}]
-odd = ["Azure-AD-IP's", "100", "-lead", "a,b [c]", 'say "hi"', "back\\slash", "#hash", "@at", "x: y"]
+odd = ["Azure-AD-IP's", "100", "-lead", "a,b [c]", 'say "hi"', "back\\slash", "#hash", "@at", "x: y", "n", "Y"]
 groups = [{"id": i, "path": f"{GD}/groups/{i}", "display_name": i, "description": "line one\nline 'two'\ttab", "expression": c("app|x")} for i in odd]
 svc = [{"id": "gm_UDP_49152–65535", "path": "/global-infra/services/gm_UDP_49152–65535", "display_name": "gm UDP 49152–65535",
         "service_entries": [{"resource_type": "L4PortSetServiceEntry", "l4_protocol": "UDP", "destination_ports": ["49152-65535"]}]}]
@@ -746,7 +747,7 @@ bad = [f for f in glob.glob("data/*/*.yaml") if yaml.safe_load(open(f)) != load_
 print(bad, file=sys.stderr)
 sys.exit(1 if bad else 0)
 PY
-check "...the odd names reach the copy intact" python3 -c "import yaml,sys;g=yaml.safe_load(open('data/groups/imported-gm1-mirror.yaml'))['groups'];sys.exit(0 if {\"Azure-AD-IP's\",'100','-lead','a,b [c]','say \"hi\"','back\\\\slash','#hash','@at','x: y'} <= set(g) and g['100']['description']=='line one\nline \'two\'\ttab' else 1)"
+check "...the odd names reach the copy intact" python3 -c "import yaml,sys;g=yaml.safe_load(open('data/groups/imported-gm1-mirror.yaml'))['groups'];sys.exit(0 if {\"Azure-AD-IP's\",'100','-lead','a,b [c]','say \"hi\"','back\\\\slash','#hash','@at','x: y','n','Y'} <= set(g) and g['100']['description']=='line one\nline \'two\'\ttab' else 1)"
 check "two policies NSX holds under one display name are both taken, and validate without PyYAML too" bash -c 'test -f data/policies/CSS.yaml && test -f data/policies/CSS-LbTAAIz-d.yaml && ! NSX_YAML_FALLBACK=1 python3 scripts/validate-data.py 2>&1 | grep -q "^ERROR"'
 check "imported rules' sequence numbers are taken as they are, without a warning each" bash -c '! python3 scripts/validate-data.py 2>&1 | grep -q "CSS.yaml.*not a multiple of 100"'
 check "...and validate: an adopted object keeps its own id" bash -c '! python3 scripts/validate-data.py 2>&1 | grep -q "^ERROR"'
