@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.5.5"
+VERSION="1.6.0"
 
 ROOT="$PWD"
 FORCE=0
@@ -1140,6 +1140,9 @@ write_file .gitignore <<'SCAFFOLD_EOF'
 *.tfvars
 !*.example.tfvars
 
+# Written by scripts/tf.sh at each plan from the schedules in data/.
+*.auto.tfvars.json
+
 # Saved plans are sensitive artifacts, not review attachments.
 tfplan
 tfplan.site
@@ -1314,6 +1317,86 @@ indent_size = 4
 
 [Makefile]
 indent_style = tab
+SCAFFOLD_EOF
+
+write_file docs/SCHEDULES.md <<'SCAFFOLD_EOF'
+# Rules that are on only at certain times
+
+A vendor's access on weekday evenings, a maintenance path for one night, an
+exception that must end on a date. In data/ a rule says when it is on; the
+pipeline makes it so. NSX holds no time window: Terraform sets the rule's
+`disabled`. A Local Manager's own time windows exist only there, so this way
+the same rule is enforced identically on a Global Manager and a Local Manager.
+
+```yaml
+rules:
+  vendor-maintenance:
+    action: ALLOW
+    source_groups: [vendor-jump-hosts]
+    destination_groups: [erp-db]
+    services: [ORACLE-1521]
+    scope: [erp-db]
+    schedule:
+      timezone: Asia/Kolkata        # required: an IANA zone, never "server time"
+      windows:                      # on ONLY inside a window; no windows: on all the time
+        - days: [MON, TUE, WED, THU, FRI]
+          from: "09:00"
+          to: "18:00"
+        - days: [SAT]
+          from: "22:00"
+          to: "02:00"               # past midnight: until 02:00 on Sunday
+      starts: 2026-11-01            # optional: off before this
+      expires: 2026-12-31 18:00     # optional: off from this on, for good
+      owner: app-erp-team           # required: who answers for it being on
+      ticket: CHG0012345            # optional
+```
+
+Outside its windows, before `starts` and from `expires` on, the rule is
+disabled. For an ALLOW rule that is closed: the safe state is the default. A
+scheduled DROP is accepted with a warning: off outside its windows, what it
+blocks is allowed then.
+
+## How it is enforced
+
+- **Every plan** of a security stack sets each scheduled rule as its schedule
+  says at that moment (`scripts/tf.sh` asks `scripts/schedule.py`).
+- **The time follower**: a pipeline schedule every 5 minutes on the default
+  branch with `SCHEDULE_FOLLOW=1` runs the `schedule` job. For each manager in
+  `mode: managed` it compares Terraform's state with the schedules. When they
+  agree, NSX is not contacted at all. When a rule has to switch, it plans that
+  rule only, without reading anything else from NSX, and `plan-guard --schedule`
+  refuses the plan unless the only change is rules' `disabled`. It uses the
+  apply credential: the merge request that added the schedule was the approval.
+- **The drift check** knows the schedules. A scheduled rule switched on in NSX
+  outside its schedule is raised as a `[HIGH]` issue, labelled `severity::high`:
+  access the schedule does not grant. One left off inside its schedule, or a
+  switch the follower missed (the job failed, GitLab was down), is raised too.
+  The follower corrects both at its next run.
+- **Expiry**: the `schedule` job raises an `nsx-schedule` issue 7 days before a
+  rule expires (`NSX_SCHEDULE_WARN_DAYS`), when it has expired (it is then
+  disabled), and 14 days after (`NSX_SCHEDULE_GRACE_DAYS`): time to remove it
+  in a merge request, with its line in allow-destroy.txt. Nothing is ever
+  deleted automatically.
+
+GitLab self-managed starts scheduled pipelines every 10 minutes by default, so
+a rule can switch up to 10 minutes late. For one-minute precision set
+`gitlab_rails['pipeline_schedule_worker_cron'] = "* * * * *"` in gitlab.rb.
+
+`NSX_SCHEDULE_NOW=2026-11-07T17:00:00Z scripts/schedule.py desired --stack local-security --site lon1`
+shows what would be on at any moment.
+
+## Moving a Local Manager's time windows over
+
+```bash
+scripts/with-credentials.sh lon1 -- scripts/convert-time-windows.py --site lon1
+```
+
+Read-only, two NSX reads at most. It writes `reports/time-windows-lon1.md`: for
+each rule using a time window (one set on a policy counts for each of its
+rules), the `schedule:` block to paste under it, or why it cannot be converted
+exactly. Fill in `owner:`. Until then the importer leaves such rules in the UI
+(NOT ADOPTED: has a time window). At cutover of the policy, in one change:
+remove the time window in NSX, and merge the rule with its `schedule:`.
 SCAFFOLD_EOF
 
 write_file docs/IMPORT.md <<'SCAFFOLD_EOF'
@@ -1794,6 +1877,7 @@ describing no real site. Replace it, or regenerate with `--no-examples`.
 | `docs/STRUCTURE.md` | What each directory is for, and what must *not* go in it. |
 | `docs/TAGGING.md` | Who applies tags: the two variants, the ownership constraint, how the boundary is enforced. |
 | `docs/IMPORT.md` | Adopting an estate that already exists — the tranche workflow. |
+| `docs/SCHEDULES.md` | Rules that are on only at certain times, and rules that expire. |
 | `docs/SETUP.md` | Standing this up end to end: prerequisites, the decisions that are yours, backend choice, first contact with a manager. |
 | `docs/GITOPS.md` | How a rule edit becomes a merge request, a plan, an approval and an apply — and what the approver is looking for. |
 | `docs/ACCEPTANCE.md` | **What "it works" means and how to prove it** — the staged plan from offline checks to a real apply. Read before promising this to anyone. |
@@ -1811,6 +1895,7 @@ By question:
 | Get changes reviewed before they apply | `docs/GITOPS.md` |
 | Decide who tags workloads | `docs/TAGGING.md` |
 | Adopt an existing estate | `docs/IMPORT.md` |
+| Open a rule only at certain times, or until a date | `docs/SCHEDULES.md` |
 | Find a command | `docs/ARCHITECTURE.md` §16 — every command that exists |
 | Know what is still undecided | `docs/ARCHITECTURE.md` §14 |
 
@@ -3011,6 +3096,33 @@ write_file data/schema/policy.schema.json <<'SCAFFOLD_EOF'
         "properties": {
           "name": { "type": "string" },
           "nsx_id": { "type": "string", "pattern": "^[^/]{1,255}$", "description": "The rule's id in NSX, when the key is not: an id the UI generated is keyed by the rule's name." },
+          "schedule": {
+            "type": "object",
+            "required": ["timezone", "owner"],
+            "additionalProperties": false,
+            "description": "When the rule is on (scripts/schedule.py). Off outside its windows, before starts and from expires on; enforced by the pipeline through 'disabled', identically on a Global and a Local Manager.",
+            "properties": {
+              "timezone": { "type": "string", "description": "An IANA time zone, e.g. Asia/Kolkata." },
+              "windows": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "required": ["from", "to"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "days": { "type": "array", "minItems": 1, "items": { "enum": ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] } },
+                    "from": { "type": "string" },
+                    "to": { "type": "string" }
+                  }
+                }
+              },
+              "starts": { "description": "A date (YYYY-MM-DD) or date and time (YYYY-MM-DD HH:MM) in the schedule's zone." },
+              "expires": { "description": "A date or date and time in the schedule's zone; the rule is off from then on, for good." },
+              "owner": { "type": "string", "minLength": 1 },
+              "ticket": { "type": "string" }
+            }
+          },
           "description": { "type": "string" },
           "sequence_number": { "type": "integer", "minimum": 0 },
           "action": { "enum": ["ALLOW", "DROP", "REJECT", "JUMP_TO_APPLICATION"] },
@@ -3763,6 +3875,12 @@ variable "service_paths" {
   type        = map(string)
   default     = {}
 }
+
+variable "rules_off" {
+  description = "Rules of this policy whose schedule has them off now (scripts/schedule.py): disabled whatever the data says."
+  type        = list(string)
+  default     = []
+}
 SCAFFOLD_EOF
 
 write_file modules/dfw-policy/main.tf <<'SCAFFOLD_EOF'
@@ -3891,7 +4009,9 @@ resource "nsxt_policy_security_policy_rule" "this" {
   action          = each.value.action
   direction       = each.value.direction
   ip_version      = try(each.value.ip_version, "IPV4_IPV6")
-  disabled        = try(each.value.disabled, false)
+  # A scheduled rule is off outside its windows and once it expires: scripts/
+  # schedule.py works that out at plan time, the same on a GM and an LM.
+  disabled        = try(each.value.disabled, false) || contains(var.rules_off, each.key)
   logged          = try(each.value.logged, true)
   notes           = try(each.value.notes, null)
   log_label       = try(each.value.log_label, null)
@@ -4626,6 +4746,12 @@ variable "data_root" {
   type        = string
   default     = "../../data"
 }
+
+variable "scheduled_off" {
+  description = "Policy key => its rules a schedule has off now. Written by scripts/tf.sh from scripts/schedule.py; never set by hand."
+  type        = map(list(string))
+  default     = {}
+}
 SCAFFOLD_EOF
 
 write_file stacks/global-security/main.tf <<'SCAFFOLD_EOF'
@@ -4738,6 +4864,7 @@ module "policies" {
   domain        = var.domain
   group_paths   = local.group_paths
   service_paths = local.service_paths
+  rules_off     = lookup(var.scheduled_off, each.key, [])
 }
 SCAFFOLD_EOF
 
@@ -4818,6 +4945,12 @@ variable "data_root" {
   description = "Location of the data/ tree relative to this stack."
   type        = string
   default     = "../../data"
+}
+
+variable "scheduled_off" {
+  description = "Policy key => its rules a schedule has off now. Written by scripts/tf.sh from scripts/schedule.py; never set by hand."
+  type        = map(list(string))
+  default     = {}
 }
 SCAFFOLD_EOF
 
@@ -4962,6 +5095,7 @@ module "policies" {
   domain        = var.domain
   group_paths   = local.group_paths
   service_paths = local.service_paths
+  rules_off     = lookup(var.scheduled_off, each.key, [])
 }
 SCAFFOLD_EOF
 
@@ -5353,6 +5487,7 @@ write_file scripts/tf.sh <<'SCAFFOLD_EOF'
 #   scripts/tf.sh show   <stack> <site>
 #   scripts/tf.sh apply  <stack> <site>     # requires APPROVE=yes
 #   scripts/tf.sh drift  <stack> <site>     # refresh-only plan: exit 2 on drift
+#   scripts/tf.sh follow <stack> <site>     # switch scheduled rules on or off, nothing else
 #
 # Credentials are never read from a file here. Either they are already in the
 # environment as NSXT_MANAGER_HOST / NSXT_USERNAME / NSXT_PASSWORD, or you wrap
@@ -5366,7 +5501,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PARALLELISM="${PARALLELISM:-5}"
 
 usage() {
-	sed -n '3,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+	sed -n '3,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 	exit "${1:-1}"
 }
 
@@ -5585,6 +5720,17 @@ require_plan_for_site() {
 	fi
 }
 
+# Scheduled rules (scripts/schedule.py): which are off right now, as Terraform
+# input, so every plan of a security stack sets them as their schedule says.
+# Written fresh before each plan; never committed.
+schedule_vars() {
+	case "$stack" in
+	global-security | local-security)
+		python3 "$REPO_ROOT/scripts/schedule.py" tfvars --stack "$stack" --site "$site" >"$stack_dir/schedule.auto.tfvars.json"
+		;;
+	esac
+}
+
 case "$cmd" in
 init)
 	init_for_site "$@"
@@ -5592,6 +5738,7 @@ init)
 plan)
 	ensure_init
 	rm -f "$plan_file" "$plan_site_file"
+	schedule_vars
 	run plan -out=tfplan -parallelism="$PARALLELISM" -input=false "$@"
 	printf '%s\n' "$site" >"$plan_site_file"
 	echo
@@ -5646,16 +5793,63 @@ apply)
 	run apply -parallelism="$PARALLELISM" -input=false tfplan
 	rm -f "$plan_file" "$plan_site_file"
 	;;
+follow)
+	# The time follower: switch the scheduled rules whose schedule changed since
+	# the last switch, and nothing else. What state holds is compared with what
+	# the schedules say now; when they agree, NSX is not contacted at all.
+	case "$stack" in
+	global-security | local-security) ;;
+	*)
+		echo "schedule: $stack has no rules to switch"
+		exit 0
+		;;
+	esac
+	if [ "${NSX_MODE:-}" = mirror ]; then
+		echo "schedule: $site is in mirror mode, still run from the UI: nothing is switched on it"
+		exit 0
+	fi
+	ensure_init
+	schedule_vars
+	state_json="$(mktemp "${TMPDIR:-/tmp}/nsx-state.XXXXXX")"
+	run state pull >"$state_json"
+	mapfile -t switch < <(python3 "$REPO_ROOT/scripts/schedule.py" switch --stack "$stack" --site "$site" --state "$state_json")
+	rm -f "$state_json"
+	if [ "${#switch[@]}" -eq 0 ]; then
+		echo "schedule: nothing to switch on $site/$stack (NSX not contacted)"
+		exit 0
+	fi
+	echo "schedule: switching ${#switch[@]} rule(s) on $site/$stack:"
+	printf '  %s\n' "${switch[@]}"
+	targets=()
+	for a in "${switch[@]}"; do targets+=(-target="$a"); done
+	rm -f "$plan_file" "$plan_site_file"
+	# No refresh: only these rules are touched, and only their 'disabled'.
+	run plan -refresh=false -out=tfplan -input=false "${targets[@]}"
+	printf '%s\n' "$site" >"$plan_site_file"
+	if ! guard --schedule; then
+		echo "error: refusing to switch: the plan changes more than scheduled rules' on/off (above)." >&2
+		exit 2
+	fi
+	if uses_local_backend && [ "${ALLOW_LOCAL_STATE:-}" != 1 ]; then
+		echo "error: stack $stack is still on the placeholder local backend; set ALLOW_LOCAL_STATE=1 only for a lab." >&2
+		exit 1
+	fi
+	run apply -input=false tfplan
+	rm -f "$plan_file" "$plan_site_file"
+	;;
 drift)
 	# Refresh-only: state against the live manager. Proposes nothing and
 	# changes nothing; never touches the reviewed tfplan. With DRIFT_JSON set,
 	# the plan is also written there as JSON. Exit 0 no drift, 2 drift.
 	ensure_init
+	schedule_vars
 	set +e
 	run plan -refresh-only -detailed-exitcode -input=false -out=drift.tfplan "$@"
 	status=$?
 	set -e
-	if [ "$status" = 2 ] && [ -n "${DRIFT_JSON:-}" ]; then
+	# The JSON is wanted with no drift too: a scheduled rule left in the wrong
+	# state by a missed switch is not drift between state and NSX.
+	if { [ "$status" = 2 ] || [ "$status" = 0 ]; } && [ -n "${DRIFT_JSON:-}" ]; then
 		run show -json drift.tfplan >"$DRIFT_JSON" || status=1
 	fi
 	rm -f "$stack_dir/drift.tfplan"
@@ -6854,6 +7048,19 @@ def check_inventory(report: Report) -> dict:
     return managers
 
 
+def schedule_problems(schedule) -> list[str]:
+    """scripts/schedule.py's own check, so a schedule that validates is one the
+    pipeline can enforce."""
+    import importlib.util  # noqa: PLC0415
+
+    spec = importlib.util.spec_from_file_location("nsx_schedule", Path(__file__).resolve().parent / "schedule.py")
+    if spec is None or spec.loader is None:
+        return ["scripts/schedule.py is missing: bring the tree up to date"]
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.problems(schedule)
+
+
 def as_date(value) -> date:
     """A YAML date as any reader gives it: a date (PyYAML), or a string, with a
     time (Terraform's yamldecode: 2026-11-01T00:00:00Z) or without."""
@@ -7249,6 +7456,13 @@ def check_policies(
 
             if rule.get("action") in ("DROP", "REJECT") and rule.get("logged") is False:
                 report.warn(where, f"{label}: a drop with logging off is invisible during an incident.")
+
+            if "schedule" in rule:
+                for problem in schedule_problems(rule["schedule"]):
+                    report.error(where, f"{label}.schedule: {problem}")
+                if rule.get("action") in ("DROP", "REJECT"):
+                    report.warn(where, f"{label}: a scheduled {rule.get('action')} is off outside its windows, so what it blocks is "
+                                       "allowed then. A time-limited ALLOW is the usual way round.")
 
             if not (rule.get("source_groups") or rule.get("destination_groups")):
                 report.warn(where, f"{label}: neither source nor destination is set — this matches everything in scope.")
@@ -8651,7 +8865,7 @@ KNOWN_FIELDS = {
 }
 # Fields with a name, because what they carry matters.
 NAMED_FIELDS = {
-    "scheduler_path": "a time window, which Terraform cannot express (convert it to a schedule: in data/)",
+    "scheduler_path": "a time window, which Terraform cannot express (scripts/convert-time-windows.py turns it into a schedule:, docs/SCHEDULES.md)",
     "connectivity_strategy": "a connectivity strategy, which Terraform cannot express",
     "application_connectivity_strategy": "an application connectivity strategy, which Terraform cannot express",
     "connectivity_preference": "a connectivity preference, which Terraform cannot express",
@@ -9605,6 +9819,13 @@ def load_allowed(site: str, stack: str) -> set[str]:
     return allowed
 
 
+def changed_fields(change: dict) -> set[str]:
+    """Top-level attributes an update changes (a computed value left unknown aside)."""
+    before, after = change.get("before") or {}, change.get("after") or {}
+    unknown = change.get("after_unknown") or {}
+    return {k for k in set(before) | set(after) if before.get(k) != after.get(k) and not unknown.get(k)}
+
+
 def import_files(stack_dir: Path, site: str) -> list[Path]:
     """This site's tranche files, and a legacy import.tf, which applies to every site."""
     candidates = list(stack_dir.glob(f"import-{site}-*.tf")) + list(stack_dir.glob("import.tf"))
@@ -9617,6 +9838,8 @@ def main() -> int:
     ap.add_argument("--stack", required=True)
     ap.add_argument("--observe", action="store_true",
                     help="mirror mode: only imports and no-ops; everything else is refused")
+    ap.add_argument("--schedule", action="store_true",
+                    help="the time follower: only a rule's 'disabled' may change; everything else is refused")
     ap.add_argument("plan_json", nargs="?", help="output of 'terraform show -json tfplan' (default: stdin)")
     args = ap.parse_args()
 
@@ -9647,6 +9870,13 @@ def main() -> int:
         if args.observe and actions not in (["no-op"], ["read"]):
             refused.append((address, f"{'/'.join(actions)} on a manager in mirror mode: only imports and refreshes are applied to it"))
             continue
+        if args.schedule and actions not in (["no-op"], ["read"]):
+            if actions == ["update"] and c.get("type") == "nsxt_policy_security_policy_rule" and \
+                    changed_fields(c["change"]) <= {"disabled"}:
+                counts["update"] += 1
+            else:
+                refused.append((address, f"{'/'.join(actions)}: the time follower only switches scheduled rules on or off"))
+            continue
         if "delete" in actions:
             counts["destroy"] += 1
             kind = "replace" if "create" in actions else "destroy"
@@ -9670,7 +9900,8 @@ def main() -> int:
                 why = "the data does not match the live object yet" if importing else "a change mixed into an import tranche; adopt first, change in a later merge request"
                 refused.append((address, f"update during an import tranche: {why}"))
 
-    mode = "mirror, observe only" if args.observe else "import tranche (must be pure)" if tranche else "normal"
+    mode = ("mirror, observe only" if args.observe else "time follower, on/off only" if args.schedule
+            else "import tranche (must be pure)" if tranche else "normal")
     print(
         f"plan-guard {args.site}/{args.stack}, {mode}: "
         f"{counts['import']} import, {counts['create']} create, {counts['update']} update, "
@@ -10574,6 +10805,45 @@ def plan_changes(plan: dict) -> list[dict]:
     return items
 
 
+def plan_resources(module: dict):
+    """Every resource in a plan's module tree (prior_state / planned_values)."""
+    yield from module.get("resources") or []
+    for child in module.get("child_modules") or []:
+        yield from plan_resources(child)
+
+
+def schedule_items(site: str, stack: str, plan: dict, items: list[dict]) -> None:
+    """Scheduled rules NSX holds in the wrong state now: switched on outside
+    their schedule (high severity: access the schedule does not grant), or left
+    off inside it. A switch the follower missed shows here too."""
+    import importlib.util  # noqa: PLC0415
+
+    spec = importlib.util.spec_from_file_location("nsx_schedule", Path(__file__).resolve().parent / "schedule.py")
+    if spec is None or spec.loader is None:
+        return
+    schedule = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(schedule)
+    want = schedule.desired(stack, site, schedule.parse_now(None))
+    if not want:
+        return
+    live = {r["address"]: bool((r.get("values") or {}).get("disabled", False))
+            for r in plan_resources(((plan.get("prior_state") or {}).get("values") or {}).get("root_module") or {})
+            if r.get("type") == "nsxt_policy_security_policy_rule"}
+    by_address = {i["key"]: i for i in items}
+    for address, off in sorted(want.items()):
+        if address not in live or live[address] == off:
+            continue
+        high = not live[address] and off
+        what = "ON outside its schedule: access the schedule does not grant" if high else "OFF inside its schedule"
+        item = by_address.get(address)
+        if item is None:
+            item = {"key": address, "kind": "nsxt_policy_security_policy_rule", "id": address, "change": "schedule",
+                    "detail": "", "who": "", "at": "", "version": digest([address, live[address]]), "path": ""}
+            items.append(item)
+        item["detail"] = what + (f"; {item['detail']}" if item["detail"] else "")
+        item["severity"] = "high" if high else item.get("severity", "")
+
+
 def lookup_owners(site: str, items: list[dict]) -> None:
     """Who last changed each drifted object, from NSX (read-only credential)."""
     import importlib.util  # noqa: PLC0415
@@ -10667,7 +10937,9 @@ def main() -> int:
     else:
         if not (args.stack and args.plan_json):
             die("plan needs --stack and --plan-json")
-        items = plan_changes(json.loads(Path(args.plan_json).read_text()))
+        plan = json.loads(Path(args.plan_json).read_text())
+        items = plan_changes(plan)
+        schedule_items(args.site, args.stack, plan, items)
         if items and os.environ.get("NSXT_MANAGER_HOST"):
             lookup_owners(args.site, items)
     if not items:
@@ -10682,10 +10954,11 @@ def main() -> int:
         return 0
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     where = f" ({args.stack})" if args.stack else ""
+    high = any(i.get("severity") == "high" for i in new)
     issue, _ = gitlab.call("POST", "/issues", {
-        "title": f"NSX drift on {args.site}{where}: {len(new)} change(s) made outside the repository, {stamp}",
+        "title": ("[HIGH] " if high else "") + f"NSX drift on {args.site}{where}: {len(new)} change(s) made outside the repository, {stamp}",
         "description": issue_body(args.site, new, args.mode, args.link),
-        "labels": f"{LABEL},site:{args.site}",
+        "labels": f"{LABEL},site:{args.site}" + (",severity::high" if high else ""),
     })
     print(f"drift: {len(new)} change(s) on {args.site} to investigate: {(issue or {}).get('web_url', 'issue raised')}")
     for i in new[:20]:
@@ -10697,6 +10970,582 @@ if __name__ == "__main__":
     sys.exit(main())
 SCAFFOLD_EOF
 mark_executable scripts/drift-issue.py
+
+write_file scripts/schedule.py <<'SCAFFOLD_EOF'
+#!/usr/bin/env python3
+"""Rules that are on only at certain times. data/ says when; the pipeline makes
+it so, the same way on a Global Manager and a Local Manager.
+
+A rule's schedule, in its policy file:
+
+  rules:
+    vendor-maintenance:
+      action: ALLOW
+      ...
+      schedule:
+        timezone: Asia/Kolkata        # required: an IANA zone, never "server time"
+        windows:                      # on ONLY inside a window; none: on all the time
+          - days: [MON, TUE, WED, THU, FRI]
+            from: "09:00"
+            to: "18:00"
+          - days: [SAT]
+            from: "22:00"
+            to: "02:00"               # past midnight: until 02:00 on Sunday
+        starts: 2026-11-01            # optional: off before this (a date, or "date HH:MM")
+        expires: 2026-12-31 18:00     # optional: off from this on, for good
+        owner: app-erp-team           # required: who answers for it
+        ticket: CHG0012345            # optional: the change behind it
+
+Outside its windows, before it starts and once it expires, the rule is
+disabled: for an ALLOW rule, closed. NSX holds no time window; Terraform sets
+the rule's 'disabled', so enforcement is identical wherever the rule lives.
+
+  scripts/schedule.py tfvars  --stack S --site X [--now T]
+      the scheduled rules that are off now, as Terraform input (scheduled_off)
+  scripts/schedule.py desired --stack S --site X [--now T]
+      address -> disabled, for every scheduled rule of that stack and manager
+  scripts/schedule.py switch  --stack S --site X --state FILE [--now T]
+      the scheduled rules whose state (terraform state pull) differs from now,
+      one address a line: what the follower applies, and nothing else
+  scripts/schedule.py report  [--now T] [--warn-days 7] [--grace-days 14] [--json]
+      rules expiring soon, expired, and expired longer than the grace period
+  scripts/schedule.py notify  [--now T] [--warn-days 7] [--grace-days 14]
+      raises a GitLab issue for each of those, once (needs NSX_BOT_TOKEN)
+
+T is an ISO time (2026-11-03T20:15:00Z); now by default. Exit status: 0 done,
+1 error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import ssl
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+POLICIES = REPO_ROOT / "data" / "policies"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from yamlcompat import load_all  # noqa: E402
+
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:  # pragma: no cover - Python < 3.9
+    ZoneInfo = None  # type: ignore[assignment]
+    ZoneInfoNotFoundError = KeyError  # type: ignore[assignment,misc]
+
+DAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+TIME = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$|^24:00$")
+LABEL = "nsx-schedule"
+MARK = re.compile(r"<!-- nsx-schedule rule=([0-9a-f]{16}) state=([a-z]+) -->")
+
+
+def die(message: str) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+# --------------------------------------------------------------------------
+# The schedule itself
+# --------------------------------------------------------------------------
+
+def zone(name: str):
+    if ZoneInfo is None:
+        raise ValueError("this Python has no zoneinfo (3.9 or later is needed)")
+    try:
+        return ZoneInfo(str(name))
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"unknown time zone {name!r} (an IANA name such as Asia/Kolkata)") from exc
+
+
+def minutes(text) -> int:
+    text = str(text)
+    if not TIME.match(text):
+        raise ValueError(f"{text!r} is not a time of day as HH:MM")
+    hours, mins = text.split(":")
+    return int(hours) * 60 + int(mins)
+
+
+def moment(value, tz) -> datetime:
+    """A date or date-and-time as data/ writes it, in the schedule's zone.
+    Readers differ: PyYAML returns date and datetime, Terraform's an RFC 3339
+    string, the built-in reader the text."""
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=tz) if value.tzinfo is None else value
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day, tzinfo=tz)
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=tz)
+        except ValueError:
+            pass
+    if re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?Z$", text):
+        # A bare date or local time decoded by Terraform comes back as UTC
+        # midnight or time; it meant the schedule's own zone.
+        return datetime.fromisoformat(text.replace("Z", "")).replace(tzinfo=tz)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"{text!r} is not a date (YYYY-MM-DD) or a date and time (YYYY-MM-DD HH:MM)") from exc
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=tz)
+
+
+def problems(schedule) -> list[str]:
+    """What is wrong with one schedule, in words; empty when it is sound."""
+    if not isinstance(schedule, dict):
+        return ["schedule must be a mapping"]
+    out = []
+    try:
+        tz = zone(schedule.get("timezone", ""))
+    except ValueError as exc:
+        return [str(exc)]
+    if not str(schedule.get("owner") or "").strip():
+        out.append("owner is required: who answers for this rule being on")
+    for i, window in enumerate(schedule.get("windows") or []):
+        if not isinstance(window, dict):
+            out.append(f"windows[{i}] must be a mapping")
+            continue
+        bad = [d for d in window.get("days") or [] if d not in DAYS]
+        if bad:
+            out.append(f"windows[{i}].days: {', '.join(map(str, bad))} (days are {', '.join(DAYS)})")
+        for end in ("from", "to"):
+            try:
+                minutes(window.get(end, ""))
+            except ValueError as exc:
+                out.append(f"windows[{i}].{end}: {exc}")
+    edges = {}
+    for end in ("starts", "expires"):
+        if schedule.get(end) is not None:
+            try:
+                edges[end] = moment(schedule[end], tz)
+            except ValueError as exc:
+                out.append(f"{end}: {exc}")
+    if "starts" in edges and "expires" in edges and edges["expires"] <= edges["starts"]:
+        out.append("expires is not after starts: the rule would never be on")
+    return out
+
+
+def active(schedule: dict, now: datetime) -> bool:
+    """Whether the rule is on at now (any zone)."""
+    tz = zone(schedule["timezone"])
+    local = now.astimezone(tz)
+    if schedule.get("starts") is not None and local < moment(schedule["starts"], tz):
+        return False
+    if schedule.get("expires") is not None and local >= moment(schedule["expires"], tz):
+        return False
+    windows = schedule.get("windows") or []
+    if not windows:
+        return True
+    at = local.hour * 60 + local.minute
+    today, yesterday = DAYS[local.weekday()], DAYS[(local.weekday() - 1) % 7]
+    for window in windows:
+        days = set(window.get("days") or DAYS)
+        start, end = minutes(window["from"]), minutes(window["to"])
+        if start < end and today in days and start <= at < end:
+            return True
+        if start > end and ((today in days and at >= start) or (yesterday in days and at < end)):
+            return True  # past midnight: from the evening of a listed day to the next morning
+        if start == end and today in days:
+            return True  # all day
+    return False
+
+
+# --------------------------------------------------------------------------
+# Which rules, where
+# --------------------------------------------------------------------------
+
+def scheduled_rules(stack: str | None = None, site: str | None = None) -> list[dict]:
+    """Every rule with a schedule; for a stack and manager, those that stack
+    plans there (the same filters as the stacks)."""
+    files = sorted(POLICIES.glob("*.yaml"))
+    out = []
+    for f, doc in zip(files, load_all([f.read_text() for f in files]) if files else []):
+        doc = doc or {}
+        policy = doc.get("policy") or {}
+        owner = policy.get("owner", "lm")
+        sites = policy.get("sites") or []
+        if stack == "global-security" and owner != "gm":
+            continue
+        if stack == "local-security" and (owner != "lm" or not (site in sites or "*" in sites)):
+            continue
+        if stack not in (None, "global-security", "local-security"):
+            continue
+        for key, rule in (doc.get("rules") or {}).items():
+            if isinstance(rule, dict) and isinstance(rule.get("schedule"), dict):
+                out.append({"policy": f.stem, "rule": str(key), "schedule": rule["schedule"],
+                            "disabled": bool(rule.get("disabled", False)), "file": f"data/policies/{f.name}",
+                            "name": rule.get("name", key), "owner": owner, "sites": sites})
+    return out
+
+
+def address(policy: str, rule: str) -> str:
+    return f'module.policies["{policy}"].nsxt_policy_security_policy_rule.this["{rule}"]'
+
+
+def desired(stack: str, site: str, now: datetime) -> dict[str, bool]:
+    """address -> disabled, now: off when the data says disabled, or the schedule says off."""
+    return {address(r["policy"], r["rule"]): r["disabled"] or not active(r["schedule"], now)
+            for r in scheduled_rules(stack, site)}
+
+
+def in_state(state: dict) -> dict[str, bool]:
+    """address -> disabled, for every rule Terraform's state holds."""
+    out = {}
+    for resource in state.get("resources") or []:
+        if resource.get("type") != "nsxt_policy_security_policy_rule" or resource.get("mode") != "managed":
+            continue
+        for instance in resource.get("instances") or []:
+            base = f'{resource.get("module", "")}.' if resource.get("module") else ""
+            key = instance.get("index_key")
+            name = f'{base}{resource["type"]}.{resource["name"]}' + (f'["{key}"]' if key is not None else "")
+            out[name] = bool((instance.get("attributes") or {}).get("disabled", False))
+    return out
+
+
+# --------------------------------------------------------------------------
+# Expiry
+# --------------------------------------------------------------------------
+
+def expiry(now: datetime, warn_days: int, grace_days: int) -> list[dict]:
+    """Rules expiring within warn_days, expired, or expired longer than grace_days."""
+    out = []
+    for r in scheduled_rules():
+        s = r["schedule"]
+        if s.get("expires") is None:
+            continue
+        ends = moment(s["expires"], zone(s["timezone"]))
+        if now >= ends + timedelta(days=grace_days):
+            state = "remove"
+        elif now >= ends:
+            state = "expired"
+        elif now >= ends - timedelta(days=warn_days):
+            state = "expiring"
+        else:
+            continue
+        out.append(dict(r, state=state, ends=ends.isoformat(timespec="minutes")))
+    return out
+
+
+class GitLab:
+    def __init__(self) -> None:
+        self.api = os.environ.get("CI_API_V4_URL", "").rstrip("/")
+        self.project = os.environ.get("CI_PROJECT_ID", "")
+        self.token = os.environ.get("NSX_BOT_TOKEN") or os.environ.get("NSX_ADOPT_TOKEN") or ""
+        if not (self.api and self.project and self.token):
+            die("CI_API_V4_URL, CI_PROJECT_ID and NSX_BOT_TOKEN (or NSX_ADOPT_TOKEN) are needed to raise issues")
+        ca = os.environ.get("CI_SERVER_TLS_CA_FILE")
+        self.ctx = ssl.create_default_context(cafile=ca) if ca and Path(ca).is_file() else ssl.create_default_context()
+        self.ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+
+    def call(self, method: str, path: str, body: dict | None = None, query: dict | None = None):
+        url = f"{self.api}/projects/{urllib.parse.quote(self.project, safe='')}{path}"
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(url, data=data, method=method)
+        request.add_header("PRIVATE-TOKEN", self.token)
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(request, context=self.ctx, timeout=60) as response:
+                return json.loads(response.read().decode() or "null"), response.headers
+        except urllib.error.HTTPError as exc:
+            die(f"GitLab API {method} {path}: HTTP {exc.code} {exc.read().decode(errors='replace')[:300]}")
+        except urllib.error.URLError as exc:
+            die(f"GitLab API {method} {path}: {exc.reason}")
+
+    def raised(self) -> set[tuple[str, str]]:
+        seen: set[tuple[str, str]] = set()
+        page = "1"
+        for _ in range(10):
+            issues, headers = self.call("GET", "/issues", query={"labels": LABEL, "state": "all", "per_page": 100, "page": page})
+            for issue in issues or []:
+                seen.update(MARK.findall(issue.get("description") or ""))
+            page = (headers.get("X-Next-Page") or "").strip()
+            if not page:
+                break
+        return seen
+
+
+def digest(value) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+WHAT = {
+    "expiring": ("expires soon", "Renew it (a new `expires:` in a merge request) or let it lapse: at expiry it is disabled."),
+    "expired": ("has expired and is disabled", "Nothing is open. Renew it in a merge request if it is still needed."),
+    "remove": ("expired over the grace period ago", "Remove the rule in a merge request, with its line in allow-destroy.txt."),
+}
+
+
+def notify(now: datetime, warn_days: int, grace_days: int, link: str) -> int:
+    items = expiry(now, warn_days, grace_days)
+    if not items:
+        print("schedule: no rule expiring, expired or due for removal.")
+        return 0
+    gitlab = GitLab()
+    seen = gitlab.raised()
+    raised = 0
+    for item in items:
+        mark = (digest([item["file"], item["rule"], str(item["schedule"].get("expires"))]), item["state"])
+        if mark in seen:
+            continue
+        title, todo = WHAT[item["state"]]
+        body = "\n".join([
+            f"Rule **{item['name']}** (`{item['rule']}` in `{item['file']}`) {title}: {item['ends']}.",
+            "",
+            f"Owner: {item['schedule'].get('owner', '?')}. Ticket: {item['schedule'].get('ticket', '-')}.",
+            f"Found by: {link}" if link else "",
+            "",
+            f"- [ ] {todo}",
+            "",
+            f"<!-- nsx-schedule rule={mark[0]} state={mark[1]} -->",
+        ])
+        issue, _ = gitlab.call("POST", "/issues", {
+            "title": f"NSX rule {item['name']} {title} ({item['ends'][:10]})",
+            "description": body, "labels": LABEL})
+        raised += 1
+        print(f"schedule: {item['rule']} {title}: {(issue or {}).get('web_url', 'issue raised')}")
+    if not raised:
+        print(f"schedule: {len(items)} rule(s) expiring or expired, each already in an issue.")
+    return 0
+
+
+# --------------------------------------------------------------------------
+
+def parse_now(text: str | None) -> datetime:
+    # NSX_SCHEDULE_NOW: a fixed "now", for tests and for checking a schedule
+    # ahead of time ("what would be on at 22:00 on Saturday?").
+    text = text or os.environ.get("NSX_SCHEDULE_NOW")
+    if not text:
+        return datetime.now(timezone.utc)
+    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("command", choices=["tfvars", "desired", "switch", "report", "notify"])
+    ap.add_argument("--stack")
+    ap.add_argument("--site")
+    ap.add_argument("--state", help="switch: terraform state pull, as JSON")
+    ap.add_argument("--now", help="the time to evaluate at (ISO); now by default")
+    ap.add_argument("--warn-days", type=int, default=int(os.environ.get("NSX_SCHEDULE_WARN_DAYS", "7")))
+    ap.add_argument("--grace-days", type=int, default=int(os.environ.get("NSX_SCHEDULE_GRACE_DAYS", "14")))
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--link", default=os.environ.get("CI_JOB_URL", ""))
+    args = ap.parse_args()
+    now = parse_now(args.now)
+
+    try:
+        if args.command in ("tfvars", "desired", "switch"):
+            if not (args.stack and args.site):
+                die(f"{args.command} needs --stack and --site")
+            want = desired(args.stack, args.site, now)
+            if args.command == "desired":
+                print(json.dumps(want, indent=2, sort_keys=True))
+            elif args.command == "tfvars":
+                off: dict[str, list[str]] = {}
+                for r in scheduled_rules(args.stack, args.site):
+                    if not r["disabled"] and not active(r["schedule"], now):
+                        off.setdefault(r["policy"], []).append(r["rule"])
+                print(json.dumps({"scheduled_off": {k: sorted(v) for k, v in sorted(off.items())}}, indent=2))
+            else:
+                if not args.state:
+                    die("switch needs --state (terraform state pull)")
+                have = in_state(json.loads(Path(args.state).read_text() or "{}"))
+                for addr in sorted(want):
+                    if addr in have and have[addr] != want[addr]:
+                        print(addr)
+            return 0
+        if args.command == "report":
+            items = expiry(now, args.warn_days, args.grace_days)
+            if args.json:
+                print(json.dumps(items, indent=2, default=str))
+            for item in items:
+                print(f"{item['state']:9} {item['file']} {item['rule']}  {item['ends']}  owner {item['schedule'].get('owner', '?')}")
+            return 0
+        return notify(now, args.warn_days, args.grace_days, args.link)
+    except ValueError as exc:
+        die(f"{exc} (scripts/validate-data.py names the rule)")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+SCAFFOLD_EOF
+mark_executable scripts/schedule.py
+
+write_file scripts/convert-time-windows.py <<'SCAFFOLD_EOF'
+#!/usr/bin/env python3
+"""Convert a Local Manager's NSX time windows into schedule: blocks for data/.
+
+Read-only: it changes nothing in NSX and writes nothing in data/. It reads the
+manager's time windows and the policies and rules that use one (a time window
+set on a policy applies to each of its rules), converts each into the
+schedule: format scripts/schedule.py enforces, and writes a review report:
+
+  scripts/with-credentials.sh lon1 -- scripts/convert-time-windows.py --site lon1
+  scripts/convert-time-windows.py --site lon1 --from-dump reports/lon1-raw.json \\
+      --schedulers reports/lon1-schedulers.json
+
+  reports/time-windows-<site>.md   one section per rule: the schedule: block to
+                                   paste under that rule in its policy file, or
+                                   why it cannot be converted
+
+Two reads at most: the time windows, and (without --from-dump) the policies.
+Nothing is guessed: a time window this cannot read exactly (an unknown time
+zone, a field it does not know) is reported, not converted. owner: is left for
+you to fill in; the validator refuses a schedule without one.
+
+NSX keeps a time window only on a Local Manager. In data/ a schedule is enforced
+by the pipeline through the rule's 'disabled', the same on a Global and a Local
+Manager. Move a rule over in one change: remove its time window in NSX and
+merge its schedule: block together, at cutover of that policy.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import os
+import sys
+from datetime import date, timedelta
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DAY = {"MONDAY": "MON", "TUESDAY": "TUE", "WEDNESDAY": "WED", "THURSDAY": "THU", "FRIDAY": "FRI",
+       "SATURDAY": "SAT", "SUNDAY": "SUN"}
+DAY.update({v: v for v in DAY.values()})
+KNOWN = {"start_date", "end_date", "start_time", "end_time", "recurring", "days", "time_zone", "id", "path",
+         "relative_path", "parent_path", "resource_type", "display_name", "description", "tags", "unique_id",
+         "realization_id", "marked_for_delete", "overridden", "children", "origin_site_id", "owner_id"}
+
+
+def importer():
+    spec = importlib.util.spec_from_file_location("import_estate", Path(__file__).resolve().parent / "import-estate.py")
+    module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
+
+
+def convert(window: dict, manager_zone: str | None) -> tuple[dict | None, str]:
+    """A schedule: block for one NSX time window, or None and why not."""
+    unknown = sorted(k for k in window if not k.startswith("_") and k not in KNOWN and window[k] not in (None, "", [], {}))
+    if unknown:
+        return None, f"carries {', '.join(unknown)}, which this does not convert"
+    raw_zone = str(window.get("time_zone") or "UTC")
+    if raw_zone.upper() == "UTC":
+        tz = "UTC"
+    elif raw_zone.upper() in ("LOCAL", "LOCAL_TIME"):
+        if not manager_zone:
+            return None, "is in the manager's local time: run again with --timezone <the manager's IANA zone>"
+        tz = manager_zone
+    else:
+        tz = raw_zone
+    out: dict = {"timezone": tz}
+    start_t, end_t = window.get("start_time"), window.get("end_time")
+    if window.get("recurring", True):
+        days = [DAY.get(str(d).upper()) for d in window.get("days") or []]
+        if None in days:
+            return None, f"has days {window.get('days')}, which this does not read"
+        if not (start_t and end_t):
+            return None, "recurs, but has no start_time and end_time"
+        entry: dict = {"from": str(start_t)[:5], "to": str(end_t)[:5]}
+        if days and len(days) < 7:
+            entry = {"days": days, **entry}
+        out["windows"] = [entry]
+        if window.get("start_date"):
+            out["starts"] = str(window["start_date"])
+        if window.get("end_date"):
+            # The window recurs on its end date too: off from the next day.
+            ends = date.fromisoformat(str(window["end_date"])) + timedelta(days=1)
+            out["expires"] = ends.isoformat()
+    else:
+        if not (window.get("start_date") and window.get("end_date")):
+            return None, "is one-off, but has no start_date and end_date"
+        out["starts"] = f"{window['start_date']} {str(start_t or '00:00')[:5]}"
+        out["expires"] = f"{window['end_date']} {str(end_t or '23:59')[:5]}"
+    out["owner"] = "TODO: who answers for this rule being on"
+    if window.get("display_name"):
+        out["ticket"] = f"was NSX time window {window['display_name']}"
+    return out, ""
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--site", required=True)
+    ap.add_argument("--from-dump", help="policies as scripts/import-estate.py --dump-only wrote them")
+    ap.add_argument("--schedulers", help="the time windows, as GET /policy/api/v1/infra/firewall-schedulers returned them")
+    ap.add_argument("--timezone", help="the manager's IANA time zone, for windows NSX keeps in local time")
+    ap.add_argument("--out", help="where to write the report (default reports/time-windows-<site>.md)")
+    args = ap.parse_args()
+    ie = importer()
+    ie.CA_SITE = args.site
+
+    host = os.environ.get("NSXT_MANAGER_HOST")
+    user, password = os.environ.get("NSXT_USERNAME"), os.environ.get("NSXT_PASSWORD")
+    insecure = os.environ.get("NSXT_ALLOW_UNVERIFIED_SSL", "").strip().lower() in ("true", "1", "yes")
+    live = not (args.from_dump and args.schedulers)
+    if live and not (host and user and password):
+        sys.exit(f"error: no credentials. Wrap the call: scripts/with-credentials.sh {args.site} -- scripts/convert-time-windows.py --site {args.site}")
+    if args.schedulers:
+        windows = json.loads(Path(args.schedulers).read_text()).get("results", [])
+    else:
+        windows = ie.api_get(host, f"{ie.LM_BASE}/firewall-schedulers", user, password, insecure).get("results", [])
+    estate = json.loads(Path(args.from_dump).read_text()) if args.from_dump else \
+        ie.fetch_estate(host, user, password, ie.LM_BASE, "default", insecure)
+    by_path = {w.get("path"): w for w in windows}
+    policies = [p for p in estate.get("policies", []) if str(p.get("path", "")).startswith("/infra/")]
+    ie.assign_keys([g for g in estate.get("groups", []) if str(g.get("path", "")).startswith("/infra/")], policies)
+
+    done, refused = [], []
+    for policy in policies:
+        for rule in policy.get("rules", []):
+            path = rule.get("scheduler_path") or policy.get("scheduler_path")
+            if not path:
+                continue
+            where = f"data/policies/{policy['id']}.yaml, rule {rule['id']}"
+            window = by_path.get(path)
+            if window is None:
+                refused.append((where, f"uses {path}, which the manager did not list"))
+                continue
+            block, why = convert(window, args.timezone)
+            if block is None:
+                refused.append((where, f"its time window {window.get('display_name', path)} {why}"))
+            else:
+                done.append((where, rule.get("display_name", rule["id"]), block))
+
+    lines = [f"# Time windows on {args.site}, converted", "",
+             f"{len(done)} rule(s) converted, {len(refused)} not. Paste each block under its rule, fill in `owner:`,",
+             "and merge it with the removal of the time window in NSX (docs/SCHEDULES.md).", ""]
+    for where, name, block in done:
+        lines += [f"## {where} ({name})", "", "```yaml", *("      " + l for l in ie.to_yaml({"schedule": block}).splitlines()), "```", ""]
+    if refused:
+        lines += ["## Not converted", ""] + [f"- {where}: {why}" for where, why in refused] + [""]
+    out = Path(args.out or REPO_ROOT / "reports" / f"time-windows-{args.site}.md")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(lines))
+    print(f"{len(done)} rule(s) converted, {len(refused)} not: {out.relative_to(REPO_ROOT) if out.is_relative_to(REPO_ROOT) else out}")
+    for where, why in refused:
+        print(f"  NOT CONVERTED  {where}: {why}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+SCAFFOLD_EOF
+mark_executable scripts/convert-time-windows.py
 
 write_file scripts/drift.sh <<'SCAFFOLD_EOF'
 #!/usr/bin/env bash
@@ -10764,6 +11613,47 @@ esac
 SCAFFOLD_EOF
 mark_executable scripts/drift.sh
 
+write_file scripts/schedule-job.sh <<'SCAFFOLD_EOF'
+#!/usr/bin/env bash
+#
+# The 'schedule' job: switch scheduled rules on and off as data/ says
+# (scripts/schedule.py), on every manager in mode: managed, then raise an issue
+# for each rule about to expire, expired, or due for removal.
+#
+# Run from a pipeline schedule, every 5 minutes, on the default branch, with
+#   SCHEDULE_FOLLOW=1
+#
+# Per manager and security stack: scripts/tf.sh follow, which compares
+# Terraform's state with the schedules and contacts NSX only for a rule that has
+# to switch, applying that and nothing else (plan-guard --schedule). Managers
+# in mode: mirror are still run from the UI and are skipped. Exit status: 0
+# done; 1 a manager could not be switched (the job fails, so it is seen; the
+# next run retries, and the drift check reports a rule left in the wrong state).
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT" || exit 1
+
+failed=()
+while read -r site stack _; do
+	[ -n "$site" ] || continue
+	case "$stack" in
+	global-security | local-security) ;;
+	*) continue ;;
+	esac
+	echo "=== $site / $stack"
+	NSX_CRED_SCOPE=apply scripts/with-credentials.sh "$site" -- scripts/tf.sh follow "$stack" "$site" || failed+=("$site/$stack")
+done < <(python3 scripts/ci-matrix.py --format lines --managed-only)
+
+python3 scripts/schedule.py notify || failed+=("expiry notices")
+if [ "${#failed[@]}" -gt 0 ]; then
+	echo "error: not done: ${failed[*]} (above)" >&2
+	exit 1
+fi
+SCAFFOLD_EOF
+mark_executable scripts/schedule-job.sh
+
 write_file scripts/drift-job.sh <<'SCAFFOLD_EOF'
 #!/usr/bin/env bash
 #
@@ -10793,8 +11683,11 @@ if [ "${1:-}" = --one ]; then # --one SITE STACK, inside with-credentials.sh
 	trap 'rm -f "$json"' EXIT
 	DRIFT_JSON="$json" scripts/drift.sh "$stack" "$site"
 	case $? in
-	0) exit 0 ;;
-	2) python3 scripts/drift-issue.py plan --site "$site" --stack "$stack" --plan-json "$json" --link "${CI_JOB_URL:-}" ;;
+	0 | 2)
+		# With no drift too: a scheduled rule in the wrong state is still raised.
+		[ -s "$json" ] || exit 0
+		python3 scripts/drift-issue.py plan --site "$site" --stack "$stack" --plan-json "$json" --link "${CI_JOB_URL:-}"
+		;;
 	*) exit 1 ;;
 	esac
 	exit $?
@@ -12157,6 +13050,9 @@ write_file deploy/ci-image/requirements.txt <<'SCAFFOLD_EOF'
 # Without it they fall back to a reader for a subset of YAML, which refuses
 # valid YAML outside that subset.
 PyYAML==6.0.2
+# tzdata: the time zones scheduled rules are evaluated in (scripts/schedule.py),
+# whatever the base image carries.
+tzdata==2025.2
 SCAFFOLD_EOF
 
 write_file deploy/ci-image/providers.tf <<'SCAFFOLD_EOF'
@@ -13804,6 +14700,8 @@ write_file .gitlab-ci.yml <<'SCAFFOLD_EOF'
 # 'cutover' job, which opens the merge request that takes a manager out of
 # mirror mode. Drift: a schedule with DRIFT_SITE runs only the 'drift' job,
 # which raises changes made in NSX as nsx-drift issues. docs/IMPORT.md.
+# Scheduled rules: a schedule with SCHEDULE_FOLLOW=1 runs only the 'schedule'
+# job, which switches them on and off. docs/SCHEDULES.md.
 #
 # Change control (NSX_APPLY_MODE=approval): a pipeline schedule with
 # APPROVAL_SWEEP=1 runs only the 'approvals' job, which starts the apply of
@@ -13920,6 +14818,24 @@ drift:
   rules:
     - if: $DRIFT_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
+# --- schedule: rules that are on only at certain times ------------------------
+# A pipeline schedule every 5 minutes with SCHEDULE_FOLLOW=1, on the default
+# branch. Switches the scheduled rules of every manager in mode: managed as
+# their schedules say (scripts/schedule.py), and nothing else; contacts NSX only
+# when a rule has to switch. Raises an issue for rules about to expire.
+
+schedule:
+  stage: adopt
+  variables:
+    NSX_CRED_SCOPE: apply
+    VAULT_TOKEN: $VAULT_APPLY_TOKEN
+  script:
+    - scripts/schedule-job.sh
+  resource_group: nsx-schedule
+  interruptible: false
+  rules:
+    - if: $SCHEDULE_FOLLOW && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
 # --- validate: offline, no credentials, runs on everything ------------------
 
 data:
@@ -13936,6 +14852,8 @@ data:
     - if: $CUTOVER_SITE && $CI_PIPELINE_SOURCE == "web"
       when: never
     - if: $DRIFT_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+      when: never
+    - if: $SCHEDULE_FOLLOW && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
@@ -13962,6 +14880,8 @@ terraform:
       when: never
     - if: $DRIFT_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
+    - if: $SCHEDULE_FOLLOW && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -13986,6 +14906,8 @@ matrix:
       when: never
     - if: $DRIFT_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
+    - if: $SCHEDULE_FOLLOW && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -14009,6 +14931,8 @@ managers:
     - if: $CUTOVER_SITE && $CI_PIPELINE_SOURCE == "web"
       when: never
     - if: $DRIFT_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+      when: never
+    - if: $SCHEDULE_FOLLOW && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

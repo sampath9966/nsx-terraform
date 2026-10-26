@@ -13,6 +13,17 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.6.0
+
+**Rules that are on only at certain times, enforced identically on a Global and a Local Manager.** A rule in data/ takes a `schedule:`: an IANA time zone, windows (days, from, to, past midnight allowed), `starts`, `expires`, an `owner` and a `ticket`. Outside its windows, before it starts and once it expires, the rule is disabled: for an ALLOW rule, closed. NSX holds no time window (a Local Manager's own exist only there, and Terraform cannot express them): every plan of a security stack sets each scheduled rule's `disabled` as its schedule says at that moment. docs/SCHEDULES.md.
+
+- **The time follower**, the new `schedule` job (a pipeline schedule every 5 minutes with `SCHEDULE_FOLLOW=1`), switches scheduled rules on and off on every manager in `mode: managed`. It compares Terraform's state with the schedules and contacts NSX only when a rule has to switch, then plans that rule alone without reading anything else, and `plan-guard --schedule` refuses anything but a rule's `disabled`. Proven with the real provider: one write per switch, no other read, nothing at all between switches.
+- **The drift check knows the schedules.** A scheduled rule switched on in NSX outside its schedule is a `[HIGH]` issue labelled `severity::high`; one left off inside it, or a switch the follower missed, is raised too.
+- **Expiry**: an `nsx-schedule` issue a week before a rule expires, when it has expired, and after a grace period (14 days) to remove it in a merge request. Nothing is deleted automatically.
+- **`scripts/convert-time-windows.py`** reads a Local Manager's time windows (two reads at most, read-only) and writes the `schedule:` block for each rule using one, or why it cannot be converted exactly. A window in the manager's local time asks for `--timezone` rather than guessing.
+- The validator checks every schedule (zone, days, times, starts before expires, owner) and warns on a scheduled DROP: off outside its windows, what it blocks is allowed then.
+- The CI image carries `tzdata`, so time zones never depend on the base image.
+
 ## 1.5.5
 
 **What other tools own is never taken.** NCP and vSphere with Tanzu create DFW policies and groups for their clusters, VCF Automation for its deployments, and they keep rewriting them. The importer now leaves them to that tool: anything NSX marks protected (created by a principal identity), anything tagged `ncp/*`, and any account or id prefix listed in the new `inventory/ownership.yaml` is reported as `OWNED ELSEWHERE`, never adopted and never raised as drift. A rule that uses such a group is still adopted: the group is listed under `references:` and resolved by its NSX id, never managed. `scripts/update.sh` creates `inventory/ownership.yaml` when the tree has none (estate data is otherwise never changed).

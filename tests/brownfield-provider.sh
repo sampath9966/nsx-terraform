@@ -589,4 +589,108 @@ cd "$T" || exit 1
 writes="$(grep WRITE "$SCRATCH/requests.log" | grep -vc "/api/session/create" || true)"
 check "NSX received no write at all (login sessions aside)" test "$writes" -eq 0
 
+echo "the time follower: a scheduled rule switched on and off by the real provider, and nothing else"
+# The one place this suite lets the mock accept a write: an existing rule's update.
+T6="$SCRATCH/tree6"
+generate "$T6" --no-examples
+cd "$T6" || exit 1
+printf 'managers:\n  lon1:\n    role: lm\n    host: 127.0.0.1:%s\n    site: lon1\n    vcf_instance: vcf-a\n    vault_path: secret/nsx/lon1\n    tier: prod\n' "$port" >inventory/managers.yaml
+printf 'terraform {\n  backend "local" {}\n}\n' >stacks/local-security/backend_override.tf
+printf 'path = "%s/sched.tfstate"\n' "$SCRATCH" >envs/lon1.backend.hcl
+cp "$UI" "$SCRATCH/ui.before-sched"
+python3 - "$UI" <<'PY'
+import json, sys
+D = "/infra/domains/default"
+d = json.load(open(sys.argv[1]))
+d["policies"].append({"id": "sched", "path": f"{D}/security-policies/sched", "display_name": "sched", "category": "Application",
+    "sequence_number": 60, "stateful": True, "tcp_strict": True, "locked": False, "scope": ["ANY"],
+    "rules": [{"id": "s1", "path": f"{D}/security-policies/sched/rules/s1", "display_name": "s1", "sequence_number": 100,
+               "action": "ALLOW", "direction": "IN_OUT", "ip_protocol": "IPV4_IPV6", "logged": True, "disabled": False,
+               "sources_excluded": False, "destinations_excluded": False, "source_groups": ["10.1.1.1"],
+               "destination_groups": ["10.2.2.2"], "services": ["ANY"], "scope": ["ANY"], "profiles": ["ANY"]}]})
+json.dump(d, open(sys.argv[1], "w"))
+PY
+mkdir -p data/policies
+cat >data/policies/sched.yaml <<'YAML'
+policy:
+  id: sched
+  name: sched
+  category: Application
+  owner: lm
+  sites: [lon1]
+  sequence_number: 60
+  scope: [ANY]
+  rule_management: standalone
+rules:
+  s1:
+    name: s1
+    sequence_number: 100
+    action: ALLOW
+    direction: IN_OUT
+    source_groups: [10.1.1.1]
+    destination_groups: [10.2.2.2]
+    logged: true
+    scope: [ANY]
+    schedule:
+      timezone: UTC
+      windows:
+        - from: "08:00"
+          to: "10:00"
+      owner: test-team
+YAML
+printf 'import {\n  to = module.policies["sched"].nsxt_policy_parent_security_policy.this\n  id = "/infra/domains/default/security-policies/sched"\n}\n\nimport {\n  to = module.policies["sched"].nsxt_policy_security_policy_rule.this["s1"]\n  id = "/infra/domains/default/security-policies/sched/rules/s1"\n}\n' >stacks/local-security/import-lon1-sched.tf
+export NSX_SCHEDULE_NOW=2026-11-02T09:00:00Z  # inside the window: on, as NSX has it
+out="$(tf plan local-security lon1)"
+check "(setup) inside its window the scheduled rule is taken over as it is: a pure import" grep -q "Plan: 2 to import, 0 to add, 0 to change, 0 to destroy" <<<"$out"
+check "(setup) it applies as imports only" grep -q "Resources: 2 imported, 0 added, 0 changed, 0 destroyed" <<<"$(APPROVE=yes tf apply local-security lon1)"
+rm stacks/local-security/import-lon1-sched.tf
+before="$(wc -l <"$SCRATCH/requests.log")"
+out="$(tf follow local-security lon1)"
+check "inside its window, with state agreeing, the follower contacts NSX not at all" bash -c 'grep -q "nothing to switch on lon1/local-security (NSX not contacted)" <<<"$1" && [ "$(wc -l <"$2")" = "$3" ]' _ "$out" "$SCRATCH/requests.log" "$before"
+touch "$SCRATCH/requests.log.writable"
+export NSX_SCHEDULE_NOW=2026-11-02T12:00:00Z  # past the window: off
+before="$(wc -l <"$SCRATCH/requests.log")"
+out="$(tf follow local-security lon1)"
+check "past its window the follower switches it off: the rule's disabled, and nothing else" bash -c 'grep -q "switching 1 rule(s) on lon1/local-security" <<<"$1" && grep -q "plan-guard lon1/local-security, time follower, on/off only: 0 import, 0 create, 1 update" <<<"$1" && grep -q "Resources: 0 added, 1 changed, 0 destroyed" <<<"$1"' _ "$out"
+check "...one write to NSX, to that rule, with disabled: true" bash -c 'tail -n +"$(( $2 + 1 ))" "$1" | grep "^WRITE" | grep -vc session/create | grep -qx 1 && tail -n +"$(( $2 + 1 ))" "$1" | grep "^WRITE" | grep -v session | grep -q "/security-policies/sched/rules/s1" && tail -n +"$(( $2 + 1 ))" "$1" | grep "^BODY" | grep -q "\"disabled\": true"' _ "$SCRATCH/requests.log" "$before"
+check "...without reading any other object from NSX" bash -c '! tail -n +"$(( $2 + 1 ))" "$1" | grep "^GET" | grep -v "/sched/rules/s1\|/api/v1/node\|session" | grep -q .' _ "$SCRATCH/requests.log" "$before"
+before="$(wc -l <"$SCRATCH/requests.log")"
+out="$(tf follow local-security lon1)"
+check "the next run finds nothing to switch, and contacts NSX not at all" bash -c 'grep -q "NSX not contacted" <<<"$1" && [ "$(wc -l <"$2")" = "$3" ]' _ "$out" "$SCRATCH/requests.log" "$before"
+sed -i 's/    action: ALLOW/    action: DROP/' data/policies/sched.yaml
+out="$(tf follow local-security lon1)"
+check "a change in data/ not yet through a merge request is never applied by the follower" bash -c 'grep -q "NSX not contacted" <<<"$1"' _ "$out"
+sed -i 's/    action: DROP/    action: ALLOW/' data/policies/sched.yaml
+export NSX_SCHEDULE_NOW=2026-11-03T08:30:00Z  # the next morning: on again
+before="$(wc -l <"$SCRATCH/requests.log")"
+out="$(tf follow local-security lon1)"
+check "inside its window again the follower switches it back on" bash -c 'grep -q "Resources: 0 added, 1 changed, 0 destroyed" <<<"$1" && tail -n +"$(( $3 + 1 ))" "$2" | grep "^BODY" | grep -q "\"disabled\": false"' _ "$out" "$SCRATCH/requests.log" "$before"
+check "...and a normal plan then agrees with NSX and the schedule: no changes" grep -q "No changes" <<<"$(tf plan local-security lon1)"
+rm -f "$SCRATCH/requests.log.writable"
+# An engineer switches it on in the UI outside its window: the drift check raises it, high.
+export NSX_SCHEDULE_NOW=2026-11-03T12:00:00Z
+touch "$SCRATCH/requests.log.writable"; tf follow local-security lon1 >/dev/null; rm -f "$SCRATCH/requests.log.writable"
+python3 - "$UI" <<'PY'
+import json, sys, time
+d = json.load(open(sys.argv[1]))
+r = next(p for p in d["policies"] if p["id"] == "sched")["rules"][0]
+r["disabled"] = False  # on, in the UI, outside the window
+time.sleep(0.01); json.dump(d, open(sys.argv[1], "w"))
+PY
+json="$SCRATCH/sched-drift.json"
+DRIFT_JSON="$json" tf drift local-security lon1 >/dev/null
+python3 - "$json" <<'PY'
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("d", "scripts/drift-issue.py"); d = importlib.util.module_from_spec(spec); spec.loader.exec_module(d)
+plan = json.load(open(sys.argv[1]))
+items = d.plan_changes(plan)
+d.schedule_items("lon1", "local-security", plan, items)
+hit = [i for i in items if i["key"].endswith('this["s1"]')]
+sys.exit(0 if hit and hit[0].get("severity") == "high" and "ON outside its schedule" in hit[0]["detail"] else 1)
+PY
+check "switched on in the UI outside its window: the drift check raises it as high severity" test $? -eq 0
+unset NSX_SCHEDULE_NOW
+cp "$SCRATCH/ui.before-sched" "$UI"
+cd "$T" || exit 1
+
 finish brownfield-provider

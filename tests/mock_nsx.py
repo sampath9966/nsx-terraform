@@ -57,6 +57,15 @@ class H(BaseHTTPRequestHandler):
         log.write(f"WRITE {self.command} {self.path}\n"); log.flush()
         if self.path.startswith("/api/session/create"):
             self.send_response(200); self.send_header("Set-Cookie", "JSESSIONID=x"); self.send_header("X-XSRF-TOKEN", "t"); self.send_header("Content-Length", "0"); self.end_headers(); return
+        # Opt-in, for the time follower's test: a file <request-log>.writable lets
+        # an existing rule be updated (as switching it on or off does). Anything
+        # else stays refused.
+        path = urllib.parse.unquote(self.path.split("?")[0])
+        if os.path.exists(sys.argv[2] + ".writable") and self.command in ("PATCH", "PUT") and objs.get(path, {}).get("resource_type") == "Rule":
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+            log.write(f"BODY {json.dumps(body, sort_keys=True)}\n"); log.flush()
+            objs[path] = dict(objs[path], **{k: v for k, v in body.items() if not k.startswith("_")}, _revision=objs[path]["_revision"] + 1)
+            return self.send(200, objs[path])
         return self.send(500, {"error_message": "mock NSX is read-only: a plan must never write"})
     do_POST = do_PUT = do_PATCH = do_DELETE = write
 srv = ThreadingHTTPServer(("127.0.0.1", port), H)
