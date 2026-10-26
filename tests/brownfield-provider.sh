@@ -420,6 +420,17 @@ d["policies"].append({"id": "_Shapes App", "path": f"{LD}/security-policies/_Sha
     "rules": [rule("vm-members", 100, [f"{LD}/groups/_Exchange-GW_VM's"], [f"{LD}/groups/App-DB"]),
               rule("addresses", 200, ["172.19.20.57", "10.1.0.0/16"], ["172.17.9.10-172.17.9.20", "13.126.23.128 - 13.126.23.135", f"{LD}/groups/App-DB"]),
               rule("location-group", 300, [f"{WD}/groups/M-App"], [f"{LD}/groups/App-DB"])]})
+# Made in the UI: UUID ids, keyed here by display name. And a group a principal
+# identity made (vSphere with Tanzu): used by name, never managed.
+U = lambda n: f"0b7c{n:04d}-1111-4222-8333-444455556666"
+d["groups"].append({"id": U(1), "path": f"{LD}/groups/{U(1)}", "display_name": "#UI Group",
+                    "expression": [{"resource_type": "Condition", "key": "Tag", "member_type": "VirtualMachine", "operator": "EQUALS", "value": "app|ui"}]})
+d["groups"].append({"id": "tkg-ns", "path": f"{LD}/groups/tkg-ns", "display_name": "tkg-ns", "_protection": "REQUIRE_OVERRIDE",
+                    "_create_user": "wcp-cluster-user", "expression": [{"resource_type": "Condition", "key": "Tag", "member_type": "VirtualMachine", "operator": "EQUALS", "value": "app|tkg"}]})
+ui = rule("x", 100, [f"{LD}/groups/{U(1)}", f"{LD}/groups/tkg-ns"], [f"{LD}/groups/App-DB"])
+ui.update(id=U(20), display_name="Allow UI", path=f"{LD}/security-policies/{U(10)}/rules/{U(20)}")
+d["policies"].append({"id": U(10), "path": f"{LD}/security-policies/{U(10)}", "display_name": "UI Policy",
+    "category": "Application", "sequence_number": 41, "stateful": True, "tcp_strict": True, "locked": False, "scope": ["ANY"], "rules": [ui]})
 json.dump(d, open(sys.argv[1], "w"))
 PY
 python3 scripts/import-estate.py --site gm1 --role gm --from-dump reports/gm1.json --mirror >/dev/null 2>&1
@@ -431,6 +442,8 @@ check "(setup) the copy validates" python3 scripts/validate-data.py
 out="$(tf plan local-security lon1)"
 check "the real provider plans VM members, addresses and the location group as a pure import" bash -c 'grep -qE "Plan: [0-9]+ to import, 0 to add, 0 to change, 0 to destroy" <<<"$1" && grep -q "plan-guard: allowed" <<<"$1"' _ "$out"
 check "...the location group by its domain's path" grep -q '/global-infra/domains/WL-Mum/groups/M-App' <<<"$out"
+check "...the UI-made policy, rule and group by their UUIDs, under readable keys" bash -c 'grep -q "module.policies\[\"UI-Policy\"\].nsxt_policy_security_policy_rule.this\[\"Allow-UI\"\]" <<<"$1" && grep -q "0b7c0020-1111-4222-8333-444455556666" <<<"$1" && grep -q "nsxt_policy_group.this\[\"UI-Group\"\]" <<<"$1"' _ "$out"
+check "...and the group vSphere with Tanzu owns is used by its path, never imported" bash -c 'grep -q "/infra/domains/default/groups/tkg-ns" <<<"$1" && ! grep -q "this\[\"tkg-ns\"\]" <<<"$1"' _ "$out"
 check "it applies as imports only" grep -qE "Resources: [0-9]+ imported, 0 added, 0 changed, 0 destroyed" <<<"$(APPROVE=yes tf apply local-security lon1)"
 check "...and the next plan is quiet: external ids and addresses read back as written" grep -q "No changes" <<<"$(tf plan local-security lon1)"
 check "...nor the one after (no loop)" grep -q "No changes" <<<"$(tf plan local-security lon1)"

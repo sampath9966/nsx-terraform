@@ -21,7 +21,8 @@
 #   CONFLICT   both changed it, or no record of last time    kept unless
 #                                                            --overwrite-unknown
 #
-# Estate data (data/, inventory/, envs/) is never read or written, and nothing
+# Estate data (data/, inventory/, envs/) is never changed: a starter file a new
+# release introduces there is created only when the tree has none. Nothing
 # is ever deleted. Every file that is overwritten is first copied to
 # .nsx-update-backup/<timestamp>/ in your tree.
 #
@@ -241,6 +242,14 @@ is_estate_data() {
 	*) return 1 ;;
 	esac
 }
+# Starter files a release adds to estate data: created when missing, never
+# changed after, as everything there.
+is_starter() {
+	case "$1" in
+	inventory/ownership.yaml) return 0 ;;
+	esac
+	return 1
+}
 # Written by the scratch run, not part of the tree.
 is_scratch_only() {
 	case "$1" in
@@ -256,8 +265,11 @@ NEW=() UPDATE=() LOCAL=() CONFLICT=() SAME=()
 while IFS= read -r rel; do
 	rel="${rel#./}"
 	is_scratch_only "$rel" && continue
-	is_estate_data "$rel" && continue
 	f="$FRESH/$rel" t="$TARGET/$rel"
+	if is_estate_data "$rel"; then
+		is_starter "$rel" && [ ! -e "$t" ] && NEW+=("$rel")
+		continue
+	fi
 	if [ ! -e "$t" ]; then
 		NEW+=("$rel")
 		continue
@@ -287,7 +299,7 @@ say "tree        is at release ${TREE_VERSION:-unrecorded}"
 release_notes
 say ""
 say "  ${#NEW[@]} new   ${#UPDATE[@]} update   ${#LOCAL[@]} yours, kept   ${#CONFLICT[@]} conflict   ${#SAME[@]} unchanged"
-say "  (data/, inventory/ and envs/ are never read or written)"
+say "  (data/, inventory/ and envs/ are never changed; a starter file missing there is created)"
 
 if [ "${#NEW[@]}" -gt 0 ]; then
 	say ""

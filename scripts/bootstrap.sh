@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.5.4"
+VERSION="1.5.5"
 
 ROOT="$PWD"
 FORCE=0
@@ -1423,7 +1423,12 @@ raises a GitLab issue labelled `nsx-drift` and `site:<site>`. The issue lists
 each object added, changed or deleted, what changed in it (`action ALLOW → DROP`,
 `source_groups +App-Web`), and who last changed it and when, as NSX records them.
 It also has a checklist: who made the change and why, keep it or revert it, and
-whether it should have come through a merge request. That is the tracker for
+whether it should have come through a merge request. Rules renumbered without a
+change in order (the UI renumbers neighbours when one rule is dragged) raise
+nothing; a change in order, which changes what traffic is allowed, is one row
+for the policy with its rules in their new order. A group's members changing
+because the estate changed (tags, VMs coming and going) is never drift: only a
+group's definition is compared. That is the tracker for
 the observation period: close each issue once its changes are explained. A
 change is raised once, however many syncs see it; a further change to the same
 object is raised again. The first copy of a manager is its baseline, not drift.
@@ -1578,8 +1583,32 @@ make validate
   files you write it is an error.
 - A rule with an empty `scope` is pushed to every host in the span. The
   validator fails it: that is a finding about your estate, not a bug.
-- Object keys are the real NSX ids, kept verbatim (mixed case included). The
-  naming convention applies to objects you create from here on.
+- Object keys are the real NSX ids, kept verbatim (mixed case included). An id
+  the UI generated (a UUID such as `09f6e461-422a-…`) says nothing in a review,
+  so such a group, policy or rule is keyed by its display name instead
+  (`#79176_vms_Mum` becomes `79176_vms_Mum`, the policy file `UI-Policy.yaml`),
+  with the UUID kept as `nsx_id`. A key never changes once data/ uses it: a
+  rename in the UI changes `display_name`, not the key (a new key would be a
+  destroy and create). The naming convention applies to objects you create
+  from here on.
+- Long member lists are written one per line.
+- Nothing NSX returns is dropped silently. Every field is either written to
+  data/, known to be safe to leave (metadata, or a field at its unset value), or
+  the object is NOT ADOPTED with the field named: a time window
+  (`scheduler_path`), a connectivity strategy, or a field a newer NSX added
+  (`carries <field>=<value>`). The last line of the report lists the fields not
+  represented yet.
+- **What other tools own is never taken.** NCP and vSphere with Tanzu create DFW
+  policies and groups for their clusters, VCF Automation for its deployments,
+  and they rewrite them as they go: Terraform must not own them.
+  `inventory/ownership.yaml` says what they are (by default: anything NSX
+  marks protected, which a principal identity created, and anything tagged
+  `ncp/*`; add the accounts of other tools as `created_by:`). They are listed
+  as `OWNED ELSEWHERE`, never adopted, and never raised as drift. A rule here
+  may still use such a group: it is listed under `references:` in the group
+  file and resolved by its NSX id, never managed.
+- The report ends with **who creates what** on the manager, per account, so the
+  tools among them are found once, not object by object.
 
 ## 4. Plan, review, apply: a merge request per tranche
 
@@ -2900,6 +2929,24 @@ write_file data/schema/group.schema.json <<'SCAFFOLD_EOF'
           }
         }
       }
+    },
+    "references": {
+      "type": "object",
+      "description": "Groups another tool owns (NCP, vSphere with Tanzu, VCF Automation; inventory/ownership.yaml). Rules and groups here may use them by name; Terraform never manages them.",
+      "propertyNames": { "pattern": "^[^/]{1,255}$" },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["display_name", "owner", "why"],
+        "additionalProperties": false,
+        "properties": {
+          "display_name": { "type": "string" },
+          "owner": { "enum": ["gm", "lm"], "description": "Which manager holds it: a Global Manager group, or a group of the listed Local Managers." },
+          "domain": { "type": "string" },
+          "nsx_id": { "type": "string", "pattern": "^[^/]{1,255}$" },
+          "sites": { "type": "array", "items": { "type": "string" } },
+          "why": { "type": "string", "minLength": 1 }
+        }
+      }
     }
   }
 }
@@ -2963,6 +3010,7 @@ write_file data/schema/policy.schema.json <<'SCAFFOLD_EOF'
         "additionalProperties": false,
         "properties": {
           "name": { "type": "string" },
+          "nsx_id": { "type": "string", "pattern": "^[^/]{1,255}$", "description": "The rule's id in NSX, when the key is not: an id the UI generated is keyed by the rule's name." },
           "description": { "type": "string" },
           "sequence_number": { "type": "integer", "minimum": 0 },
           "action": { "enum": ["ALLOW", "DROP", "REJECT", "JUMP_TO_APPLICATION"] },
@@ -3833,7 +3881,8 @@ resource "nsxt_policy_parent_security_policy" "this" {
 resource "nsxt_policy_security_policy_rule" "this" {
   for_each = var.rules
 
-  nsx_id       = each.key
+  # The key is the id, or the rule's name where NSX generated the id (nsx_id).
+  nsx_id       = try(each.value.nsx_id, each.key)
   display_name = try(each.value.name, each.key)
   description  = try(each.value.description, null)
   policy_path  = nsxt_policy_parent_security_policy.this.path
@@ -4609,7 +4658,17 @@ locals {
   base_groups      = { for k, g in local.groups : k => g if !contains(local.composite_group_keys, k) }
   composite_groups = { for k, g in local.groups : k => g if contains(local.composite_group_keys, k) }
 
-  group_paths = merge(module.base_groups.paths, module.composite_groups.paths)
+  # Groups another tool owns (inventory/ownership.yaml): used by name, never
+  # managed, so this stack cannot fight the tool that rewrites them.
+  references_all = merge([
+    for f in local.group_files : try(yamldecode(file("${local.data_root}/groups/${f}")).references, {})
+  ]...)
+  reference_paths = {
+    for k, g in local.references_all : k => "/global-infra/domains/${try(g.domain, "default")}/groups/${try(g.nsx_id, k)}"
+    if g.owner == "gm"
+  }
+
+  group_paths = merge(local.reference_paths, module.base_groups.paths, module.composite_groups.paths)
 
   # --- services -----------------------------------------------------------
   service_files = fileset("${local.data_root}/services", "*.yaml")
@@ -4654,7 +4713,7 @@ module "composite_groups" {
 
   groups      = local.composite_groups
   domain      = var.domain
-  group_paths = module.base_groups.paths
+  group_paths = merge(local.reference_paths, module.base_groups.paths)
 }
 
 # Services NSX already ships with are looked up, never recreated.
@@ -4802,7 +4861,24 @@ locals {
     if try(g.owner, "lm") == "gm"
   }
 
-  group_paths = merge(local.global_group_paths, module.base_groups.paths, module.composite_groups.paths)
+  # Groups another tool owns (inventory/ownership.yaml): used by name, never
+  # managed. A Local Manager's own, at the sites listed; the Global Manager's,
+  # read-only, as above.
+  references_all = merge([
+    for f in local.group_files : try(yamldecode(file("${local.data_root}/groups/${f}")).references, {})
+  ]...)
+  reference_paths = merge(
+    {
+      for k, g in local.references_all : k => "/infra/domains/${try(g.domain, var.domain)}/groups/${try(g.nsx_id, k)}"
+      if g.owner == "lm" && (contains(try(g.sites, []), var.site) || contains(try(g.sites, []), "*"))
+    },
+    {
+      for k, g in local.references_all : k => "/global-infra/domains/${try(g.domain, "default")}/groups/${try(g.nsx_id, k)}"
+      if g.owner == "gm"
+    },
+  )
+
+  group_paths = merge(local.global_group_paths, local.reference_paths, module.base_groups.paths, module.composite_groups.paths)
 
   # --- services -----------------------------------------------------------
   service_files = fileset("${local.data_root}/services", "*.yaml")
@@ -4862,7 +4938,7 @@ module "composite_groups" {
 
   groups      = local.composite_groups
   domain      = var.domain
-  group_paths = module.base_groups.paths
+  group_paths = merge(local.global_group_paths, local.reference_paths, module.base_groups.paths)
 }
 
 data "nsxt_policy_service" "predefined" {
@@ -6936,6 +7012,21 @@ def check_groups(docs: dict[Path, dict], scopes: dict, sites: set[str], imported
                         check_tag_value(where, label, condition.get("member_type", ""), str(condition.get("value", "")), scopes, report,
                                         imported=where in imported)
 
+        # Groups another tool owns: usable by name, never managed here.
+        for name, ref in (doc.get("references") or {}).items():
+            if not isinstance(ref, dict):
+                continue
+            if name in groups:
+                report.error(where, f"reference {name!r} is also defined in {origin[name]}. Group names are unique estate-wide.")
+                continue
+            groups[name] = dict(ref, reference=True)
+            origin[name] = where
+            for site in ref.get("sites") or []:
+                if site != "*" and site not in sites:
+                    report.error(where, f"reference {name}: site {site!r} is not in inventory/managers.yaml")
+            if ref.get("owner") == "lm" and not ref.get("sites"):
+                report.error(where, f"reference {name}: a Local Manager's group needs the sites it exists at.")
+
     # Nested membership: the stacks resolve groups in two passes, so a composite
     # group may only reference a base group.
     composite = {
@@ -8113,8 +8204,13 @@ def emit(value, indent: int = 0) -> list[str]:
                 lines.append(f"{pad}{key(name)}:")
                 lines.extend(emit(item, indent + 1))
             elif isinstance(item, list) and item:
-                if all(not isinstance(x, (dict, list)) for x in item):
-                    lines.append(f"{pad}{key(name)}: [{', '.join(scalar(x) for x in item)}]")
+                flow = f"{pad}{key(name)}: [{', '.join(scalar(x) for x in item)}]"
+                if all(not isinstance(x, (dict, list)) for x in item) and len(item) <= 4 and len(flow) <= 100:
+                    lines.append(flow)
+                elif all(not isinstance(x, (dict, list)) for x in item):
+                    # One member per line: a long list is read, and diffed, line by line.
+                    lines.append(f"{pad}{key(name)}:")
+                    lines.extend(f"{pad}  - {scalar(x)}" for x in item)
                 else:
                     lines.append(f"{pad}{key(name)}:")
                     lines.extend(emit(item, indent + 1))
@@ -8228,7 +8324,7 @@ def convert_rule(rule: dict, group_paths: dict, service_paths: dict) -> dict:
         return out
 
     converted: dict = {
-        "name": rule.get("display_name", rule["id"]),
+        "name": rule.get("display_name", rule.get("_nsx_id", rule["id"])),
         "sequence_number": rule.get("sequence_number", 100),
         "action": rule.get("action", "ALLOW"),
         "direction": rule.get("direction", "IN_OUT"),
@@ -8272,6 +8368,8 @@ def convert_rule(rule: dict, group_paths: dict, service_paths: dict) -> dict:
     # Apply To "ANY" (the policy's own scope) is written as ANY: an empty list
     # would read as a rule that forgot its Apply To, and is refused.
     converted["scope"] = scope or ["ANY"]
+    if rule.get("_nsx_id"):
+        converted["nsx_id"] = rule["_nsx_id"]  # the key is the display name
     return converted
 
 
@@ -8445,22 +8543,28 @@ def service_unsupported(service: dict) -> str | None:
     return None
 
 
-def unsupported_objects(groups: list[dict], services: list[dict], start: dict[str, str] | None = None) -> dict[str, str]:
+def unsupported_objects(groups: list[dict], services: list[dict], start: dict[str, str] | None = None,
+                        elsewhere: dict[str, str] | None = None) -> dict[str, str]:
     """path -> reason, for groups and custom services that cannot be adopted.
     A group that nests an unsupported group is unsupported too. start: paths
-    already known to be unadoptable (federation())."""
-    bad: dict[str, str] = dict(start or {})
+    already known to be unadoptable (federation()). elsewhere: objects another
+    tool owns; they are used by name, never adopted, so their content does not
+    matter here."""
+    elsewhere = elsewhere or {}
+    bad: dict[str, str] = {p: why for p, why in (start or {}).items() if p not in elsewhere}
     for g in groups:
-        if not is_system(g) and (why := group_unsupported(g)):
+        if not is_system(g) and g.get("path") not in elsewhere and (
+                why := field_unsupported("group", g) or group_unsupported(g)):
             bad[g["path"]] = why
     for s in services:
-        if not is_system(s) and (why := service_unsupported(s)):
+        if not is_system(s) and s.get("path") not in elsewhere and (
+                why := field_unsupported("service", s) or service_unsupported(s)):
             bad[s["path"]] = why
     changed = True
     while changed:
         changed = False
         for g in groups:
-            if g.get("path") in bad or is_system(g):
+            if g.get("path") in bad or is_system(g) or g.get("path") in elsewhere:
                 continue
             for expression in g.get("expression", []):
                 hit = [p for p in expression.get("paths", []) if p in bad] if expression.get("resource_type") == "PathExpression" else []
@@ -8472,6 +8576,8 @@ def unsupported_objects(groups: list[dict], services: list[dict], start: dict[st
 
 
 def rule_unsupported(rule: dict, bad: dict[str, str]) -> str | None:
+    if why := field_unsupported("rule", rule):
+        return why
     if rule.get("service_entries") and (why := service_unsupported({"service_entries": rule["service_entries"]})):
         return "inline " + why
     used = sorted({p for f in ("source_groups", "destination_groups", "scope", "services") for p in rule.get(f) or [] if p in bad})
@@ -8482,6 +8588,218 @@ def rule_unsupported(rule: dict, bad: dict[str, str]) -> str | None:
 
 def is_system(obj: dict) -> bool:
     return bool(obj.get("_system_owned")) or obj.get("_create_user") == "system"
+
+
+# --------------------------------------------------------------------------
+# Objects another tool owns: never adopted, never drift, still usable by name
+# --------------------------------------------------------------------------
+
+OWNERSHIP = REPO_ROOT / "inventory" / "ownership.yaml"
+# What NSX marks an object created by a principal identity (NCP, vSphere with
+# Tanzu, VCF Automation, any certificate-based integration) with.
+PROTECTED = {"PROTECTED", "REQUIRE_OVERRIDE"}
+DEFAULT_OWNERSHIP = [{"protected": True}, {"tag_scope": "ncp/"}]
+
+
+def ownership_rules() -> list[dict]:
+    """inventory/ownership.yaml's owned_elsewhere list; the defaults without one."""
+    if not OWNERSHIP.exists():
+        return list(DEFAULT_OWNERSHIP)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from yamlcompat import load_yaml  # noqa: PLC0415
+
+    rules = (load_yaml(OWNERSHIP.read_text()) or {}).get("owned_elsewhere")
+    return [r for r in rules or [] if isinstance(r, dict)]
+
+
+def owned_elsewhere(obj: dict, rules: list[dict]) -> str | None:
+    """Why another tool owns this object, or None. Terraform must never take it:
+    the other tool rewrites it, so it would drift forever or be reverted."""
+    if is_system(obj):
+        return None
+    who = str(obj.get("_create_user") or "")
+    for rule in rules:
+        if rule.get("protected") and obj.get("_protection") in PROTECTED:
+            return f"protected: created by the principal identity {who or '?'}"
+        prefix = rule.get("tag_scope")
+        if prefix and any(str(t.get("scope", "")).startswith(str(prefix)) for t in obj.get("tags") or []):
+            return f"tagged {prefix}* by the tool that manages it"
+        if rule.get("created_by") and who == str(rule["created_by"]):
+            return f"created by {who}"
+        if rule.get("id_prefix") and str(obj.get("_nsx_id", obj.get("id", ""))).startswith(str(rule["id_prefix"])):
+            return f"id starts with {rule['id_prefix']}"
+    return None
+
+
+# --------------------------------------------------------------------------
+# Every field NSX returns is either represented, known to be safe to leave, or
+# makes the object not adoptable, named. Nothing is dropped silently: a field
+# Terraform does not set is cleared, or kept on an object it then claims to own.
+# --------------------------------------------------------------------------
+
+METADATA = {"id", "path", "relative_path", "parent_path", "remote_path", "resource_type", "unique_id",
+            "realization_id", "marked_for_delete", "overridden", "display_name", "description", "tags",
+            "children", "origin_site_id", "owner_id", "is_default"}
+KNOWN_FIELDS = {
+    "rule": {"action", "destination_groups", "destinations_excluded", "direction", "disabled", "ip_protocol",
+             "logged", "notes", "profiles", "rule_id", "scope", "sequence_number", "service_entries", "services",
+             "source_groups", "sources_excluded", "tag"},
+    "policy": {"category", "comments", "internal_sequence_number", "lock_modified_by", "lock_modified_time",
+               "locked", "rules", "scope", "sequence_number", "stateful", "tcp_strict", "rule_count"},
+    "group": {"expression", "extended_expression", "group_type", "state"},
+    "service": {"service_entries", "service_type"},
+}
+# Fields with a name, because what they carry matters.
+NAMED_FIELDS = {
+    "scheduler_path": "a time window, which Terraform cannot express (convert it to a schedule: in data/)",
+    "connectivity_strategy": "a connectivity strategy, which Terraform cannot express",
+    "application_connectivity_strategy": "an application connectivity strategy, which Terraform cannot express",
+    "connectivity_preference": "a connectivity preference, which Terraform cannot express",
+    "logging_enabled": "policy-wide logging, which Terraform cannot express",
+    "reference": "a federation reference group, which belongs to the Global Manager",
+}
+UNSET = (None, False, "", "NONE", [], {}, ["ANY"])
+
+
+def field_unsupported(kind: str, obj: dict) -> str | None:
+    """The first field this object carries that nothing here represents, or None."""
+    for name in sorted(obj):
+        if name.startswith("_") or name in METADATA or name in KNOWN_FIELDS[kind]:
+            continue
+        value = obj[name]
+        if value in UNSET:
+            continue
+        what = NAMED_FIELDS.get(name)
+        if what:
+            return f"has {what} ({name})"
+        shown = json.dumps(value, default=str)
+        return f"carries {name}={shown[:60]}, which this tool does not represent"
+    return None
+
+
+# --------------------------------------------------------------------------
+# Readable keys. An id the UI generated (a UUID) says nothing in a review, so
+# such an object is keyed by its display name, with the id kept as nsx_id. A
+# key never changes once chosen: what data/ already calls an object, it keeps.
+# --------------------------------------------------------------------------
+
+UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def slug(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-._")[:80]
+
+
+def known_keys() -> tuple[dict[tuple, str], set[str], set[str]]:
+    """(kind, domain, nsx id[, rule nsx id]) -> the key data/ uses, and the group
+    and policy keys taken, from every file data/ has (mirror files included)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from yamlcompat import load_all  # noqa: PLC0415
+
+    files = sorted((DATA / "groups").glob("*.yaml")) + sorted((DATA / "policies").glob("*.yaml"))
+    docs = load_all([f.read_text() for f in files]) if files else []
+    known: dict[tuple, str] = {}
+    groups: set[str] = set()
+    policies: set[str] = set()
+    for f, doc in zip(files, docs):
+        doc = doc or {}
+        if f.parent.name == "groups":
+            for section in ("groups", "references"):
+                for k, g in (doc.get(section) or {}).items():
+                    g = g if isinstance(g, dict) else {}
+                    groups.add(str(k))
+                    known[("group", g.get("domain") or "default", str(g.get("nsx_id", k)))] = str(k)
+        else:
+            header = doc.get("policy") or {}
+            where = header.get("domain") or "default"
+            pid = str(header.get("id") or f.stem)
+            policies.add(f.stem)
+            known[("policy", where, pid)] = f.stem
+            for k, r in (doc.get("rules") or {}).items():
+                r = r if isinstance(r, dict) else {}
+                known[("rule", where, pid, str(r.get("nsx_id", k)))] = str(k)
+    return known, groups, policies
+
+
+def readable(kind: str, nsx: str, name: str, where: str, taken: set[str]) -> str:
+    """A key for an object no file names yet: its id, or for a UUID its display
+    name (<name>@<domain> outside default), made unique."""
+    base = slug(name) if UUID.match(nsx) else ""
+    if not base:
+        return nsx if where == "default" else f"{nsx}@{where}"
+    if where != "default":
+        base = f"{base}@{where}"
+    key, n = base, 2
+    while key in taken:
+        key, n = f"{base}-{n}" if where == "default" else f"{slug(name)}-{n}@{where}", n + 1
+    return key
+
+
+def assign_keys(groups: list[dict], policies: list[dict]) -> None:
+    """Set each object's key (o['id']), keeping the NSX id in o['_nsx_id']."""
+    known, taken_groups, taken_policies = known_keys()
+    for kind, objects, taken in (("group", groups, taken_groups), ("policy", policies, taken_policies)):
+        fresh = []
+        for o in sorted(objects, key=lambda o: (o.get("path", ""), o.get("id", ""))):
+            nsx = str(o.get("_nsx_id", o["id"]))
+            where = domain_of(o.get("path", ""), "default")
+            key = known.get((kind, where, nsx))
+            if key is None:
+                fresh.append((o, nsx, where))
+                continue
+            o["_nsx_id"], o["id"] = nsx, key
+        # Ids that are not UUIDs keep their own key; they are placed first, so a
+        # display name can never take a key an id already has.
+        fresh.sort(key=lambda f: bool(UUID.match(f[1])))
+        for o, nsx, where in fresh:
+            key = readable(kind, nsx, o.get("display_name", ""), where, taken)
+            taken.add(key)
+            o["_nsx_id"], o["id"] = nsx, key
+        for o in objects:
+            if o["_nsx_id"] == o["id"]:
+                del o["_nsx_id"]
+    for policy in policies:
+        where = domain_of(policy.get("path", ""), "default")
+        pid = str(policy.get("_nsx_id", policy["id"]))
+        taken = set()
+        fresh = []
+        for rule in policy.get("rules", []):
+            nsx = str(rule["id"])
+            key = known.get(("rule", where, pid, nsx))
+            if key is None:
+                fresh.append(rule)
+            else:
+                rule["_nsx_id"], rule["id"] = nsx, key
+                taken.add(key)
+        for rule in sorted(fresh, key=lambda r: (bool(UUID.match(str(r["id"]))), str(r["id"]))):
+            nsx = str(rule["id"])
+            key = readable("rule", nsx, rule.get("display_name", ""), "default", taken)
+            taken.add(key)
+            rule["_nsx_id"], rule["id"] = nsx, key
+        for rule in policy.get("rules", []):
+            if rule["_nsx_id"] == rule["id"]:
+                del rule["_nsx_id"]
+
+
+def ownership_report(site: str, objects: list[tuple[str, dict]], rules: list[dict]) -> list[str]:
+    """Who creates what on this manager: the answer to which tool owns which objects."""
+    rows: dict[tuple[str, str], dict[str, int]] = {}
+    for kind, o in objects:
+        if is_system(o):
+            continue
+        who = str(o.get("_create_user") or "?")
+        why = owned_elsewhere(o, rules)
+        row = rows.setdefault((who, "owned elsewhere" if why else "adoptable"), {})
+        row[kind] = row.get(kind, 0) + 1
+    if not rows:
+        return []
+    lines = [f"who creates what on {site} (system objects aside):",
+             f"  {'CREATED BY':<40} {'GROUPS':>7} {'POLICIES':>8} {'RULES':>6} {'SERVICES':>8}  TREATED AS"]
+    for (who, verdict), counts in sorted(rows.items(), key=lambda kv: (-sum(kv[1].values()), kv[0])):
+        lines.append(f"  {who[:40]:<40} {counts.get('group', 0):>7} {counts.get('policy', 0):>8} "
+                     f"{counts.get('rule', 0):>6} {counts.get('service', 0):>8}  {verdict}")
+    lines.append("  An account that is a tool, not a person, belongs in inventory/ownership.yaml (created_by:).")
+    return lines
 
 
 # --------------------------------------------------------------------------
@@ -8674,11 +8992,9 @@ def existing_keys(exclude: frozenset[Path] | set[Path] = frozenset()) -> dict[st
     for f in sorted((DATA / "policies").glob("*.yaml")):
         if f in exclude:
             continue
-        doc = load_yaml(f.read_text()) or {}
-        header = doc.get("policy") or {}
-        pid = str(header.get("id") or f.stem)
-        where_ = header.get("domain") or "default"
-        found["policies"].add(pid if where_ == "default" else f"{pid}@{where_}")
+        # A policy's key is its file's name, as the stacks key it; the importer
+        # keys what it reads the same way (assign_keys).
+        found["policies"].add(f.stem)
     return found
 
 
@@ -8791,14 +9107,20 @@ def main() -> int:
 
     own: set[Path] = mirror_files(args.site) if args.mirror else set()
     # data/ keys objects as NSX does, by domain and id: in 'default' by its id,
-    # in any other domain as <id>@<domain>, with the id as nsx_id. Always, not
-    # only when an id appears in two domains, so a key never changes later (a
-    # new key would be a destroy and create). From here on o["id"] is the key.
-    for o in all_groups + all_policies:
-        where_ = domain_of(o.get("path", ""), "default")
-        if where_ != "default" and "_nsx_id" not in o:
-            o["_nsx_id"] = o["id"]
-            o["id"] = f"{o['id']}@{where_}"
+    # in any other domain as <id>@<domain>, with the id as nsx_id; an id the UI
+    # generated (a UUID) by the display name instead. Always, not only when an
+    # id appears in two domains, and a key data/ already uses is kept, so a key
+    # never changes later (a new key would be a destroy and create). From here
+    # on o["id"] is the key.
+    assign_keys(all_groups, all_policies)
+    # What another tool owns (NCP, vSphere with Tanzu, VCF Automation...): never
+    # adopted, never drift. A rule may still use such a group, by name.
+    rules_ = ownership_rules()
+    elsewhere = {o["path"]: why for o in all_groups + all_services + all_policies
+                 if o.get("path") and (why := owned_elsewhere(o, rules_))}
+    creators = ownership_report(args.site, [("group", g) for g in all_groups] + [("service", s_) for s_ in all_services]
+                                + [("policy", p) for p in all_policies]
+                                + [("rule", r) for p in all_policies for r in p.get("rules", [])], rules_)
     # References are converted to names using everything that was read, so a
     # rule can name a group this tranche does not adopt.
     group_paths = {g["path"]: g["id"] for g in all_groups if g.get("path")}
@@ -8807,7 +9129,7 @@ def main() -> int:
                            declared_objects(exclude=own), group_paths, service_paths)
 
     if args.list:
-        return survey(args.site, all_groups, all_services, all_policies, federated)
+        return survey(args.site, all_groups, all_services, all_policies, federated, elsewhere)
     sites = [args.site]
     owner = "gm" if role == "gm" else "lm"
 
@@ -8852,9 +9174,15 @@ def main() -> int:
         policies = [p for p in policies if p["id"] not in have["policies"]]
 
     # Never adopt what cannot be represented exactly; report it instead.
-    bad = unsupported_objects(all_groups, all_services, federated)
+    bad = unsupported_objects(all_groups, all_services, federated, elsewhere)
     kept_in_ui: list[str] = [f"{o.get('resource_type', 'object')} {o.get('id')}: belongs to the Global Manager ({o.get('path')})"
                              for o in foreign]
+    owned_by_others = sorted(f"{kind} {o['id']}: {elsewhere[o['path']]}"
+                             for kind, objects in (("group", groups), ("service", services), ("policy", policies))
+                             for o in objects if o.get("path") in elsewhere)
+    groups = [g for g in groups if g.get("path") not in elsewhere]
+    services = [sv for sv in services if sv.get("path") not in elsewhere]
+    policies = [p for p in policies if p.get("path") not in elsewhere]
     # A local object shadowed by another manager's id is reported here, not as MANAGED.
     for kind, objects in (("group", all_groups), ("service", all_services)):
         for o in objects:
@@ -8873,6 +9201,13 @@ def main() -> int:
     for policy in policies:
         if is_system(policy):
             adoptable.append(policy)
+            continue
+        why = field_unsupported("policy", policy)
+        if why:
+            reason = f"policy {policy['id']}: {why}"
+            if policy["id"] in args.policy:
+                sys.exit(f"error: {reason}. Nothing was written.")
+            kept_in_ui.append(reason)
             continue
         blocked = [p for p in policy.get("scope") or [] if p in bad]
         if blocked:
@@ -8901,6 +9236,32 @@ def main() -> int:
         adoptable.append(dict(policy, rules=rules))
     policies = adoptable
 
+    # Groups another tool owns that what is adopted uses: named, never managed.
+    used: set[str] = set()
+    for policy in policies:
+        used.update(policy.get("scope") or [])
+        for rule in policy.get("rules", []):
+            for field in ("source_groups", "destination_groups", "scope"):
+                used.update(rule.get(field) or [])
+    for g in groups:
+        for expression in g.get("expression", []):
+            if expression.get("resource_type") == "PathExpression":
+                used.update(expression.get("paths", []))
+    references: dict = {}
+    for g in all_groups:
+        if g.get("path") in used and g.get("path") in elsewhere:
+            entry: dict = {"display_name": g.get("display_name", g["id"]), "owner": owner}
+            where = domain_of(g.get("path", ""), domain)
+            if where != "default":
+                entry["domain"] = where
+            if g.get("_nsx_id"):
+                entry["nsx_id"] = g["_nsx_id"]
+            if owner == "lm":
+                entry["sites"] = list(sites)
+            entry["why"] = f"owned by another tool ({elsewhere[g['path']]}); used by name, never managed here"
+            references[g["id"]] = entry
+    references = dict(sorted(references.items()))
+
     writer = Writer(args.dry_run, overwrite=args.mirror)
     security_stack = "global-security" if role == "gm" else "local-security"
     import_path = REPO_ROOT / "stacks" / security_stack / f"import-{args.site}-{tranche}.tf"
@@ -8927,14 +9288,17 @@ def main() -> int:
             where = domain_of(g.get("path", ""), domain)
             if g["id"] in converted_groups and where != "default":
                 converted_groups[g["id"]]["domain"] = where
-    if converted_groups:
+    if converted_groups or references:
         header = mirror_header if args.mirror else (
             f"# Imported from {args.site} on {datetime.now(timezone.utc):%Y-%m-%d}. Adopted, not created.\n"
             "#\n"
             "# Review before the first apply: check every 'why_static' note, and confirm\n"
             "# the tag scopes below are in data/schema/tag-scopes.yaml.\n\n"
         )
-        writer.write(DATA / "groups" / f"imported-{args.site}-{tranche}.yaml", header + to_yaml({"groups": converted_groups}))
+        document = {"groups": converted_groups}
+        if references:
+            document["references"] = references
+        writer.write(DATA / "groups" / f"imported-{args.site}-{tranche}.yaml", header + to_yaml(document))
 
     # --- services -------------------------------------------------------
     custom = {s["id"]: convert_service(s) for s in services if not is_system(s)}
@@ -8999,7 +9363,8 @@ def main() -> int:
             rule_ids[f"{key}/{rule['id']}"] = {
                 "policy": key,
                 "rule": rule["id"],
-                "id": object_id("rule", domain_of(policy.get("path", ""), domain), rule.get("path", ""), f"{nsx}/{rule['id']}", args.id_format),
+                "id": object_id("rule", domain_of(policy.get("path", ""), domain), rule.get("path", ""),
+                                f"{nsx}/{rule.get('_nsx_id', rule['id'])}", args.id_format),
             }
 
     kinds = [
@@ -9081,11 +9446,22 @@ def main() -> int:
         print(f"  EXISTS    {note}  (your file was not touched — diff and merge by hand)")
     for note in skipped:
         print(f"  MANAGED   {note}  (already in data/, so not adopted again)")
+    for note in owned_by_others:
+        print(f"  OWNED ELSEWHERE  {note}")
+    if owned_by_others:
+        print("  (another tool manages these: never adopted, never raised as drift. A rule here may")
+        print("   still use such a group, by name: data/groups lists it under references.)")
     for note in kept_in_ui:
         print(f"  NOT ADOPTED  {note}")
     if kept_in_ui:
         print("  (these cannot be represented exactly, so importing them would change them on")
         print("   the first apply; they stay as they are, managed in the NSX UI)")
+    unknown = sorted({n.split("carries ", 1)[1].split("=", 1)[0] for n in kept_in_ui if "carries " in n})
+    if unknown:
+        print(f"  fields NSX returned that this tool does not represent yet: {', '.join(unknown)}")
+    print()
+    for line in creators:
+        print(line)
     print()
     print(f"{len(converted_groups)} group(s), {len([p for p in policies if not is_system(p)])} policy/policies, "
           f"{sum(len(p.get('rules', [])) for p in policies if not is_system(p))} rule(s), {len(custom)} custom service(s)")
@@ -9106,13 +9482,23 @@ def main() -> int:
     return 0
 
 
-def survey(site: str, groups: list, services: list, policies: list, federated: dict | None = None) -> int:
+def survey(site: str, groups: list, services: list, policies: list, federated: dict | None = None,
+           elsewhere: dict | None = None) -> int:
     """What could be adopted from this manager, policy by policy. Writes nothing."""
-    bad = unsupported_objects(groups, services, federated)
+    elsewhere = elsewhere or {}
+    bad = unsupported_objects(groups, services, federated, elsewhere)
     have = existing_keys()
     rows = []
     for policy in policies:
         if is_system(policy):
+            continue
+        if policy.get("path") in elsewhere:
+            rows.append((policy.get("category", ""), policy["id"], policy.get("display_name", ""),
+                         len(policy.get("rules", [])), f"owned elsewhere: {elsewhere[policy['path']]}"))
+            continue
+        if why := field_unsupported("policy", policy):
+            rows.append((policy.get("category", ""), policy["id"], policy.get("display_name", ""),
+                         len(policy.get("rules", [])), f"not adoptable: {why}"))
             continue
         rules = policy.get("rules", [])
         kept = [r for r in rules if rule_unsupported(r, bad)]
@@ -9972,24 +10358,36 @@ class GitLab:
 # What changed
 # --------------------------------------------------------------------------
 
-def mirror_objects(files: dict[str, str], site: str) -> dict[tuple[str, str], dict]:
-    """(kind, id) -> definition, from this site's mirror files."""
+def mirror_objects(files: dict[str, str], site: str, identity: dict | None = None) -> dict[tuple[str, str], dict]:
+    """(kind, key) -> definition, from this site's mirror files. identity, when
+    given, receives (kind, key) -> the object's identity in NSX (nsx_ident())."""
     out: dict[tuple[str, str], dict] = {}
+    ident = identity if identity is not None else {}
     mine = {path: text for path, text in files.items() if text.split("\n", 1)[0].strip() == f"{MIRROR_MARK}{site}"}
     # In one go: without PyYAML that is one terraform call, not one per file.
     for (path, text), doc in zip(mine.items(), load_all(list(mine.values()))):
         doc = doc or {}
         if path.startswith("data/groups/"):
+            # references: are groups another tool owns; never drift.
             for key, value in (doc.get("groups") or {}).items():
                 out[("group", str(key))] = value
+                value = value if isinstance(value, dict) else {}
+                ident[("group", str(key))] = ("group", value.get("domain") or "default", str(value.get("nsx_id", key)))
         elif path.startswith("data/services/"):
             for key, value in (doc.get("custom") or {}).items():
                 out[("service", str(key))] = value
+                ident[("service", str(key))] = ("service", str(key))
         elif path.startswith("data/policies/"):
-            pid = Path(path).stem  # the key: <id>, or <id>@<domain> outside default
-            out[("policy", pid)] = doc.get("policy") or {}
+            pid = Path(path).stem  # the key: the file's name
+            header = doc.get("policy") or {}
+            out[("policy", pid)] = header
+            where = header.get("domain") or "default"
+            nsx = str(header.get("id") or pid)
+            ident[("policy", pid)] = ("policy", where, nsx)
             for key, value in (doc.get("rules") or {}).items():
                 out[("rule", f"{pid}/{key}")] = value
+                value = value if isinstance(value, dict) else {}
+                ident[("rule", f"{pid}/{key}")] = ("rule", where, nsx, str(value.get("nsx_id", key)))
     return out
 
 
@@ -10050,25 +10448,39 @@ def describe(before, after) -> str:
     return text if len(text) <= 240 else text[:237] + "..."
 
 
-def data_key(obj: dict) -> str:
-    """The key data/ gives an object: its id, or <id>@<domain> outside 'default'."""
-    found = re.match(r"^/(?:global-)?infra/domains/([^/]+)/", obj.get("path") or "")
-    where = found.group(1) if found else "default"
-    return obj.get("id", "") if where == "default" else f"{obj.get('id', '')}@{where}"
+def nsx_index(dump: dict) -> dict[tuple, dict]:
+    """The object's identity in NSX -> the object as NSX returned it, for who
+    changed it and when. Identities are what mirror_objects() records, so a
+    key data/ chose (a display name, <id>@<domain>) finds its object."""
+    out: dict[tuple, dict] = {}
 
+    def where(obj: dict) -> str:
+        found = re.match(r"^/(?:global-)?infra/domains/([^/]+)/", obj.get("path") or "")
+        return found.group(1) if found else "default"
 
-def nsx_index(dump: dict) -> dict[tuple[str, str], dict]:
-    """(kind, key) -> the object as NSX returned it, for who changed it and when."""
-    out: dict[tuple[str, str], dict] = {}
     for g in dump.get("groups", []):
-        out.setdefault(("group", data_key(g)), g)
+        out.setdefault(("group", where(g), str(g.get("id", ""))), g)
     for s in dump.get("services", []):
-        out.setdefault(("service", s.get("id", "")), s)
+        out.setdefault(("service", str(s.get("id", ""))), s)
     for p in dump.get("policies", []):
-        out.setdefault(("policy", data_key(p)), p)
+        out.setdefault(("policy", where(p), str(p.get("id", ""))), p)
         for r in p.get("rules", []):
-            out.setdefault(("rule", f"{data_key(p)}/{r.get('id')}"), r)
+            out.setdefault(("rule", where(p), str(p.get("id", "")), str(r.get("id", ""))), r)
     return out
+
+
+def order_only(before, after) -> bool:
+    """True when a rule changed in its sequence number and nothing else."""
+    if not (isinstance(before, dict) and isinstance(after, dict)):
+        return False
+    return {k for k in set(before) | set(after) if before.get(k) != after.get(k)} == {"sequence_number"}
+
+
+def rule_order(objects: dict, pid: str, keep: set[str]) -> list[str]:
+    """The rules of one policy, of those in keep, in the order NSX evaluates them."""
+    rows = [(v.get("sequence_number", 0) if isinstance(v, dict) else 0, k[1].split("/", 1)[1])
+            for k, v in objects.items() if k[0] == "rule" and k[1].split("/", 1)[0] == pid and k[1].split("/", 1)[1] in keep]
+    return [name for _, name in sorted(rows)]
 
 
 def when(obj: dict | None) -> tuple[str, str, float | None]:
@@ -10084,10 +10496,11 @@ def when(obj: dict | None) -> tuple[str, str, float | None]:
 def mirror_changes(site: str, base: str, dump: dict) -> list[dict] | None:
     """The changes to report; None when REF holds no copy of the site yet (baseline)."""
     old_files = files_at(base)
-    old = mirror_objects(old_files, site)
+    identity: dict = {}
+    old = mirror_objects(old_files, site, identity)
     if not old:
         return None
-    new = mirror_objects(files_now(), site)
+    new = mirror_objects(files_now(), site, identity)
     mine = [p for p, t in old_files.items() if t.split("\n", 1)[0].strip() == f"{MIRROR_MARK}{site}"]
     copied = int(subprocess.run(["git", "log", "-1", "--format=%ct", base, "--", *mine], cwd=REPO_ROOT,
                                 capture_output=True, text=True, check=True).stdout.strip() or 0)
@@ -10095,6 +10508,7 @@ def mirror_changes(site: str, base: str, dump: dict) -> list[dict] | None:
     live = nsx_index(dump)
     gone_policies = {k[1] for k in old if k[0] == "policy" and k not in new}
     items = []
+    renumbered: dict[str, list[str]] = {}
     for key in sorted(set(old) | set(new)):
         kind, ident = key
         before, after = old.get(key), new.get(key)
@@ -10102,7 +10516,12 @@ def mirror_changes(site: str, base: str, dump: dict) -> list[dict] | None:
             continue
         if kind == "rule" and before is not None and after is None and ident.split("/", 1)[0] in gone_policies:
             continue  # reported with its policy
-        who, at, seconds = when(live.get(key))
+        if kind == "rule" and order_only(before, after):
+            # The UI renumbers neighbours when one rule is dragged: only a change
+            # in ORDER changes what traffic is allowed. Decided per policy below.
+            renumbered.setdefault(ident.split("/", 1)[0], []).append(ident.split("/", 1)[1])
+            continue
+        who, at, seconds = when(live.get(identity.get(key)))
         if after is not None and seconds is not None and seconds < since:
             continue  # nobody changed it in NSX since the copy: the repository side moved
         if before is None:
@@ -10115,6 +10534,22 @@ def mirror_changes(site: str, base: str, dump: dict) -> list[dict] | None:
             change, detail = "changed", describe(before, after)
         items.append({"key": f"{kind} {ident}", "kind": kind, "id": ident, "change": change, "detail": detail,
                       "who": who, "at": at, "version": digest(after) if after is not None else "0" * 16})
+    for pid, moved in sorted(renumbered.items()):
+        both = {k[1].split("/", 1)[1] for k in old if k[0] == "rule" and k[1].split("/", 1)[0] == pid} & \
+               {k[1].split("/", 1)[1] for k in new if k[0] == "rule" and k[1].split("/", 1)[0] == pid}
+        before_order, after_order = rule_order(old, pid, both), rule_order(new, pid, both)
+        if before_order == after_order:
+            continue  # renumbered, same order: nothing an engineer needs to look at
+        stamps = [when(live.get(identity.get(("rule", f"{pid}/{r}")))) for r in moved]
+        who, at, seconds = max(stamps, key=lambda w: w[2] or 0) if stamps else ("", "", None)
+        if seconds is not None and seconds < since:
+            continue
+        shifted = [r for i, r in enumerate(after_order) if before_order.index(r) != i]
+        detail = "rule order changed: now " + " > ".join(after_order)
+        if len(detail) > 240:
+            detail = f"rule order changed: {len(shifted)} rule(s) moved, including " + ", ".join(shifted[:5])
+        items.append({"key": f"policy {pid} order", "kind": "policy", "id": pid, "change": "reordered",
+                      "detail": detail, "who": who, "at": at, "version": digest(after_order)})
     return items
 
 
@@ -14864,6 +15299,35 @@ abstraction is wrong.
 | `domain` | NSX domain. On a GM, a domain id or site id — set it explicitly. |
 | `stacks` | Which stacks run against this manager. Defaults by role. |
 | `enabled` | Set `false` to drop a manager out of the CI matrix without deleting it |
+
+## ownership.yaml
+
+What other tools own. NCP and vSphere with Tanzu create DFW policies and groups
+for their clusters, VCF Automation creates them for its deployments, and they
+rewrite them as they go. Terraform must never take those: it would drift
+forever, or undo the tool's work. An object matching any entry is never
+adopted and never raised as drift; a rule in data/ may still use such a group,
+by name (the importer lists it under `references:`).
+
+The importer prints, on every run, who created what on the manager. An account
+that is a tool, not a person, belongs here.
+SCAFFOLD_EOF
+
+write_file inventory/ownership.yaml <<'SCAFFOLD_EOF'
+# Objects other tools own: never adopted, never raised as drift, still usable by
+# name in a rule. Any entry matching an object is enough. See inventory/README.md.
+#
+#   protected: true     NSX marks the object protected: a principal identity
+#                       (NCP, vSphere with Tanzu, VCF Automation, any
+#                       certificate-based integration) created it
+#   tag_scope: ncp/     a tag whose scope starts with this
+#   created_by: NAME    the account that created it (_create_user), exactly
+#   id_prefix: PREFIX   its NSX id starts with this
+
+owned_elsewhere:
+  - protected: true
+  - tag_scope: ncp/
+  # - created_by: svc-vra@corp.example
 SCAFFOLD_EOF
 
 if [ "$WITH_EXAMPLES" = 1 ]; then

@@ -13,6 +13,18 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.5.5
+
+**What other tools own is never taken.** NCP and vSphere with Tanzu create DFW policies and groups for their clusters, VCF Automation for its deployments, and they keep rewriting them. The importer now leaves them to that tool: anything NSX marks protected (created by a principal identity), anything tagged `ncp/*`, and any account or id prefix listed in the new `inventory/ownership.yaml` is reported as `OWNED ELSEWHERE`, never adopted and never raised as drift. A rule that uses such a group is still adopted: the group is listed under `references:` and resolved by its NSX id, never managed. `scripts/update.sh` creates `inventory/ownership.yaml` when the tree has none (estate data is otherwise never changed).
+
+**Nothing is dropped silently.** Every field NSX returns is either represented, known to be safe to leave, or makes that object NOT ADOPTED with the field named. Before, a policy or rule with an NSX time window was adopted without it; after cutover an update could have left the rule open at all times. Time windows (`scheduler_path`), connectivity strategies and preferences, policy-wide logging and federation reference groups are named; a field a newer NSX adds reads `carries <field>=<value>`, and the report lists them.
+
+**Readable files.** Groups, policies and rules whose id the UI generated (a UUID) are keyed by their display name, with the UUID as `nsx_id`; rules then read `source_groups: [79176_vms_Mum]`. A key, once data/ uses it, never changes, a rename in the UI included. Long member lists are written one per line.
+
+**Rule order, not numbers.** Rules renumbered in the same order raise no drift issue; a real reorder is one row for the policy, rules in their new order, with who and when.
+
+**Who creates what.** Every import and mirror ends with the accounts that created the manager's objects, per kind, and whether each is adopted or owned elsewhere, so the tools among them are found once.
+
 ## 1.5.4
 
 **IP ranges written with spaces are adopted.** The NSX UI stores a range typed in a rule's source or destination as `13.126.23.128 - 13.126.23.135`, with spaces around the dash. The importer, the validator and the policy module only knew `a-b`, so such a rule stayed in the UI as "refers to 13.126.23.128 - 13.126.23.135, which hyd-gm01 does not hold". The range is now adopted exactly as NSX holds it, so the plan stays a pure import.

@@ -334,6 +334,49 @@ check "deletions raise a new drift issue; a policy's rules go with it" bash -c '
 check "a policy and a group deleted in the UI are deleted from the repository" bash -c 'grep -q "^D	data/policies/new-app.yaml" <<<"$1" && grep -q "^D	data/groups/imported-lon1-mirror.yaml" <<<"$1"' _ "$files"
 check "...and from the import blocks" bash -c '! git -C "$1" show mirror/lon1:stacks/local-security/import-lon1-mirror.tf | grep -q "New-G\|new-app"' _ "$SCRATCH/remote.git"
 check "...and from the manifest" bash -c '! git -C "$1" show mirror/lon1:data/.import-manifest.json | grep -q new-app' _ "$SCRATCH/remote.git"
+merge_mirror
+
+# Rule order: the UI renumbers neighbours when one rule is dragged. Only a change
+# in order changes what traffic is allowed.
+python3 - <<'PY'
+import json, time
+d = json.load(open("reports/lon1-raw.json"))
+fresh = next(p for p in d["policies"] if p["id"] == "fresh-app")
+second = json.loads(json.dumps(fresh["rules"][0]).replace('"' + fresh["rules"][0]["id"] + '"', '"second-rule"'))
+second["sequence_number"] = fresh["rules"][0]["sequence_number"] + 100
+second["_last_modified_user"], second["_last_modified_time"] = "carol", int(time.time() * 1000)
+fresh["rules"].append(second)
+json.dump(d, open("reports/lon1-raw.json", "w"))
+PY
+mirror MIRROR_AUTO_MERGE=1 >/dev/null
+merge_mirror
+n_before="$(issue | tail -1)"
+python3 - <<'PY'
+import json, time
+d = json.load(open("reports/lon1-raw.json"))
+fresh = next(p for p in d["policies"] if p["id"] == "fresh-app")
+for r in fresh["rules"]:
+    r["sequence_number"] += 7  # renumbered, same order
+    r["_last_modified_user"], r["_last_modified_time"] = "dave", int(time.time() * 1000)
+json.dump(d, open("reports/lon1-raw.json", "w"))
+PY
+out="$(mirror MIRROR_AUTO_MERGE=1)"
+check "rules renumbered in the same order follow, and raise no drift issue" bash -c '[ "$3" = "$1" ] && grep -q "no change made in NSX on lon1 to report" <<<"$2"' _ "$n_before" "$out" "$(issue | tail -1)"
+merge_mirror
+python3 - <<'PY'
+import json, time
+d = json.load(open("reports/lon1-raw.json"))
+fresh = next(p for p in d["policies"] if p["id"] == "fresh-app")
+a, b = fresh["rules"]
+a["sequence_number"], b["sequence_number"] = b["sequence_number"], a["sequence_number"]  # moved: order changed
+for r in (a, b):
+    r["_last_modified_user"], r["_last_modified_time"] = "erin", int(time.time() * 1000)
+json.dump(d, open("reports/lon1-raw.json", "w"))
+PY
+mirror MIRROR_AUTO_MERGE=1 >/dev/null
+I="$(issue)"
+check "a real reorder raises one issue for the policy, in order, by whom" bash -c '[ "$(tail -1 <<<"$1")" = "$(( $2 + 1 ))" ] && grep -q "| reordered | .policy fresh-app order. | rule order changed: now second-rule > " <<<"$1" && grep -q "| erin |" <<<"$1" && ! grep -q "sequence_number" <<<"$1"' _ "$I" "$n_before"
+merge_mirror
 
 # A large manager: its file list and report are over the kernel's 128 KiB limit
 # for one environment variable or argument, and over what a description holds.
@@ -729,6 +772,100 @@ ok = ok and e["domains"] == ["default"] and not any(c.endswith("/domains") for c
 sys.exit(0 if ok else 1)
 PY
 check "a Global Manager is read in every domain, its own first; a Local Manager in default only" test $? -eq 0
+
+echo "ownership, the field allow-list, readable keys, readable lists"
+rm -rf data/groups data/services data/policies data/.import-manifest.json stacks/*/import-*.tf
+mkdir -p data/groups data/services data/policies
+python3 - <<'PY'
+import json
+LD = "/infra/domains/default"
+U = lambda n: f"0b7c{n:04d}-1111-4222-8333-444455556666"
+cond = lambda v: [{"resource_type": "Condition", "key": "Tag", "member_type": "VirtualMachine", "operator": "EQUALS", "value": v}]
+def grp(i, name, expr, **extra): return dict({"id": i, "path": f"{LD}/groups/{i}", "display_name": name, "expression": expr}, **extra)
+def rule(p, i, name, src, seq, **extra):
+    return dict({"id": i, "path": f"{LD}/security-policies/{p}/rules/{i}", "display_name": name, "sequence_number": seq, "action": "ALLOW",
+                 "direction": "IN_OUT", "logged": True, "source_groups": src, "destination_groups": ["ANY"], "services": ["ANY"],
+                 "scope": ["ANY"], "profiles": ["ANY"], "is_default": False}, **extra)
+def pol(i, name, rules, **extra):
+    return dict({"id": i, "path": f"{LD}/security-policies/{i}", "display_name": name, "category": "Application", "sequence_number": 10,
+                 "stateful": True, "scope": ["ANY"], "rules": rules, "connectivity_strategy": "NONE", "internal_sequence_number": 7}, **extra)
+ips = [f"10.0.0.{n}" for n in range(1, 9)]
+groups = [
+    grp(U(1), "#79176_vms_Mum", [{"resource_type": "IPAddressExpression", "ip_addresses": ips}], state="SUCCESS"),
+    grp(U(2), "App Web", cond("app|web")),
+    grp(U(3), "App Web", cond("app|web2")),                      # the same display name: a second key
+    grp("plain-id", "Plain", cond("app|plain")),
+    grp("tkg-ns-1", "tkg ns 1", cond("app|tkg"), _protection="REQUIRE_OVERRIDE", _create_user="wcp-cluster-user-x"),
+    grp("ncp-tagged", "ncp tagged", cond("app|ncp"), tags=[{"scope": "ncp/cluster", "tag": "k8s"}]),
+    grp("vra-made", "vra made", cond("app|vra"), _create_user="svc-vra"),
+    grp("odd-field", "odd field", cond("app|odd"), team_owner="netops"),
+]
+policies = [
+    pol(U(10), "Payments", [
+        rule(U(10), U(20), "Allow Web", [f"{LD}/groups/{U(2)}", f"{LD}/groups/{U(3)}"], 100),
+        rule(U(10), U(21), "Allow TKG", [f"{LD}/groups/tkg-ns-1", f"{LD}/groups/ncp-tagged"], 200),
+        rule(U(10), U(22), "Night only", ["ANY"], 300, scheduler_path="/infra/firewall-schedulers/night"),
+        rule(U(10), U(23), "Odd rule", ["ANY"], 400, future_field={"x": 1}),
+        rule(U(10), "named-rule", "named rule", [f"{LD}/groups/plain-id"], 500),
+    ]),
+    pol("windowed", "Windowed", [rule("windowed", "w1", "w1", ["ANY"], 100)], scheduler_path="/infra/firewall-schedulers/office"),
+    pol("ncp-pol", "NCP policy", [rule("ncp-pol", "n1", "n1", ["ANY"], 100)], _protection="REQUIRE_OVERRIDE", _create_user="ncp-hyd"),
+    pol("strategy", "Strategy", [rule("strategy", "s1", "s1", ["ANY"], 100)], connectivity_strategy="WHITELIST"),
+]
+json.dump({"groups": groups, "services": [], "policies": policies, "domain": "default", "domains": ["default"]}, open("reports/own1.json", "w"))
+PY
+python3 - <<'PY'
+import yaml
+m = yaml.safe_load(open("inventory/managers.yaml"))
+m["managers"]["own1"] = {"role": "lm", "host": "own1.example.internal", "site": "own1", "region": "x", "vault_path": "nsx/own1",
+                         "tier": "lab", "domain": "default", "mode": "mirror", "vcf_instance": "vcf-x",
+                         "sddc_manager": "sddc.example.internal"}
+open("inventory/managers.yaml", "w").write(yaml.safe_dump(m, sort_keys=False))
+PY
+printf 'owned_elsewhere:\n  - protected: true\n  - tag_scope: ncp/\n  - created_by: svc-vra\n' >inventory/ownership.yaml
+out="$(mir own1)"
+G="$(cat data/groups/imported-own1-mirror.yaml 2>/dev/null)"
+check "a group the UI gave a UUID is keyed by its display name, with the UUID as nsx_id" bash -c 'python3 -c "import yaml,sys;g=yaml.safe_load(sys.stdin)[\"groups\"];sys.exit(0 if g[\"79176_vms_Mum\"][\"nsx_id\"]==\"0b7c0001-1111-4222-8333-444455556666\" else 1)" <<<"$1"' _ "$G"
+check "two groups with one display name get two keys" bash -c 'python3 -c "import yaml,sys;g=yaml.safe_load(sys.stdin)[\"groups\"];sys.exit(0 if {\"App-Web\",\"App-Web-2\"} <= set(g) else 1)" <<<"$1"' _ "$G"
+check "an id that is not a UUID stays the key" bash -c 'python3 -c "import yaml,sys;g=yaml.safe_load(sys.stdin)[\"groups\"];sys.exit(0 if \"plain-id\" in g and \"nsx_id\" not in g[\"plain-id\"] else 1)" <<<"$1"' _ "$G"
+check "a UUID policy is written as <display name>.yaml with its UUID as id; its UUID rules by name" bash -c 'python3 -c "import yaml,sys;d=yaml.safe_load(open(\"data/policies/Payments.yaml\"));r=d[\"rules\"];sys.exit(0 if d[\"policy\"][\"id\"]==\"0b7c0010-1111-4222-8333-444455556666\" and r[\"Allow-Web\"][\"nsx_id\"]==\"0b7c0020-1111-4222-8333-444455556666\" and r[\"Allow-Web\"][\"source_groups\"]==[\"App-Web\",\"App-Web-2\"] and \"named-rule\" in r else 1)"'
+check "import ids keep the NSX ids, not the readable keys" bash -c 'grep -q "\"Payments/Allow-Web\" *= { policy = \"Payments\", rule = \"Allow-Web\", id = \"/infra/domains/default/security-policies/0b7c0010-1111-4222-8333-444455556666/rules/0b7c0020-1111-4222-8333-444455556666\" }" stacks/local-security/import-own1-mirror.tf'
+check "a long member list is written one per line" bash -c 'grep -q "^          - 10.0.0.1$" data/groups/imported-own1-mirror.yaml'
+check "a protected group (a principal identity made it) is owned elsewhere, not adopted" bash -c 'grep -q "OWNED ELSEWHERE  group tkg-ns-1: protected: created by the principal identity wcp-cluster-user-x" <<<"$1" && ! grep -q "^  tkg-ns-1:" <<<"$2"' _ "$out" "$(python3 -c "import yaml;print(yaml.safe_dump(yaml.safe_load(open('data/groups/imported-own1-mirror.yaml'))['groups']))")"
+check "...as are a group tagged ncp/ and one a listed account created" bash -c 'grep -q "OWNED ELSEWHERE  group ncp-tagged: tagged ncp/" <<<"$1" && grep -q "OWNED ELSEWHERE  group vra-made: created by svc-vra" <<<"$1"' _ "$out"
+check "a rule using groups another tool owns is adopted, naming them; they are listed as references" bash -c 'python3 -c "import yaml,sys;d=yaml.safe_load(open(\"data/groups/imported-own1-mirror.yaml\"));r=yaml.safe_load(open(\"data/policies/Payments.yaml\"))[\"rules\"][\"Allow-TKG\"];sys.exit(0 if r[\"source_groups\"]==[\"tkg-ns-1\",\"ncp-tagged\"] and set(d[\"references\"])=={\"tkg-ns-1\",\"ncp-tagged\"} and d[\"references\"][\"tkg-ns-1\"][\"sites\"]==[\"own1\"] else 1)"'
+check "a protected policy is owned elsewhere: no file, no import" bash -c 'grep -q "OWNED ELSEWHERE  policy ncp-pol" <<<"$1" && ! test -f data/policies/ncp-pol.yaml && ! grep -q "ncp-pol" stacks/local-security/import-own1-mirror.tf' _ "$out"
+check "a rule with a time window is not adopted, and says so" bash -c 'grep -q "NOT ADOPTED  rule Payments/Night-only: has a time window" <<<"$1" && ! grep -q "Night-only" data/policies/Payments.yaml' _ "$out"
+check "a policy with a time window is not adopted, and says so" bash -c 'grep -q "NOT ADOPTED  policy windowed: has a time window" <<<"$1" && ! test -f data/policies/windowed.yaml' _ "$out"
+check "a policy with a connectivity strategy is not adopted" grep -q "NOT ADOPTED  policy strategy: has a connectivity strategy" <<<"$out"
+check "a field nothing here represents names itself, and blocks only that object" bash -c 'grep -q "NOT ADOPTED  rule Payments/Odd-rule: carries future_field=" <<<"$1" && grep -q "NOT ADOPTED  group odd-field: carries team_owner=" <<<"$1" && grep -q "does not represent yet: future_field, team_owner" <<<"$1"' _ "$out"
+check "fields at their unset value, and known metadata, block nothing" bash -c '! grep -q "NOT ADOPTED  group 79176\|internal_sequence_number\|connectivity_strategy=\|is_default" <<<"$1"' _ "$out"
+check "who creates what is reported, with the verdict" bash -c 'grep -q "who creates what on own1" <<<"$1" && grep -q "wcp-cluster-user-x .* owned elsewhere" <<<"$1"' _ "$out"
+check "it validates, references included" python3 scripts/validate-data.py
+check "...and without PyYAML" bash -c '! NSX_YAML_FALLBACK=1 NSX_YAML_NO_TERRAFORM=1 python3 scripts/validate-data.py 2>&1 | grep -q "^ERROR"'
+check "the stacks resolve references by NSX id and never manage them" bash -c 'grep -q "reference_paths" stacks/local-security/main.tf && grep -q "reference_paths" stacks/global-security/main.tf && grep -q "nsx_id       = try(each.value.nsx_id, each.key)" modules/dfw-policy/main.tf'
+before="$(cat data/groups/*.yaml data/policies/*.yaml stacks/*/import-*.tf | sha256sum)"
+python3 - <<'PY'
+import json
+d = json.load(open("reports/own1.json"))
+for g in d["groups"]:
+    if g["display_name"] == "#79176_vms_Mum": g["display_name"] = "renamed in the UI"
+json.dump(d, open("reports/own1.json", "w"))
+PY
+mir own1 >/dev/null
+check "a key, once chosen, survives a rename in the UI (a new key would be a destroy and create)" bash -c 'python3 -c "import yaml,sys;g=yaml.safe_load(open(\"data/groups/imported-own1-mirror.yaml\"))[\"groups\"];sys.exit(0 if g[\"79176_vms_Mum\"][\"display_name\"]==\"renamed in the UI\" else 1)"'
+python3 - <<'PY'
+import json
+d = json.load(open("reports/own1.json"))
+for g in d["groups"]:
+    if g["display_name"] == "renamed in the UI": g["display_name"] = "#79176_vms_Mum"
+json.dump(d, open("reports/own1.json", "w"))
+PY
+mir own1 >/dev/null
+check "...and syncing an unchanged manager rewrites the same bytes" test "$(cat data/groups/*.yaml data/policies/*.yaml stacks/*/import-*.tf | sha256sum)" = "$before"
+rm -f inventory/ownership.yaml
+out="$(mir own1)"
+check "without inventory/ownership.yaml, protected and ncp/ objects are still owned elsewhere" bash -c 'grep -q "OWNED ELSEWHERE  group tkg-ns-1" <<<"$1" && grep -q "OWNED ELSEWHERE  group ncp-tagged" <<<"$1" && ! grep -q "OWNED ELSEWHERE  group vra-made" <<<"$1"' _ "$out"
 cd "$T" || exit 1
 
 finish brownfield
