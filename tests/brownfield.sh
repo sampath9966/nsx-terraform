@@ -813,7 +813,9 @@ policies = [
     pol("ncp-pol", "NCP policy", [rule("ncp-pol", "n1", "n1", ["ANY"], 100)], _protection="REQUIRE_OVERRIDE", _create_user="ncp-hyd"),
     pol("strategy", "Strategy", [rule("strategy", "s1", "s1", ["ANY"], 100)], connectivity_strategy="WHITELIST"),
 ]
-json.dump({"groups": groups, "services": [], "policies": policies, "domain": "default", "domains": ["default"]}, open("reports/own1.json", "w"))
+exclude = [f"{LD}/groups/plain-id", f"{LD}/groups/tkg-ns-1", "/infra/segments/seg1", f"{LD}/groups/odd-field"]
+json.dump({"groups": groups, "services": [], "policies": policies, "domain": "default", "domains": ["default"], "exclude_list": exclude},
+          open("reports/own1.json", "w"))
 PY
 python3 - <<'PY'
 import yaml
@@ -842,6 +844,9 @@ check "a policy with a connectivity strategy is not adopted" grep -q "NOT ADOPTE
 check "a field nothing here represents names itself, and blocks only that object" bash -c 'grep -q "NOT ADOPTED  rule Payments/Odd-rule: carries future_field=" <<<"$1" && grep -q "NOT ADOPTED  group odd-field: carries team_owner=" <<<"$1" && grep -q "does not represent yet: future_field, team_owner" <<<"$1"' _ "$out"
 check "fields at their unset value, and known metadata, block nothing" bash -c '! grep -q "NOT ADOPTED  group 79176\|internal_sequence_number\|connectivity_strategy=\|is_default" <<<"$1"' _ "$out"
 check "who creates what is reported, with the verdict" bash -c 'grep -q "who creates what on own1" <<<"$1" && grep -q "wcp-cluster-user-x .* owned elsewhere" <<<"$1"' _ "$out"
+check "the DFW exclusion list is taken: groups by their keys, another tool's by reference" bash -c 'python3 -c "import yaml,sys;d=yaml.safe_load(open(\"data/exclude-list/own1.yaml\"));sys.exit(0 if set(d[\"members\"])=={\"plain-id\",\"tkg-ns-1\"} else 1)" && grep -q "nsxt_policy_firewall_exclude_list_member.this\[each.key\]" stacks/local-security/import-own1-mirror.tf'
+check "...a member that is not a group, or whose group is not taken, stays in the UI, and says why" bash -c 'grep -q "NOT ADOPTED  exclusion-list member /infra/segments/seg1: not a group" <<<"$1" && grep -q "NOT ADOPTED  exclusion-list member odd-field: its group is not adopted" <<<"$1"' _ "$out"
+check "...and as adopted, its members are findings of the exclusion-list guardrail, not errors" bash -c 'python3 scripts/validate-data.py --findings 2>&1 | grep -q "^finding  data/exclude-list/own1.yaml: members.plain-id: guardrail exclusion-list"'
 check "it validates, references included" python3 scripts/validate-data.py
 check "...and without PyYAML" bash -c '! NSX_YAML_FALLBACK=1 NSX_YAML_NO_TERRAFORM=1 python3 scripts/validate-data.py 2>&1 | grep -q "^ERROR"'
 check "the stacks resolve references by NSX id and never manage them" bash -c 'grep -q "reference_paths" stacks/local-security/main.tf && grep -q "reference_paths" stacks/global-security/main.tf && grep -q "nsx_id       = try(each.value.nsx_id, each.key)" modules/dfw-policy/main.tf'

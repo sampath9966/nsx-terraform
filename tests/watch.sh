@@ -51,8 +51,8 @@ policies = [{"id": "app", "path": f"{D}/security-policies/app", "display_name": 
                  rule("app", "odd", "odd", 400, ["ANY"], ["ANY"], scheduler_path="/infra/firewall-schedulers/x")]},
             {"id": "ncp", "path": f"{D}/security-policies/ncp", "display_name": "ncp", "category": "Application", "sequence_number": 20,
              "scope": ["ANY"], "_protection": "REQUIRE_OVERRIDE", "rules": [rule("ncp", "n1", "n1", 100, ["ANY"], ["ANY"])]}]
-json.dump({"groups": groups, "services": services, "policies": policies, "domain": "default", "domains": ["default"]},
-          open("reports/lon1.json", "w"))
+json.dump({"groups": groups, "services": services, "policies": policies, "domain": "default", "domains": ["default"],
+           "exclude_list": [f"{D}/groups/web"]}, open("reports/lon1.json", "w"))
 PY
 python3 scripts/import-estate.py --site lon1 --from-dump reports/lon1.json --mirror >/dev/null 2>&1
 check "(setup) the copy validates" python3 scripts/validate-data.py
@@ -87,6 +87,16 @@ check "a rule changed: action and destinations, by whom" bash -c 'grep -q "chang
 check "a policy's sequence, a group's criteria, a service's ports" bash -c 'grep -q "changed  *policy app  sequence_number 10 → 11" <<<"$1" && grep -q "changed  *group web  criteria changed" <<<"$1" && grep -q "changed  *service app-8443" <<<"$1"' _ "$out"
 check "a group created in the UI is created outside Git" grep -q "created outside Git  *group new-g" <<<"$out"
 check "a rule deleted in the UI is found by the full read" grep -q "deleted  *rule app/r3" <<<"$out"
+cp "$SCRATCH/lon1.json" reports/lon1.json
+
+python3 - <<'PY'
+import json
+d = json.load(open("reports/lon1.json"))
+d["exclude_list"] = ["/infra/domains/default/groups/vms"]
+json.dump(d, open("reports/lon1.json", "w"))
+PY
+out="$(watch)"
+check "a group added to the DFW exclusion list outside Git is raised, high: it bypasses the firewall" bash -c 'grep -q "created outside Git  *exclusion vms  now bypasses the DFW entirely" <<<"$1" && grep -q "deleted  *exclusion web" <<<"$1"' _ "$out"
 cp "$SCRATCH/lon1.json" reports/lon1.json
 
 echo "what is not drift"

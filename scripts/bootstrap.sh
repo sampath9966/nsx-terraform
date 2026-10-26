@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.8.0"
+VERSION="1.9.0"
 
 ROOT="$PWD"
 FORCE=0
@@ -1395,6 +1395,28 @@ what NSX has and what the plan would set. Two ways out, both in a merge request:
 
 An incident fix made in the UI therefore survives until it is decided on.
 
+## Towards default deny, without an outage
+
+1. Write the application's allow rules.
+2. End its policy with a rule that matches everything else: action ALLOW,
+   logged, log label `WOULD_DENY`.
+3. The `hits` job (monthly, `HITS_SITE`) reports, from NSX's own hit counters,
+   what that rule matched: traffic still needing an explicit allow. No add-on
+   is needed; Security Intelligence, where licensed, adds flow detail.
+4. When it reports no hits for long enough, change it to DROP in a merge
+   request: `no-default-deny` is then satisfied.
+
+The same job lists rules with no hit since NSX last reset its counters: clean-up
+candidates, never removed automatically.
+
+## The DFW exclusion list
+
+A VM in a group on the exclusion list bypasses the firewall entirely. It is
+data like everything else, `data/exclude-list/<site>.yaml`, and every member
+needs an exception (guardrail `exclusion-list`, enforced): owner, ticket,
+expiry. The importer takes the list (members that are groups), the watch
+raises a group added to it outside Git as `[HIGH]`.
+
 ## Plans in firewall terms
 
 Each plan job posts, above the raw plan, what changes in firewall terms
@@ -1419,7 +1441,7 @@ the estate.
 | What | When | NSX calls |
 |---|---|---|
 | `watch` job, incremental: objects modified in the last 20 minutes, compared with data/ | every 5 minutes (`WATCH_SITE`) | 1 search, plus 1 login |
-| `watch` job, full: everything, also deletions and objects created outside Git | nightly (`WATCH_SITE`, `WATCH_FULL=1`) | 1 hierarchical read, plus 1 login |
+| `watch` job, full: everything, also deletions, objects created outside Git, the exclusion list | nightly (`WATCH_SITE`, `WATCH_FULL=1`) | 1 hierarchical read and 1 for the exclusion list, plus 1 login |
 | `mirror` job, nothing modified since the last copy | its schedule | 1 search: the full read is skipped |
 | `mirror` job, something modified | its schedule, and nightly with `MIRROR_FULL=1` | 1 hierarchical read |
 | `schedule` job, no rule to switch | every 5 minutes | 0 |
@@ -1724,6 +1746,17 @@ the UI into something the importer cannot represent leaves the copy but not
 state, so its plan shows a destroy and is refused every time: hand it back
 (below) to stop managing it.
 
+**Cut over in slices**, one policy (or a few) at a time, while the rest stays
+mirrored: Run pipeline with `CUTOVER_SITE` and `CUTOVER_POLICY` (policy keys,
+space separated). The same checks as below; the merge request turns only those
+policies' files into ordinary data files and sets the manager to
+`mode: hybrid`. In hybrid mode the policies cut over are managed (plans,
+applies, guardrails, drift), the rest is still mirrored: the mirror keeps it in
+step with the UI, and plan-guard refuses any apply that would change it. The
+groups those policies use stay mirrored until the whole manager is cut over.
+Each slice is small, reviewed and reversible; the last cutover (no
+`CUTOVER_POLICY`) makes the manager `mode: managed`.
+
 **Cut over** when the team is ready to stop changing that manager by hand. The
 imported copy is not a report: it becomes the configuration, and engineers
 change it, and add to it, like anything they wrote themselves.
@@ -1861,6 +1894,11 @@ make validate
   file and resolved by its NSX id, never managed.
 - The report ends with **who creates what** on the manager, per account, so the
   tools among them are found once, not object by object.
+- Identity firewall groups (Active Directory groups, by distinguished name and
+  SID) are taken, as `identity_groups:`.
+- The DFW exclusion list is taken into `data/exclude-list/<site>.yaml`
+  (members that are groups); each member then needs an exception
+  (docs/GUARDRAILS.md).
 
 ## 4. Plan, review, apply: a merge request per tranche
 
@@ -3047,8 +3085,8 @@ write_file data/schema/managers.schema.json <<'SCAFFOLD_EOF'
           "standby_for": { "type": "string" },
           "enabled": { "type": "boolean" },
           "mode": {
-            "enum": ["managed", "mirror"],
-            "description": "managed (the default): the pipeline plans and applies. mirror: scripts/mirror.sh keeps data/ a copy of the manager, and only its state is updated (imports and refreshes, read-only); nothing is applied to NSX. docs/IMPORT.md."
+            "enum": ["managed", "mirror", "hybrid"],
+            "description": "managed (the default): the pipeline plans and applies. mirror: scripts/mirror.sh keeps data/ a copy of the manager, and only its state is updated (imports and refreshes, read-only); nothing is applied to NSX. hybrid: cut over in slices; the policies cut over are managed, the rest still mirrored, and never changed by an apply. docs/IMPORT.md."
           },
           "stacks": {
             "type": "array",
@@ -3097,6 +3135,21 @@ write_file data/schema/group.schema.json <<'SCAFFOLD_EOF'
             "type": "array",
             "items": { "type": "string" },
             "description": "Required for owner=lm. Site ids from inventory/managers.yaml."
+          },
+          "identity_groups": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Identity firewall: Active Directory groups whose users' sessions are members (AND with criteria, as NSX applies extended criteria).",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "minProperties": 1,
+              "properties": {
+                "distinguished_name": { "type": "string" },
+                "domain_base_distinguished_name": { "type": "string" },
+                "sid": { "type": "string" }
+              }
+            }
           },
           "why_static": {
             "type": "string",
@@ -3451,6 +3504,42 @@ write_file data/schema/service.schema.json <<'SCAFFOLD_EOF'
                 "display_name": { "type": "string" },
                 "ether_type": { "type": "integer", "minimum": 0 }
               }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+SCAFFOLD_EOF
+
+write_file data/schema/exclude-list.schema.json <<'SCAFFOLD_EOF'
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nsx-terraform/schema/exclude-list.json",
+  "title": "DFW exclusion list of one Local Manager (data/exclude-list/<site>.yaml)",
+  "type": "object",
+  "required": ["members"],
+  "additionalProperties": false,
+  "properties": {
+    "members": {
+      "type": "object",
+      "description": "Group keys (data/groups, groups or references) whose members bypass the DFW entirely.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "why": { "type": "string" },
+          "exception": {
+            "type": "object",
+            "required": ["guardrails", "owner", "ticket", "expires"],
+            "additionalProperties": false,
+            "properties": {
+              "guardrails": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+              "owner": { "type": "string", "minLength": 1 },
+              "ticket": { "type": "string", "minLength": 1 },
+              "expires": {},
+              "why": { "type": "string" }
             }
           }
         }
@@ -3819,6 +3908,23 @@ resource "nsxt_policy_group" "this" {
     }
   }
 
+  # Identity firewall: AD groups. NSX ANDs them with the criteria above.
+  dynamic "extended_criteria" {
+    for_each = length(try(each.value.identity_groups, [])) > 0 ? [1] : []
+
+    content {
+      dynamic "identity_group" {
+        for_each = each.value.identity_groups
+
+        content {
+          distinguished_name             = try(identity_group.value.distinguished_name, null)
+          domain_base_distinguished_name = try(identity_group.value.domain_base_distinguished_name, null)
+          sid                            = try(identity_group.value.sid, null)
+        }
+      }
+    }
+  }
+
   # The provider pairs criteria[i] with conjunction[i] in order, so one
   # conjunction is needed between every adjacent pair of criteria blocks.
   dynamic "conjunction" {
@@ -3840,7 +3946,7 @@ resource "nsxt_policy_group" "this" {
 
   lifecycle {
     precondition {
-      condition     = length(try(each.value.criteria, [])) > 0 || try(each.value.why_empty, "") != ""
+      condition     = length(try(each.value.criteria, [])) > 0 || length(try(each.value.identity_groups, [])) > 0 || try(each.value.why_empty, "") != ""
       error_message = "Group ${each.key} has no criteria. A group with no membership matches nothing and silently drops traffic; give it criteria, or a why_empty note saying why it exists."
     }
 
@@ -5283,6 +5389,20 @@ module "policies" {
   service_paths = local.service_paths
   rules_off     = lookup(var.scheduled_off, each.key, [])
 }
+
+# The DFW exclusion list: groups whose members bypass the firewall entirely.
+# data/exclude-list/<site>.yaml, each member with its exception (the validator
+# holds every one to an owner, a ticket and an expiry). docs/GUARDRAILS.md.
+locals {
+  exclude_file    = "${local.data_root}/exclude-list/${var.site}.yaml"
+  exclude_members = try(yamldecode(fileexists(local.exclude_file) ? file(local.exclude_file) : "{}").members, {})
+}
+
+resource "nsxt_policy_firewall_exclude_list_member" "this" {
+  for_each = local.exclude_members
+
+  member = local.group_paths[each.key]
+}
 SCAFFOLD_EOF
 
 write_file stacks/local-security/outputs.tf <<'SCAFFOLD_EOF'
@@ -6340,12 +6460,14 @@ from yamlcompat import load_yaml  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INVENTORY = REPO_ROOT / "inventory" / "managers.yaml"
-MODES = ("managed", "mirror")
+MODES = ("managed", "mirror", "hybrid")
 
 
 def mode_of(name: str, manager: dict) -> str:
-    """managed or mirror, from the manager's mode in inventory/managers.yaml
-    only: changing it is a reviewed merge request, like any other change."""
+    """managed, mirror or hybrid, from the manager's mode in
+    inventory/managers.yaml only: changing it is a reviewed merge request, like
+    any other change. hybrid: managed, with the objects not yet cut over still
+    mirrored from the UI (scripts/cutover.sh with CUTOVER_POLICY)."""
     mode = manager.get("mode", "managed")
     if mode not in MODES:
         sys.exit(f"error: {name}: mode {mode!r} in inventory/managers.yaml must be one of: {', '.join(MODES)}")
@@ -7402,7 +7524,7 @@ def check_groups(docs: dict[Path, dict], scopes: dict, sites: set[str], imported
 
             criteria = group.get("criteria") or []
             static = any(c.get("ip_addresses") or c.get("external_ids") or c.get("mac_addresses") for c in criteria if isinstance(c, dict))
-            if not criteria and not group.get("why_empty"):
+            if not criteria and not group.get("identity_groups") and not group.get("why_empty"):
                 report.error(where, f"{name}: no criteria. A group with no membership matches nothing; give it criteria, or a why_empty note saying why it exists.")
             for i, criterion in enumerate(criteria):
                 if isinstance(criterion, dict) and bool(criterion.get("external_ids")) != bool(criterion.get("member_type")):
@@ -7700,6 +7822,8 @@ GUARDRAILS = {
     "prod-nonprod": ("enforce", "800-53 SC-7, AC-4", "an ALLOW between production and non-production"),
     "no-default-deny": ("warn", "SP 800-207 tenet 6; 800-53 SC-7(5)", "an Application policy whose last rule is not a DROP or REJECT"),
     "static-membership": ("warn", "SP 800-207 tenet 4", "a group of addresses or picked VMs, not attributes"),
+    "exclusion-list": ("enforce", "800-53 SC-7, CM-7; SP 800-207 tenet 1",
+                       "a group in the DFW exclusion list: its members bypass the firewall entirely"),
 }
 LEVELS = {"off": 0, "warn": 1, "enforce": 2}
 
@@ -7749,6 +7873,60 @@ def group_env(group: dict, config: dict) -> set[str]:
     return found
 
 
+def exception_of(where: str, label: str, exception, report: Report) -> set[str]:
+    """The guardrails a current, complete exception lets off; errors for the rest."""
+    if not isinstance(exception, dict):
+        return set()
+    missing = [f for f in ("guardrails", "owner", "ticket", "expires") if not exception.get(f)]
+    if missing:
+        report.error(where, f"{label}.exception: needs {', '.join(missing)}: an exception is owned, tracked and ends")
+        return set()
+    try:
+        ends = as_date(exception["expires"])
+    except (TypeError, ValueError):
+        report.error(where, f"{label}.exception.expires: not a date (YYYY-MM-DD)")
+        return set()
+    if ends < date.today():
+        report.error(where, f"{label}.exception expired on {ends}: renew it, or bring it within the guardrails")
+        return set()
+    exempt = {str(g) for g in exception["guardrails"]}
+    unknown = exempt - set(GUARDRAILS)
+    if unknown:
+        report.error(where, f"{label}.exception: unknown guardrail(s) {', '.join(sorted(unknown))}")
+    return exempt
+
+
+def check_exclusions(groups: dict[str, dict], sites: set[str], imported: set[str], report: Report,
+                     flag) -> int:
+    """data/exclude-list/<site>.yaml: groups whose members bypass the DFW. Each
+    must exist at that site, and carry an exception (guardrail exclusion-list)."""
+    count = 0
+    directory = DATA / "exclude-list"
+    for path in sorted(directory.glob("*.yaml")) if directory.is_dir() else []:
+        where = _rel(path)
+        site = path.stem
+        if site not in sites:
+            report.error(where, f"{site!r} is not a manager in inventory/managers.yaml (the file is named after its manager)")
+            continue
+        doc = load_yaml(path.read_text()) or {}
+        schema = load_schema("exclude-list.schema.json")
+        if schema:
+            check_schema(doc, schema, where, "", report)
+        for name, member in (doc.get("members") or {}).items():
+            count += 1
+            member = member if isinstance(member, dict) else {}
+            group = groups.get(name)
+            if group is None:
+                report.error(where, f"members.{name}: no group {name!r} in data/ (groups or references)")
+                continue
+            at = group.get("sites") or []
+            if group.get("owner", "lm") == "lm" and not (site in at or "*" in at):
+                report.error(where, f"members.{name}: group {name!r} does not exist at {site}")
+            exempt = exception_of(where, f"members.{name}", member.get("exception"), report)
+            flag(where, f"members.{name}", "exclusion-list", [site], exempt)
+    return count
+
+
 def check_guardrails(docs: dict[Path, dict], groups: dict[str, dict], managers: dict, imported: set[str],
                      report: Report) -> tuple[int, list[str]]:
     """Every rule and policy against the guardrails. Written here: the level
@@ -7795,25 +7973,7 @@ def check_guardrails(docs: dict[Path, dict], groups: dict[str, dict], managers: 
             if not isinstance(rule, dict):
                 continue
             label = f"rules.{key}"
-            exempt: set[str] = set()
-            exception = rule.get("exception")
-            if isinstance(exception, dict):
-                missing = [f for f in ("guardrails", "owner", "ticket", "expires") if not exception.get(f)]
-                if missing:
-                    report.error(where, f"{label}.exception: needs {', '.join(missing)}: an exception is owned, tracked and ends")
-                else:
-                    try:
-                        ends = as_date(exception["expires"])
-                    except (TypeError, ValueError):
-                        report.error(where, f"{label}.exception.expires: not a date (YYYY-MM-DD)")
-                        ends = today
-                    if ends < today:
-                        report.error(where, f"{label}.exception expired on {ends}: renew it, or bring the rule within the guardrails")
-                    else:
-                        exempt = {str(g) for g in exception["guardrails"]}
-                        unknown = exempt - set(GUARDRAILS)
-                        if unknown:
-                            report.error(where, f"{label}.exception: unknown guardrail(s) {', '.join(sorted(unknown))}")
+            exempt = exception_of(where, label, rule.get("exception"), report)
             action = rule.get("action")
             src = [s for s in rule.get("source_groups") or [] if s != "ANY"]
             dst = [s for s in rule.get("destination_groups") or [] if s != "ANY"]
@@ -7853,6 +8013,7 @@ def check_guardrails(docs: dict[Path, dict], groups: dict[str, dict], managers: 
             where = group.get("_where", "data/groups")
             sites = gm_sites if group.get("owner") == "gm" else [s for s in group.get("sites") or [] if s != "*"]
             flag(where, f"group {name}", "static-membership", sites, set())
+    check_exclusions(groups, set(managers), imported, report, flag)
     return counts[0], findings
 
 
@@ -8770,6 +8931,15 @@ def hierarchy(tree: dict) -> dict[str, list[dict]]:
     return found
 
 
+def exclude_list(host: str, user: str, password: str, base: str, insecure: bool) -> list[str]:
+    """The DFW exclusion list of a Local Manager: what it holds bypasses the
+    firewall entirely. One call."""
+    if base != LM_BASE:
+        return []
+    found = api_get(host, f"{base}/settings/firewall/security/exclude-list", user, password, insecure, True)
+    return [str(m) for m in found.get("members") or []]
+
+
 def fetch_estate(host: str, user: str, password: str, base: str, domain: str, insecure: bool) -> dict:
     """Groups, services and policies. On a Global Manager, from every domain: a
     global policy's rules may use a location domain's groups (e.g. WL-Mum), and
@@ -8797,7 +8967,8 @@ def fetch_estate(host: str, user: str, password: str, base: str, domain: str, in
                       f"{len(policies)} policy/policies, {len(services)} service(s), "
                       f"in {CALLS - before} call(s) (hierarchical read)", file=sys.stderr)
                 return {"groups": groups, "services": services, "policies": policies, "domain": domain,
-                        "domains": domains, "calls": CALLS - before}
+                        "domains": domains, "exclude_list": exclude_list(host, user, password, base, insecure),
+                        "calls": CALLS - before}
 
     def results(path: str) -> list:
         # The policy API pages lists (1000 per page by default). Follow the cursor,
@@ -8840,7 +9011,7 @@ def fetch_estate(host: str, user: str, password: str, base: str, domain: str, in
     print(f"  {len(services)} service(s), in {CALLS - before} call(s) (paged read)", file=sys.stderr)
 
     return {"groups": groups, "services": services, "policies": policies, "domain": domain, "domains": domains,
-            "calls": CALLS - before}
+            "exclude_list": exclude_list(host, user, password, base, insecure), "calls": CALLS - before}
 
 
 def domain_of(path: str, default: str) -> str:
@@ -9020,9 +9191,17 @@ def convert_group(group: dict, path_to_name: dict, owner: str, sites: list[str])
         out["group_type"] = "IPAddress"  # "IP Addresses Only" in the UI
     if conjunction and len(criteria) > 1:
         out["conjunction"] = conjunction
+    # Identity firewall: Active Directory groups, by distinguished name and SID.
+    identity = [
+        {k: g[k] for k in ("distinguished_name", "domain_base_distinguished_name", "sid") if g.get(k)}
+        for e in group.get("extended_expression") or [] if e.get("resource_type") == "IdentityGroupExpression"
+        for g in e.get("identity_groups") or []
+    ]
+    if identity:
+        out["identity_groups"] = identity
     if criteria:
         out["criteria"] = criteria
-    else:
+    elif not identity:
         out["why_empty"] = (
             "IMPORTED AS-IS: this group has no membership criteria in NSX, so it matches nothing "
             "(or its members are managed elsewhere). Replace this note with the reason, or delete the group."
@@ -9238,8 +9417,9 @@ def group_unsupported(group: dict) -> str | None:
         for c in conditions:
             if why := condition_unsupported(c):
                 return why
-    if group.get("extended_expression"):
-        return "extended criteria (identity firewall)"
+    extended = {e.get("resource_type") for e in group.get("extended_expression") or []}
+    if extended - {"IdentityGroupExpression"}:
+        return "extended criteria of type " + ", ".join(sorted(str(k) for k in extended - {"IdentityGroupExpression"}))
     group_type = group.get("group_type") or []
     if group_type and group_type != ["IPAddress"]:
         return "group_type " + ", ".join(group_type)
@@ -9599,7 +9779,7 @@ def import_file(site: str, tranche: str, role: str, kinds: list[tuple[str, str, 
 def mirror_files(site: str) -> set[Path]:
     """The data files mirror mode owns for this manager, by their first line."""
     own: set[Path] = set()
-    for kind in ("groups", "services", "policies"):
+    for kind in ("groups", "services", "policies", "exclude-list"):
         for f in (DATA / kind).glob("*.yaml"):
             if f.read_text().split("\n", 1)[0].strip() == f"{MIRROR_MARK}{site}":
                 own.add(f)
@@ -9954,8 +10134,21 @@ def main() -> int:
         adoptable.append(dict(policy, rules=rules))
     policies = adoptable
 
+    # The DFW exclusion list: groups whose members bypass the firewall. Taken
+    # when the group is taken (or another tool owns it: then by reference).
+    adopted_group_paths = {g.get("path") for g in groups}
+    excluded: dict[str, str] = {}
+    if role != "gm" and not args.policy:
+        for member in estate.get("exclude_list") or []:
+            if member in adopted_group_paths or member in elsewhere:
+                excluded[group_paths[member]] = member
+            elif member in group_paths and member in bad:
+                kept_in_ui.append(f"exclusion-list member {group_paths[member]}: its group is not adopted ({bad[member]})")
+            else:
+                kept_in_ui.append(f"exclusion-list member {member}: not a group data/ holds (segments and ports are not taken)")
+
     # Groups another tool owns that what is adopted uses: named, never managed.
-    used: set[str] = set()
+    used: set[str] = set(excluded.values())
     for policy in policies:
         used.update(policy.get("scope") or [])
         for rule in policy.get("rules", []):
@@ -10017,6 +10210,14 @@ def main() -> int:
         if references:
             document["references"] = references
         writer.write(DATA / "groups" / f"imported-{args.site}-{tranche}.yaml", header + to_yaml(document))
+
+    # --- the exclusion list ----------------------------------------------
+    if excluded:
+        header = mirror_header if args.mirror else f"# Imported from {args.site} on {datetime.now(timezone.utc):%Y-%m-%d}.\n\n"
+        note = ("IMPORTED AS-IS: this group's members bypass the DFW entirely. Record why, with an exception "
+                "(owner, ticket, expires) naming the guardrail exclusion-list, or remove it.")
+        writer.write(DATA / "exclude-list" / f"{args.site}.yaml",
+                     header + to_yaml({"members": {k: {"why": note} for k in sorted(excluded)}}))
 
     # --- services -------------------------------------------------------
     custom = {s["id"]: convert_service(s) for s in services if not is_system(s)}
@@ -10091,6 +10292,7 @@ def main() -> int:
         ("services", "module.services.nsxt_policy_service.this[each.key]", service_ids),
         ("policies", "module.policies[each.key].nsxt_policy_parent_security_policy.this", policy_ids),
         ("rules", "module.policies[each.value.policy].nsxt_policy_security_policy_rule.this[each.value.rule]", rule_ids),
+        ("exclude_list", "nsxt_policy_firewall_exclude_list_member.this[each.key]", dict(sorted(excluded.items()))),
     ]
     header = (
         f"# Mirror of {args.site}: every object in the mirror files, imported into state.\n"
@@ -10360,6 +10562,34 @@ def scheduled_addresses(site: str, stack: str) -> set[str]:
         return set()
 
 
+def mirror_addresses(site: str) -> tuple[set[str], tuple[str, ...]]:
+    """What a hybrid manager still mirrors from the UI: the addresses (exact,
+    and prefixes for a policy's resources) of every object in a file carrying
+    the mirror mark. Those are only ever imported or refreshed, never changed."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from yamlcompat import load_yaml  # noqa: PLC0415
+
+    mark = f"# nsx-mirror: {site}"
+    exact: set[str] = set()
+    prefixes: list[str] = []
+    for kind in ("groups", "services", "policies", "exclude-list"):
+        for f in sorted((REPO_ROOT / "data" / kind).glob("*.yaml")):
+            text = f.read_text()
+            if text.split("\n", 1)[0].strip() != mark:
+                continue
+            doc = load_yaml(text) or {}
+            if kind == "groups":
+                for k in doc.get("groups") or {}:
+                    exact |= {f'module.base_groups.nsxt_policy_group.this["{k}"]', f'module.composite_groups.nsxt_policy_group.this["{k}"]'}
+            elif kind == "services":
+                exact |= {f'module.services.nsxt_policy_service.this["{k}"]' for k in doc.get("custom") or {}}
+            elif kind == "policies":
+                prefixes.append(f'module.policies["{f.stem}"].')
+            else:
+                exact |= {f'nsxt_policy_firewall_exclude_list_member.this["{k}"]' for k in doc.get("members") or {}}
+    return exact, tuple(prefixes)
+
+
 def changed_fields(change: dict) -> set[str]:
     """Top-level attributes an update changes (a computed value left unknown aside)."""
     before, after = change.get("before") or {}, change.get("after") or {}
@@ -10395,7 +10625,15 @@ def main() -> int:
     changes = [c for c in plan.get("resource_changes") or [] if c.get("mode", "managed") == "managed"]
     allowed = load_allowed(args.site, args.stack)
     leftover = import_files(REPO_ROOT / "stacks" / args.stack, args.site)
-    tranche = bool(leftover) or any(c["change"].get("importing") for c in changes)
+    # hybrid: what is still mirrored is held to observe; what was cut over is
+    # managed, and its mirror's import file is not a tranche to it.
+    hybrid = os.environ.get("NSX_MODE") == "hybrid"
+    mirrored, mirrored_prefixes = mirror_addresses(args.site) if hybrid else (set(), ())
+    if hybrid:
+        leftover = [f for f in leftover if not f.name.endswith("-mirror.tf")]
+    tranche = bool(leftover) or any(c["change"].get("importing") and not
+                                    (hybrid and (c["address"] in mirrored or c["address"].startswith(mirrored_prefixes)))
+                                    for c in changes)
 
     refused: list[tuple[str, str]] = []
     destroy_lines: list[str] = []
@@ -10410,6 +10648,10 @@ def main() -> int:
             counts["import"] += 1
         if args.observe and actions not in (["no-op"], ["read"]):
             refused.append((address, f"{'/'.join(actions)} on a manager in mirror mode: only imports and refreshes are applied to it"))
+            continue
+        if hybrid and (address in mirrored or address.startswith(mirrored_prefixes)) and actions not in (["no-op"], ["read"]):
+            refused.append((address, f"{'/'.join(actions)} on an object still mirrored from the UI: cut its policy over "
+                                     "first (CUTOVER_POLICY), or change it in NSX and let the mirror bring it in"))
             continue
         if args.schedule and actions not in (["no-op"], ["read"]):
             if actions == ["update"] and c.get("type") == "nsxt_policy_security_policy_rule" and \
@@ -10455,14 +10697,15 @@ def main() -> int:
             revert_lines.append(f"{args.site} {args.stack} {address}")
 
     mode = ("mirror, observe only" if args.observe else "time follower, on/off only" if args.schedule
-            else "import tranche (must be pure)" if tranche else "normal")
+            else "import tranche (must be pure)" if tranche else "hybrid: cut over managed, the rest observe only" if hybrid
+            else "normal")
     print(
         f"plan-guard {args.site}/{args.stack}, {mode}: "
         f"{counts['import']} import, {counts['create']} create, {counts['update']} update, "
         f"{counts['destroy']} destroy/replace, {counts['forget']} hand back"
     )
     # A mirror's import file stays until cutover; it is not a finished tranche.
-    if leftover and not counts["import"] and os.environ.get("NSX_MODE") != "mirror":
+    if leftover and not counts["import"] and os.environ.get("NSX_MODE") not in ("mirror", "hybrid"):
         names = ", ".join(f"stacks/{args.stack}/{f.name}" for f in leftover)
         print(f"  note: {names} imports nothing new, so that tranche is applied. Delete the file(s)")
         print("        in their own merge request; until then this stack accepts imports only.")
@@ -10816,7 +11059,7 @@ PY
 )" || die "cannot read the managers' modes (above)"
 mode_of() { awk -v s="$1" '$1 == s { print $2 }' <<<"$inventory"; }
 if [ "$MIRROR_SITE" = all ]; then
-	sites="$(awk '$2 == "mirror" { print $1 }' <<<"$inventory")"
+	sites="$(awk '$2 == "mirror" || $2 == "hybrid" { print $1 }' <<<"$inventory")"
 	if [ -z "$sites" ]; then
 		echo "error: no manager in inventory/managers.yaml has mode: mirror. On the branch this ran on:" >&2
 		while read -r name mode; do
@@ -10863,7 +11106,7 @@ for site in $sites; do
 	echo
 	echo "=== $site"
 	case "$(mode_of "$site")" in
-	mirror) ;;
+	mirror | hybrid) ;;
 	"")
 		echo "error: $site is not an enabled manager in inventory/managers.yaml" >&2
 		failed+=("$site")
@@ -11086,6 +11329,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -11187,6 +11431,9 @@ def mirror_objects(files: dict[str, str], site: str, identity: dict | None = Non
             for key, value in (doc.get("custom") or {}).items():
                 out[("service", str(key))] = value
                 ident[("service", str(key))] = ("service", str(key))
+        elif path.startswith("data/exclude-list/"):
+            for key in (doc.get("members") or {}):
+                out[("exclusion", str(key))] = {"member": str(key)}
         elif path.startswith("data/policies/"):
             pid = Path(path).stem  # the key: the file's name
             header = doc.get("policy") or {}
@@ -11203,7 +11450,8 @@ def mirror_objects(files: dict[str, str], site: str, identity: dict | None = Non
 
 def files_at(ref: str) -> dict[str, str]:
     """The data files at ref, read in one git process."""
-    names = subprocess.run(["git", "ls-tree", "-r", "--name-only", ref, "--", "data/groups", "data/services", "data/policies"],
+    names = subprocess.run(["git", "ls-tree", "-r", "--name-only", ref, "--", "data/groups", "data/services", "data/policies",
+                            "data/exclude-list"],
                            cwd=REPO_ROOT, capture_output=True, text=True, check=True).stdout.splitlines()
     names = [n for n in names if n.endswith(".yaml")]
     if not names:
@@ -11222,7 +11470,7 @@ def files_at(ref: str) -> dict[str, str]:
 
 def files_now() -> dict[str, str]:
     out: dict[str, str] = {}
-    for kind in ("groups", "services", "policies"):
+    for kind in ("groups", "services", "policies", "exclude-list"):
         for f in sorted((REPO_ROOT / "data" / kind).glob("*.yaml")):
             out[str(f.relative_to(REPO_ROOT))] = f.read_text()
     return out
@@ -11336,6 +11584,8 @@ def mirror_changes(site: str, base: str, dump: dict) -> list[dict] | None:
             continue  # nobody changed it in NSX since the copy: the repository side moved
         if before is None:
             change, detail = "added", ""
+            if kind == "exclusion":
+                detail = "now bypasses the DFW entirely"
         elif after is None:
             change = "deleted"
             detail = f"with its {sum(1 for k in old if k[0] == 'rule' and k[1].startswith(ident + '/'))} rule(s)" if kind == "policy" else ""
@@ -11343,7 +11593,8 @@ def mirror_changes(site: str, base: str, dump: dict) -> list[dict] | None:
         else:
             change, detail = "changed", describe(before, after)
         items.append({"key": f"{kind} {ident}", "kind": kind, "id": ident, "change": change, "detail": detail,
-                      "who": who, "at": at, "version": digest(after) if after is not None else "0" * 16})
+                      "who": who, "at": at, "version": digest(after) if after is not None else "0" * 16,
+                      "severity": "high" if kind == "exclusion" and before is None else ""})
     for pid, moved in sorted(renumbered.items()):
         both = {k[1].split("/", 1)[1] for k in old if k[0] == "rule" and k[1].split("/", 1)[0] == pid} & \
                {k[1].split("/", 1)[1] for k in new if k[0] == "rule" and k[1].split("/", 1)[0] == pid}
@@ -11521,6 +11772,14 @@ def main() -> int:
         plan = json.loads(Path(args.plan_json).read_text())
         items = plan_changes(plan)
         schedule_items(args.site, args.stack, plan, items)
+        # hybrid: what is still mirrored is the mirror job's to raise.
+        from ci_matrix_lib import managers, mode_of  # noqa: PLC0415
+        if mode_of(args.site, managers().get(args.site) or {}) == "hybrid":
+            spec = importlib.util.spec_from_file_location("plan_guard", Path(__file__).resolve().parent / "plan-guard.py")
+            guard = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+            spec.loader.exec_module(guard)  # type: ignore[union-attr]
+            exact, prefixes = guard.mirror_addresses(args.site)
+            items = [i for i in items if not (i["key"] in exact or i["key"].startswith(prefixes))]
         if items and os.environ.get("NSXT_MANAGER_HOST"):
             lookup_owners(args.site, items)
     if not items:
@@ -12176,7 +12435,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from yamlcompat import load_all, load_yaml  # noqa: E402
 
-KINDS = ("Group", "SecurityPolicy", "Rule", "Service")
+KINDS = ("Group", "SecurityPolicy", "Rule", "Service", "PolicyExcludeList")
 
 
 def load(name: str, file: str):
@@ -12205,17 +12464,27 @@ def desired(site: str, role: str) -> dict:
         sites = d.get("sites") or []
         return d.get("owner", "lm") == "lm" and (site in sites or "*" in sites)
 
-    out: dict = {"objects": {}, "paths": {}, "services": {}}
+    out: dict = {"objects": {}, "paths": {}, "services": {}, "mirrored": set()}
+    mark = f"# nsx-mirror: {site}"
+    # A hybrid manager's objects still mirrored from the UI are the mirror job's
+    # to follow: never raised here, as changed or as created outside Git.
+    from ci_matrix_lib import managers as inventory, mode_of  # noqa: PLC0415
+    hybrid = mode_of(site, inventory().get(site) or {}) == "hybrid"
+    mirrored = lambda f: hybrid and f.read_text().split("\n", 1)[0].strip() == mark  # noqa: E731
     files = sorted((REPO_ROOT / "data" / "groups").glob("*.yaml"))
     for f, doc in zip(files, load_all([f.read_text() for f in files]) if files else []):
         doc = doc or {}
+        if mirrored(f):
+            for key, g in (doc.get("groups") or {}).items():
+                g = g if isinstance(g, dict) else {}
+                out["mirrored"].add(("group", g.get("domain") or "default", str(g.get("nsx_id", key))))
         for section in ("groups", "references"):
             for key, g in (doc.get(section) or {}).items():
                 g = g if isinstance(g, dict) else {}
                 where, nsx = g.get("domain") or "default", str(g.get("nsx_id", key))
                 prefix = "/global-infra" if g.get("owner") == "gm" else "/infra"
                 out["paths"][f"{prefix}/domains/{where}/groups/{nsx}"] = str(key)
-                if section == "groups" and mine(g):
+                if section == "groups" and mine(g) and not mirrored(f):
                     out["objects"][("group", where, nsx)] = (str(key), g, f"data/groups/{f.name}")
     files = sorted((REPO_ROOT / "data" / "services").glob("*.yaml"))
     for f, doc in zip(files, load_all([f.read_text() for f in files]) if files else []):
@@ -12228,6 +12497,9 @@ def desired(site: str, role: str) -> dict:
             sv = sv if isinstance(sv, dict) else {}
             prefix = "/global-infra" if sv.get("owner", "gm") == "gm" else "/infra"
             out["services"][f"{prefix}/services/{key}"] = str(key)
+            if mirrored(f):
+                out["mirrored"].add(("service", str(key)))
+                continue
             if (role == "gm" and sv.get("owner", "gm") == "gm") or (role != "gm" and sv.get("owner", "gm") == "lm" and (
                     site in (sv.get("sites") or ["*"]) or "*" in (sv.get("sites") or ["*"]))):
                 out["objects"][("service", str(key))] = (str(key), sv, f"data/services/{f.name}")
@@ -12238,6 +12510,10 @@ def desired(site: str, role: str) -> dict:
         if not mine(header) or header.get("rule_management", "standalone") != "standalone":
             continue
         where, pid = header.get("domain") or "default", str(header.get("id") or f.stem)
+        if mirrored(f):
+            out["mirrored"].add(("policy", where, pid))
+            out["mirrored"] |= {("rule", where, pid, str((r or {}).get("nsx_id", k))) for k, r in (doc.get("rules") or {}).items()}
+            continue
         out["objects"][("policy", where, pid)] = (f.stem, header, f"data/policies/{f.name}")
         for key, rule in (doc.get("rules") or {}).items():
             rule = rule if isinstance(rule, dict) else {}
@@ -12280,7 +12556,8 @@ def group_form(g: dict) -> dict:
         criteria.append(c)
     return {"display_name": g.get("display_name"), "description": g.get("description"),
             "conjunction": g.get("conjunction") if len(criteria) > 1 else None,
-            "group_type": g.get("group_type"), "criteria": criteria, "tags": norm_list(g.get("tags"))}
+            "group_type": g.get("group_type"), "criteria": criteria, "tags": norm_list(g.get("tags")),
+            "identity_groups": norm_list(g.get("identity_groups"))}
 
 
 def policy_form(p: dict) -> dict:
@@ -12369,7 +12646,7 @@ def compare(site: str, role: str, objects: list[dict], full: bool) -> list[dict]
         if not str(o.get("path", "")).startswith(tree) or ie.is_system(o) or ie.owned_elsewhere(o, rules_):
             continue
         ident = identity(o, {})
-        if ident is None:
+        if ident is None or ident in want["mirrored"]:
             continue
         seen.add(ident)
         who, at, seconds = ie_when(o)
@@ -12407,6 +12684,19 @@ def compare(site: str, role: str, objects: list[dict], full: bool) -> list[dict]
         for ident, (key, _, _) in sorted(want["objects"].items(), key=lambda kv: str(kv[0])):
             if ident not in seen and not (ident[0] == "rule" and ("policy",) + ident[1:3] not in seen):
                 items.append(item(ident, "deleted", "", "", "", {}, key))
+    # The exclusion list: a group added outside Git bypasses the firewall.
+    listed = next((o for o in objects if o.get("resource_type") == "PolicyExcludeList"), None)
+    if listed is not None and role != "gm":
+        file = REPO_ROOT / "data" / "exclude-list" / f"{site}.yaml"
+        members = set((load_yaml(file.read_text()) or {}).get("members") or {}) if file.exists() else set()
+        key_of = {path: key for path, key in want["paths"].items()}
+        have = {key_of.get(m, m) for m in listed.get("members") or []}
+        who, at, _ = ie_when(listed)
+        for m in sorted(have - members):
+            items.append(item(("exclusion", m), "created outside Git", "now bypasses the DFW entirely", who, at,
+                              listed, m, "high"))
+        for m in sorted(members - have):
+            items.append(item(("exclusion", m), "deleted", "no longer excluded", who, at, listed, m))
     return items
 
 
@@ -12479,6 +12769,9 @@ def main() -> int:
             dict(r, resource_type="Rule") for p in estate.get("policies", []) for r in p.get("rules", [])]
         objects = [dict(o, resource_type=o.get("resource_type") or ("Group" if "/groups/" in o.get("path", "") else "Service"))
                    for o in objects]
+        if "exclude_list" in estate and role != "gm":
+            objects.append({"resource_type": "PolicyExcludeList", "path": "/infra/settings/firewall/security/exclude-list",
+                            "members": estate.get("exclude_list") or []})
     elif args.full:
         estate = ie.fetch_estate(host, user, password, ie.GM_BASE if role == "gm" else ie.LM_BASE,
                                  manager.get("domain") or "default", insecure)
@@ -12486,6 +12779,9 @@ def main() -> int:
                   [dict(s, resource_type="Service") for s in estate["services"]] + \
                   [dict(p, resource_type="SecurityPolicy") for p in estate["policies"]] + \
                   [dict(r, resource_type="Rule") for p in estate["policies"] for r in p.get("rules", [])]
+        if role != "gm":
+            objects.append({"resource_type": "PolicyExcludeList", "path": "/infra/settings/firewall/security/exclude-list",
+                            "members": estate.get("exclude_list") or []})
     else:
         since = int((time.time() - args.lookback * 60) * 1000)
         objects = search(host, user, password, insecure, role, since)
@@ -12986,6 +13282,137 @@ if __name__ == "__main__":
 SCAFFOLD_EOF
 mark_executable scripts/plan-summary.py
 
+write_file scripts/rule-hits.py <<'SCAFFOLD_EOF'
+#!/usr/bin/env python3
+"""Which rules nothing uses, and what a would-deny rule would have blocked:
+native NSX hit counters, no add-on needed.
+
+  scripts/with-credentials.sh lon1 -- scripts/rule-hits.py --site lon1 [--issue]
+
+One hierarchical read for the rules, then one statistics call per policy
+data/ manages. Reported:
+
+  * unused: a rule data/ manages with no hit since NSX last reset its counters
+    (an upgrade, or a reset by hand, starts them again). A clean-up candidate,
+    never removed automatically.
+  * would-deny: a rule labelled WOULD_DENY (log label), the step before an
+    application's default deny: an ALLOW, logged, last in its policy, so what
+    it matches is what a DROP there would block. Its hits are what still needs
+    an explicit rule before it becomes a DROP. docs/GUARDRAILS.md.
+
+--issue raises one nsx-hits issue a month with the list (NSX_BOT_TOKEN).
+Security Intelligence, where licensed, adds flow detail; nothing here needs it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import os
+import sys
+import time
+import urllib.parse
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def load(name: str, file: str):
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parent / file)
+    module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
+
+
+watch = load("nsx_watch", "nsx-watch.py")
+ie = watch.ie
+
+
+def counters(stats) -> dict[str, int]:
+    """internal rule id -> hit count, wherever the statistics hold them."""
+    out: dict[str, int] = {}
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            if "hit_count" in node:
+                rid = node.get("internal_rule_id", node.get("rule_id", node.get("rule")))
+                if rid is not None:
+                    out[str(rid).rsplit("/", 1)[-1]] = out.get(str(rid).rsplit("/", 1)[-1], 0) + int(node.get("hit_count") or 0)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(stats)
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--site", required=True)
+    ap.add_argument("--issue", action="store_true")
+    args = ap.parse_args()
+    ie.CA_SITE = args.site
+    managers = (watch.load_yaml((REPO_ROOT / "inventory" / "managers.yaml").read_text()) or {}).get("managers") or {}
+    manager = managers.get(args.site) or {}
+    role = manager.get("role", "lm")
+    host, user, password = (os.environ.get(k, "") for k in ("NSXT_MANAGER_HOST", "NSXT_USERNAME", "NSXT_PASSWORD"))
+    insecure = os.environ.get("NSXT_ALLOW_UNVERIFIED_SSL", "").strip().lower() in ("true", "1", "yes")
+    if not (host and user and password):
+        sys.exit(f"error: no credentials. Wrap the call: scripts/with-credentials.sh {args.site} -- scripts/rule-hits.py --site {args.site}")
+    base = ie.GM_BASE if role == "gm" else ie.LM_BASE
+    want = watch.desired(args.site, role)
+    estate = ie.fetch_estate(host, user, password, base, manager.get("domain") or "default", insecure)
+    unused, would = [], []
+    for policy in estate["policies"]:
+        where = ie.domain_of(policy.get("path", ""), "default")
+        if ("policy", where, str(policy["id"])) not in want["objects"]:
+            continue
+        prefix = "/global-manager/api/v1" if role == "gm" else "/policy/api/v1"
+        stats = ie.api_get(host, prefix + urllib.parse.quote(policy["path"]) + "/statistics", user, password, insecure, True)
+        hits = counters(stats)
+        for rule in policy.get("rules") or []:
+            entry = want["objects"].get(("rule", where, str(policy["id"]), str(rule["id"])))
+            if entry is None:
+                continue
+            count = hits.get(str(rule.get("rule_id")), hits.get(str(rule["id"])))
+            if count is None:
+                continue  # no counter for it: never guessed as unused
+            if rule.get("tag") == "WOULD_DENY":
+                would.append((entry[0], count))
+            elif count == 0:
+                unused.append(entry[0])
+    print(f"hits on {args.site}: {len(unused)} rule(s) with no hit since NSX last reset its counters; "
+          f"{len(would)} would-deny rule(s); {ie.CALLS} NSX call(s)")
+    for key in unused:
+        print(f"  unused      {key}")
+    for key, count in would:
+        print(f"  would-deny  {key}: {count} hit(s){'  (nothing left to allow: ready to become a DROP)' if count == 0 else ''}")
+    if args.issue and (unused or would):
+        drift = watch.drift
+        gitlab = drift.GitLab()
+        month = time.strftime("%Y-%m", time.gmtime())
+        mark = f"<!-- nsx-hits site={args.site} month={month} -->"
+        found, _ = gitlab.call("GET", "/issues", query={"labels": f"nsx-hits,site:{args.site}", "state": "all", "per_page": 20})
+        if any(mark in (i.get("description") or "") for i in found or []):
+            print("hits: this month's issue exists already.")
+            return 0
+        body = "\n".join([f"Rule hit counters on **{args.site}**, {month} (since NSX last reset them):", "",
+                          "### No hit: clean-up candidates", *([f"- `{k}`" for k in unused] or ["(none)"]), "",
+                          "### Would-deny rules: what a DROP there would block", *([f"- `{k}`: {c} hit(s)" for k, c in would] or ["(none)"]),
+                          "", "Remove a rule in a merge request (with allow-destroy.txt); nothing is removed automatically.", "", mark])
+        issue, _ = gitlab.call("POST", "/issues", {"title": f"NSX rule hits on {args.site}, {month}", "description": body,
+                                                   "labels": f"nsx-hits,site:{args.site}"})
+        print(f"hits: {(issue or {}).get('web_url', 'issue raised')}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+SCAFFOLD_EOF
+mark_executable scripts/rule-hits.py
+
 write_file scripts/drift.sh <<'SCAFFOLD_EOF'
 #!/usr/bin/env bash
 #
@@ -13209,7 +13636,11 @@ write_file scripts/cutover.sh <<'SCAFFOLD_EOF'
 # Run by the 'cutover' job: Build -> Pipelines -> Run pipeline on the default
 # branch, with
 #
-#   CUTOVER_SITE   the manager, in mode: mirror
+#   CUTOVER_SITE     the manager, in mode: mirror (or hybrid)
+#   CUTOVER_POLICY   optional: cut over only these policies (keys, space
+#                    separated): a slice. The manager becomes mode: hybrid; the
+#                    rest stays mirrored, never changed by an apply, until the
+#                    next slice or the whole manager (no CUTOVER_POLICY).
 #
 # 1. Reads the manager (read-only) and checks the repository still holds exactly
 #    what it holds: a change made in the UI since the last sync stops here.
@@ -13239,6 +13670,7 @@ die() {
 }
 
 site="${CUTOVER_SITE:-}"
+slice="${CUTOVER_POLICY:-}"
 [ -n "$site" ] || die "CUTOVER_SITE is not set: the manager to cut over, in mode: mirror"
 [ -n "${NSX_ADOPT_TOKEN:-}${NSX_ADOPT_REMOTE:-}" ] ||
 	die "NSX_ADOPT_TOKEN is not set: a project access token (api, write_repository), masked and protected"
@@ -13258,17 +13690,20 @@ print(mode_of(sys.argv[1], m) if m is not None else "")
 PY
 )" || die "cannot read the inventory (above)"
 case "$mode" in
-mirror) ;;
+mirror | hybrid) ;;
 "") die "$site is not a manager in inventory/managers.yaml" ;;
 *) die "$site is in mode: $mode, not mirror: there is nothing to cut over" ;;
 esac
+[ -z "$slice" ] || branch="cutover/$site-$(printf '%s' "$slice" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-60)"
 
 [ -z "$(git status --porcelain -- data stacks inventory)" ] ||
 	die "data/, stacks/ or inventory/ has uncommitted changes: commit or stash them first"
 work="$(mktemp -d)"
 # Back where it started; anything left untracked under data/ or stacks/ was
 # written here (the tree was clean above).
-trap 'rm -rf "$work"; git checkout -q -f "$start" 2>/dev/null || true; git clean -qfd -- data stacks 2>/dev/null || true' EXIT
+# Terraform's lock files are kept: its working directories (ignored, so kept
+# too) expect them, and the next plan in this checkout would fail without.
+trap 'rm -rf "$work"; git checkout -q -f "$start" 2>/dev/null || true; git clean -qfd -e .terraform.lock.hcl -- data stacks 2>/dev/null || true' EXIT
 git checkout -q -f -B "$branch" "$base"
 
 echo "== 1. $site still matches the repository"
@@ -13282,13 +13717,14 @@ if [ -n "$(git status --porcelain -- data stacks)" ]; then
 fi
 echo "it does."
 
-echo "== 2. the copy becomes the source of truth"
-python3 - "$site" <<'PY'
+echo "== 2. the copy becomes the source of truth${slice:+ for: $slice}"
+python3 - "$site" "$slice" <<'PY'
 import json, re, sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 site = sys.argv[1]
+slice_ = sys.argv[2].split()
 mark = f"# nsx-mirror: {site}"
 today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 header = (
@@ -13299,10 +13735,16 @@ header = (
 )
 renamed: dict[str, str] = {}
 count = 0
-for kind in ("groups", "services", "policies"):
+for name in slice_:
+    f = Path("data/policies") / f"{name}.yaml"
+    if not f.exists() or f.read_text().split("\n", 1)[0].strip() != mark:
+        sys.exit(f"error: {f} is not a policy {site} still mirrors (a file starting '{mark}')")
+for kind in ("groups", "services", "policies", "exclude-list"):
+    if slice_ and kind != "policies":
+        continue  # a slice takes its policies; their groups stay mirrored until the whole manager
     for f in sorted(Path("data", kind).glob("*.yaml")):
         text = f.read_text()
-        if text.split("\n", 1)[0].strip() != mark:
+        if text.split("\n", 1)[0].strip() != mark or (slice_ and f.stem not in slice_):
             continue
         lines = text.split("\n")
         i = 0
@@ -13318,7 +13760,8 @@ for kind in ("groups", "services", "policies"):
             f.unlink()
             renamed[str(f)] = str(target)
         count += 1
-removed = [str(f) for f in sorted(Path("stacks").glob(f"*/import-{site}-mirror.tf"))]
+# A slice keeps the mirror's import blocks: the rest is still mirrored.
+removed = [] if slice_ else [str(f) for f in sorted(Path("stacks").glob(f"*/import-{site}-mirror.tf"))]
 for f in removed:
     Path(f).unlink()
 
@@ -13343,15 +13786,21 @@ for i in range(start + 1, len(lines)):
     line = lines[i]
     if line.strip() and len(line) - len(line.lstrip()) <= indent:
         break
-    if re.fullmatch(r"\s+mode:\s*mirror\s*(#.*)?", line):
-        lines[i] = re.sub(r"mirror", "managed", line, count=1)
+    found = re.fullmatch(r"(\s+mode:\s*)(mirror|hybrid)(\s*(#.*)?)", line)
+    if found:
+        # A slice: hybrid until the whole manager is cut over. Without one: managed.
+        still_mirrored = slice_ and any(
+            f.read_text().split("\n", 1)[0].strip() == mark
+            for kind in ("groups", "services", "policies", "exclude-list") for f in Path("data", kind).glob("*.yaml"))
+        new_mode = "hybrid" if still_mirrored else "managed"
+        lines[i] = found.group(1) + new_mode + found.group(3)
         done = True
         break
 if not done:
-    sys.exit(f"error: no 'mode: mirror' line under {site} in {inventory}")
+    sys.exit(f"error: no 'mode: mirror' or 'mode: hybrid' line under {site} in {inventory}")
 inventory.write_text("\n".join(lines))
 print(f"{count} file(s) now ordinary data files; import blocks removed: {', '.join(removed) or 'none'}; "
-      f"{site}: mode: managed")
+      f"{site}: mode: {new_mode}")
 PY
 
 echo "== 3. plan $site: it must change nothing"
@@ -13375,8 +13824,10 @@ for stack in $stacks; do
 done
 
 git add -A data stacks inventory
+what="$site"
+[ -z "$slice" ] || what="$site: $slice"
 git -c user.name="${GITLAB_USER_NAME:-nsx-cutover}" -c user.email="${GITLAB_USER_EMAIL:-nsx-cutover@localhost}" \
-	-c commit.gpgsign=false commit -q -m "Cut $site over to managed
+	-c commit.gpgsign=false commit -q -m "Cut $what over to managed
 
 The mirror copy of $site becomes the source of truth: ordinary data files,
 no import blocks, mode: managed. Planned by scripts/cutover.sh in pipeline
@@ -13406,10 +13857,28 @@ gitlab() { # gitlab METHOD PATH [JSON-FILE]
 }
 open_mr="$(gitlab GET "/merge_requests?state=opened&source_branch=$branch&target_branch=$target" |
 	python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[0]["iid"] if d else "")')" || open_mr=""
-SITE="$site" BRANCH="$branch" TARGET="$target" NEW="$open_mr" python3 - "$work/mr.json" "$summary" <<'PY'
+SITE="$site" SLICE="$slice" BRANCH="$branch" TARGET="$target" NEW="$open_mr" python3 - "$work/mr.json" "$summary" <<'PY'
 import json, os, sys
 e = os.environ
 plans = open(sys.argv[2]).read().split()
+if e.get("SLICE"):
+    body = {"title": f"Cut {e['SITE']} over to managed: {e['SLICE']}", "description": "\n".join([
+        f"Cuts the policies `{e['SLICE']}` of **{e['SITE']}** over to managed: a slice. Merging this is that cutover.",
+        "",
+        "- Their files become ordinary data files: changes to these policies are made here, in merge requests.",
+        f"- `inventory/managers.yaml`: `mode: hybrid`. Everything else of {e['SITE']} is still mirrored from the UI, and",
+        "  plan-guard refuses any apply that would change it; the groups these policies use too, until the whole manager.",
+        "",
+        "Planned by the cutover job against the live manager, with this exact content: **no changes** in any stack.",
+        "",
+        "### Before merging",
+        "- [ ] The owners of these policies stop changing them in the UI from now on.",
+        "- [ ] Their open `nsx-drift` issues are explained.",
+    ])}
+    if not e["NEW"]:
+        body.update(source_branch=e["BRANCH"], target_branch=e["TARGET"], remove_source_branch=True)
+    json.dump(body, open(sys.argv[1], "w"))
+    sys.exit(0)
 description = "\n".join([
     f"Cuts **{e['SITE']}** over from mirror mode to managed. Merging this is the cutover.",
     "",
@@ -13427,7 +13896,7 @@ description = "\n".join([
     "",
     "### After merging",
     "- Change these objects by editing their files, and add new objects in new files, in merge requests.",
-    "- A change made in the NSX UI is drift: the drift check raises an issue, and the next apply would undo it.",
+    "- A change made in the NSX UI is drift: the drift check raises an issue; no apply undoes it until it is accepted or the revert approved.",
     "- Placeholder `why_static` notes still say IMPORTED AS-IS: replace them as the groups are touched.",
 ])
 body = {"title": f"Cut {e['SITE']} over to managed", "description": description}
@@ -16335,6 +16804,27 @@ accept:
   rules:
     - if: $ACCEPT_SITE && $ACCEPT_KEYS && $CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
+# --- hits: unused rules, and what a would-deny rule would block --------------
+# A monthly pipeline schedule with HITS_SITE (a manager in mode: managed, or
+# 'all'). Native NSX hit counters: one read and one call per policy. Raises one
+# nsx-hits issue a month. Read-only.
+
+hits:
+  stage: adopt
+  variables:
+    NSX_CRED_SCOPE: plan
+    VAULT_TOKEN: $VAULT_PLAN_TOKEN
+  script:
+    - |
+      for site in $(python3 scripts/ci-matrix.py --format lines --managed-only | awk '{ print $1 }' | sort -u); do
+        if [ "$HITS_SITE" = all ] || [[ " $HITS_SITE " == *" $site "* ]]; then
+          NSX_CRED_SCOPE=plan scripts/with-credentials.sh "$site" -- python3 scripts/rule-hits.py --site "$site" --issue
+        fi
+      done
+  interruptible: false
+  rules:
+    - if: $HITS_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
 # --- schedule: rules that are on only at certain times ------------------------
 # A pipeline schedule every 5 minutes with SCHEDULE_FOLLOW=1, on the default
 # branch. Switches the scheduled rules of every manager in mode: managed as
@@ -16376,6 +16866,8 @@ data:
       when: never
     - if: $ACCEPT_SITE && $CI_PIPELINE_SOURCE == "web"
       when: never
+    - if: $HITS_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -16407,6 +16899,8 @@ terraform:
       when: never
     - if: $ACCEPT_SITE && $CI_PIPELINE_SOURCE == "web"
       when: never
+    - if: $HITS_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -16437,6 +16931,8 @@ matrix:
       when: never
     - if: $ACCEPT_SITE && $CI_PIPELINE_SOURCE == "web"
       when: never
+    - if: $HITS_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -16466,6 +16962,8 @@ managers:
     - if: $WATCH_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "trigger")
       when: never
     - if: $ACCEPT_SITE && $CI_PIPELINE_SOURCE == "web"
+      when: never
+    - if: $HITS_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
       when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

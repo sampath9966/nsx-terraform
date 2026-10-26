@@ -13,6 +13,20 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 1.9.0
+
+**Cut over in slices.** `CUTOVER_POLICY` (with `CUTOVER_SITE`) cuts over only the named policies: their files become ordinary data files and the manager becomes `mode: hybrid`. The policies cut over are managed (plans, applies, guardrails, drift); everything else stays mirrored from the UI, and plan-guard refuses any apply that would change it. The mirror leaves the policies cut over to their files; the watch and the drift check leave what is still mirrored to the mirror. Proven with the real provider. The last cutover makes the manager `mode: managed`.
+
+**The DFW exclusion list is data.** A group on it bypasses the firewall entirely. The importer takes it into `data/exclude-list/<site>.yaml` (one call), the security stack manages each member (`nsxt_policy_firewall_exclude_list_member`), the new `exclusion-list` guardrail (enforced) needs an exception with owner, ticket and expiry for every member, and the watch raises a group added outside Git as `[HIGH]`.
+
+**Identity firewall groups are adopted**: Active Directory groups by distinguished name and SID, as `identity_groups:`, ANDed with the group's criteria as NSX does. Proven with the real provider.
+
+**Unused rules and default deny, from native hit counters.** `scripts/rule-hits.py` and the monthly `hits` job (`HITS_SITE`) list rules with no hit since NSX last reset its counters, and what a rule labelled `WOULD_DENY` (the step before an application's default deny) still matches. One read and one call per policy; no add-on needed. docs/GUARDRAILS.md.
+
+**Fixed:** the cutover's clean-up deleted Terraform lock files its own plans had made, so a second cutover in the same checkout failed at init.
+
+Not yet covered, next: gateway firewall policies, IDS/IPS policies, custom context profiles, the DFW default rule, NSX role assignments, and projects and VPCs (VCF 9). Until then they stay in the UI, and the field allow-list keeps anything they touch from being adopted half-represented.
+
 ## 1.8.0
 
 **Zero-trust guardrails, set by the security team, checked on every merge request.** `data/guardrails.yaml` (created when missing) holds eleven guardrails, each mapped to NIST SP 800-207 and 800-53: any-to-any-on-any and production to non-production are enforced by default; any service, source or destination, rules applied to everything, addresses instead of attributes, unlogged drops, policies without their own final deny and static groups are warnings. Levels are enforce, warn or off, estate-wide and per manager. A rule may carry an exception, which needs an owner, a ticket and an expiry, and fails again once expired. Rules adopted from NSX are counted as findings, a backlog, never a failed pipeline. docs/GUARDRAILS.md.

@@ -121,6 +121,17 @@ check "the same violations in an adopted file are counted as findings, not error
 check "--findings lists them" bash -c 'python3 scripts/validate-data.py --findings 2>&1 | grep -q "^finding  data/policies/adopted.yaml: rules.any-any: guardrail any-any-any"'
 rm data/policies/adopted.yaml data/.import-manifest.json
 
+echo "the DFW exclusion list"
+mkdir -p data/exclude-list
+printf 'members:\n  legacy:\n    why: an appliance the DFW breaks\n' >data/exclude-list/lon1.yaml
+out="$(python3 scripts/validate-data.py 2>&1)"
+check "a group excluded from the DFW without an exception is refused" grep -q "ERROR .*data/exclude-list/lon1.yaml: members.legacy: guardrail exclusion-list" <<<"$out"
+printf 'members:\n  legacy:\n    why: an appliance the DFW breaks\n    exception:\n      guardrails: [exclusion-list]\n      owner: net-team\n      ticket: CHG9\n      expires: 2099-01-01\n' >data/exclude-list/lon1.yaml
+check "...accepted with one, owned, tracked and ending" bash -c '! python3 scripts/validate-data.py 2>&1 | grep -q "exclude-list/lon1.yaml"'
+printf 'members:\n  nope:\n    why: x\n' >data/exclude-list/lon1.yaml
+check "a member that is no group in data/ is an error" bash -c 'python3 scripts/validate-data.py 2>&1 | grep -q "members.nope: no group .nope. in data/"'
+rm -r data/exclude-list
+
 echo "no silent undoing of a change made in NSX"
 plan_json() { # field-in-plan-after, extra drift: what the plan sets the rule's action to
 	python3 - "$1" <<'PY'
@@ -140,6 +151,23 @@ printf 'lon1 local-security module.policies["app"].nsxt_policy_security_policy_r
 check "...allowed once the revert is approved in allow-revert.txt, in the merge request" bash -c 'python3 scripts/plan-guard.py --site lon1 --stack local-security <<<"$1"' _ "$(plan_json ALLOW)"
 rm allow-revert.txt
 check "a merge request that changes the field itself is not a silent revert" bash -c 'python3 scripts/plan-guard.py --site lon1 --stack local-security <<<"$1"' _ "$(plan_json REJECT)"
+
+echo "hybrid: cut over in slices"
+printf '# nsx-mirror: lon1\npolicy:\n  id: still\n  name: still\n  category: Application\n  owner: lm\n  sites: [lon1]\n  scope: [ANY]\n  rule_management: standalone\nrules: {}\n' >data/policies/still.yaml
+hybrid_plan() { # policy action [importing]
+	python3 - "$@" <<'PY'
+import json, sys
+c = {"address": f'module.policies["{sys.argv[1]}"].nsxt_policy_security_policy_rule.this["r"]', "mode": "managed",
+     "type": "nsxt_policy_security_policy_rule", "change": {"actions": [sys.argv[2]], "before": {"a": 1}, "after": {"a": 2}}}
+if len(sys.argv) > 3:
+    c["change"]["importing"] = {"id": "x"}
+print(json.dumps({"resource_changes": [c]}))
+PY
+}
+check "a change to a policy still mirrored from the UI is refused" bash -c '! NSX_MODE=hybrid python3 scripts/plan-guard.py --site lon1 --stack local-security <<<"$1" 2>&1 | grep -q "allowed" && NSX_MODE=hybrid python3 scripts/plan-guard.py --site lon1 --stack local-security <<<"$1" 2>&1 | grep -q "still mirrored from the UI"' _ "$(hybrid_plan still update)"
+check "...its import is allowed" bash -c 'NSX_MODE=hybrid python3 scripts/plan-guard.py --site lon1 --stack local-security <<<"$1"' _ "$(hybrid_plan still no-op import)"
+check "...and a change to a policy cut over is allowed, a mirror's import file being no tranche to it" bash -c 'mkdir -p stacks/local-security && printf "import {\n}\n" >stacks/local-security/import-lon1-mirror.tf && NSX_MODE=hybrid python3 scripts/plan-guard.py --site lon1 --stack local-security <<<"$1"; r=$?; rm -f stacks/local-security/import-lon1-mirror.tf; exit $r' _ "$(hybrid_plan app update)"
+rm data/policies/still.yaml
 
 echo "plans in firewall terms"
 python3 - >"$SCRATCH/plan.json" <<'PY'

@@ -283,12 +283,38 @@ gl=$!
 sleep 1
 cut() { env -u NSXT_MANAGER_HOST -u NSXT_USERNAME -u NSXT_PASSWORD NSX_LON1_USERNAME=u NSX_LON1_PASSWORD=p \
 	NSX_ADOPT_REMOTE="$SCRATCH/t2-remote.git" NSX_ADOPT_TOKEN=T CI_API_V4_URL="http://127.0.0.1:$gl_port/api/v4" \
-	CI_PROJECT_ID=7 CI_DEFAULT_BRANCH=main CUTOVER_SITE=lon1 scripts/cutover.sh 2>&1; }
+	CI_PROJECT_ID=7 CI_DEFAULT_BRANCH=main CUTOVER_SITE=lon1 "$@" scripts/cutover.sh 2>&1; }
 ui edit-and-add
 out="$(cut)"
 check "a UI change not yet synced stops the cutover, and nothing is pushed" bash -c 'grep -q "lon1 changed in the UI since the last sync" <<<"$1" && ! git -C "$2" rev-parse -q --verify refs/heads/cutover/lon1' _ "$out" "$SCRATCH/t2-remote.git"
 check "...leaving the checkout as it was" bash -c '[ -z "$(git status --porcelain)" ] && [ "$(git rev-parse --abbrev-ref HEAD)" = main ]'
 ui delete
+
+echo "cutover in slices: one policy at a time, the rest still mirrored"
+P="$(grep -l "^# nsx-mirror: lon1" data/policies/*.yaml | head -1 | xargs -n1 basename | sed 's/\.yaml$//')"
+Q="$(grep -l "^# nsx-mirror: lon1" data/policies/*.yaml | sed -n 2p | xargs -r -n1 basename | sed 's/\.yaml$//')"
+out="$(cut CUTOVER_POLICY="$P")"
+SB="cutover/lon1-$P"
+check "a slice plans as changing nothing, and opens its merge request" bash -c 'grep -q "hybrid: cut over managed, the rest observe only: 0 import, 0 create, 0 update, 0 destroy/replace" <<<"$1" && grep -q "\"title\": \"Cut lon1 over to managed: $3\"" "$2"' _ "$out" "$SCRATCH/t2-gl.log" "$P"
+check "...the branch: mode hybrid, the policy an ordinary file, everything else still mirrored, import blocks kept" bash -c 'git -C "$1" show "$2":inventory/managers.yaml | grep -q "^    mode: hybrid" && ! git -C "$1" show "$2:data/policies/$3.yaml" | grep -q "nsx-mirror:" && git -C "$1" show "$2:data/groups/imported-lon1-mirror.yaml" | head -1 | grep -qx "# nsx-mirror: lon1" && git -C "$1" show "$2:stacks/local-security/import-lon1-mirror.tf" >/dev/null' _ "$SCRATCH/t2-remote.git" "$SB" "$P"
+git_quiet fetch -q "$SCRATCH/t2-remote.git" "$SB"
+git_quiet checkout -q -B slice FETCH_HEAD
+sed -i '0,/action: ALLOW/s//action: DROP/' "data/policies/$P.yaml"
+out="$(tf plan local-security lon1)"
+check "the sliced policy is managed: a change to it plans, and is allowed" bash -c 'grep -q "0 to add, 1 to change, 0 to destroy" <<<"$1" && grep -q "plan-guard: allowed" <<<"$1"' _ "$out"
+git_quiet checkout -q -- data
+if [ -n "$Q" ]; then
+	sed -i '0,/action: ALLOW/s//action: DROP/' "data/policies/$Q.yaml"
+	out="$(tf plan local-security lon1)"
+	check "a change in data/ to a policy still mirrored is refused: the UI still owns it" bash -c 'grep -q "plan-guard: REFUSED" <<<"$1" && grep -q "still mirrored from the UI" <<<"$1"' _ "$out"
+	git_quiet checkout -q -- data
+fi
+out="$(python3 scripts/import-estate.py --site lon1 --from-dump "$SCRATCH/mirror-cap.json" --mirror 2>&1)"
+check "the mirror of a hybrid manager leaves the sliced policy to its file" grep -q "MANAGED   policy $P" <<<"$out"
+git_quiet checkout -q -f main
+git_quiet clean -qfd -- data
+rm -f stacks/*/.terraform/nsx-site  # a fresh checkout, as CI has: the next plan initialises again
+
 out="$(cut)"
 check "in step: the cutover plans every stack of the manager, and each changes nothing" bash -c 'grep -q "plan-guard lon1/local-security, normal: 0 import, 0 create, 0 update, 0 destroy/replace, 0 hand back" <<<"$1" && ! grep -q "^error" <<<"$1"' _ "$out"
 check "...and opens the merge request that is the cutover" bash -c 'grep -q "\"title\": \"Cut lon1 over to managed\"" "$1" && grep -q "merge request: " <<<"$2"' _ "$SCRATCH/t2-gl.log" "$out"
@@ -329,7 +355,7 @@ import json, sys
 p = [json.loads(x)["body"] for x in open(sys.argv[1]) if '"/api/v4/projects/7/issues"' in x and '"POST"' in x]
 d = p[-1]["description"] if p else ""
 ok = len(p) == 1 and p[0]["labels"] == "nsx-drift,site:lon1" and 'base_groups.nsxt_policy_group.this["App-Web"]' in d and "| carol |" in d
-ok = ok and "the next apply of this manager reverts it" in d and "http://gitlab.test/jobs/9" in d
+ok = ok and "every plan of this manager refuses to undo it silently" in d and "ACCEPT_KEYS" in d and "http://gitlab.test/jobs/9" in d
 sys.exit(0 if ok else 1)
 PY
 out="$(env -u NSXT_MANAGER_HOST -u NSXT_USERNAME -u NSXT_PASSWORD NSX_LON1_USERNAME=u NSX_LON1_PASSWORD=p NSX_ADOPT_TOKEN=T \
@@ -427,7 +453,15 @@ d["groups"].append({"id": U(1), "path": f"{LD}/groups/{U(1)}", "display_name": "
                     "expression": [{"resource_type": "Condition", "key": "Tag", "member_type": "VirtualMachine", "operator": "EQUALS", "value": "app|ui"}]})
 d["groups"].append({"id": "tkg-ns", "path": f"{LD}/groups/tkg-ns", "display_name": "tkg-ns", "_protection": "REQUIRE_OVERRIDE",
                     "_create_user": "wcp-cluster-user", "expression": [{"resource_type": "Condition", "key": "Tag", "member_type": "VirtualMachine", "operator": "EQUALS", "value": "app|tkg"}]})
-ui = rule("x", 100, [f"{LD}/groups/{U(1)}", f"{LD}/groups/tkg-ns"], [f"{LD}/groups/App-DB"])
+# The DFW exclusion list: App-DB's members bypass the firewall.
+d["exclude_list"] = [f"{LD}/groups/App-DB"]
+# Identity firewall: users of an AD group, on VMs tagged app|vdi.
+d["groups"].append({"id": "vdi-ops", "path": f"{LD}/groups/vdi-ops", "display_name": "vdi-ops",
+                    "expression": [{"resource_type": "Condition", "key": "Tag", "member_type": "VirtualMachine", "operator": "EQUALS", "value": "app|vdi"}],
+                    "extended_expression": [{"resource_type": "IdentityGroupExpression", "identity_groups": [
+                        {"distinguished_name": "CN=ops,OU=groups,DC=corp,DC=example", "domain_base_distinguished_name": "DC=corp,DC=example",
+                         "sid": "S-1-5-21-1-2-3-1001"}]}]})
+ui = rule("x", 100, [f"{LD}/groups/{U(1)}", f"{LD}/groups/tkg-ns", f"{LD}/groups/vdi-ops"], [f"{LD}/groups/App-DB"])
 ui.update(id=U(20), display_name="Allow UI", path=f"{LD}/security-policies/{U(10)}/rules/{U(20)}")
 d["policies"].append({"id": U(10), "path": f"{LD}/security-policies/{U(10)}", "display_name": "UI Policy",
     "category": "Application", "sequence_number": 41, "stateful": True, "tcp_strict": True, "locked": False, "scope": ["ANY"], "rules": [ui]})
@@ -443,6 +477,8 @@ out="$(tf plan local-security lon1)"
 check "the real provider plans VM members, addresses and the location group as a pure import" bash -c 'grep -qE "Plan: [0-9]+ to import, 0 to add, 0 to change, 0 to destroy" <<<"$1" && grep -q "plan-guard: allowed" <<<"$1"' _ "$out"
 check "...the location group by its domain's path" grep -q '/global-infra/domains/WL-Mum/groups/M-App' <<<"$out"
 check "...the UI-made policy, rule and group by their UUIDs, under readable keys" bash -c 'grep -q "module.policies\[\"UI-Policy\"\].nsxt_policy_security_policy_rule.this\[\"Allow-UI\"\]" <<<"$1" && grep -q "0b7c0020-1111-4222-8333-444455556666" <<<"$1" && grep -q "nsxt_policy_group.this\[\"UI-Group\"\]" <<<"$1"' _ "$out"
+check "...and the DFW exclusion list's member, as a pure import" grep -q 'nsxt_policy_firewall_exclude_list_member.this\["App-DB"\] will be imported' <<<"$out"
+check "...and an identity firewall group, with its AD group, as a pure import" bash -c 'grep -q "nsxt_policy_group.this\[\"vdi-ops\"\]" <<<"$1" && grep -q "CN=ops,OU=groups,DC=corp,DC=example" <<<"$1"' _ "$out"
 check "...and the group vSphere with Tanzu owns is used by its path, never imported" bash -c 'grep -q "/infra/domains/default/groups/tkg-ns" <<<"$1" && ! grep -q "this\[\"tkg-ns\"\]" <<<"$1"' _ "$out"
 check "it applies as imports only" grep -qE "Resources: [0-9]+ imported, 0 added, 0 changed, 0 destroyed" <<<"$(APPROVE=yes tf apply local-security lon1)"
 check "...and the next plan is quiet: external ids and addresses read back as written" grep -q "No changes" <<<"$(tf plan local-security lon1)"
@@ -593,7 +629,7 @@ echo "reading cost: the whole manager in one call, one login"
 cd "$T" || exit 1
 before="$(wc -l <"$SCRATCH/requests.log")"
 out="$(python3 scripts/import-estate.py --site lon1 --dump-only "$SCRATCH/cost-h.json" 2>&1)"
-check "a capture reads the whole manager in one call (hierarchical read), after one login" bash -c 'grep -q "in 2 call(s) (hierarchical read)" <<<"$1" && [ "$(tail -n +"$(( $3 + 1 ))" "$2" | grep -c "^GET")" = 1 ] && [ "$(tail -n +"$(( $3 + 1 ))" "$2" | grep -c "session/create")" = 1 ]' _ "$out" "$SCRATCH/requests.log" "$before"
+check "a capture reads the whole manager in two calls (the tree, the exclusion list), after one login" bash -c 'grep -q "in 2 call(s) (hierarchical read)" <<<"$1" && [ "$(tail -n +"$(( $3 + 1 ))" "$2" | grep -c "^GET")" = 2 ] && [ "$(tail -n +"$(( $3 + 1 ))" "$2" | grep -c "session/create")" = 1 ]' _ "$out" "$SCRATCH/requests.log" "$before"
 touch "$SCRATCH/requests.log.paged"
 out="$(python3 scripts/import-estate.py --site lon1 --dump-only "$SCRATCH/cost-p.json" 2>&1)"
 rm -f "$SCRATCH/requests.log.paged"
@@ -747,6 +783,8 @@ hit = [i for i in items if i["key"].endswith('this["s1"]')]
 sys.exit(0 if hit and hit[0].get("severity") == "high" and "ON outside its schedule" in hit[0]["detail"] else 1)
 PY
 check "switched on in the UI outside its window: the drift check raises it as high severity" test $? -eq 0
+out="$(python3 scripts/rule-hits.py --site lon1 2>&1)"
+check "native hit counters: a managed rule with no hit is listed, for a read and a call per policy" bash -c 'grep -q "  unused      sched/s1" <<<"$1" && grep -q "; 4 NSX call(s)" <<<"$1"' _ "$out"
 unset NSX_SCHEDULE_NOW
 cp "$SCRATCH/ui.before-sched" "$UI"
 cd "$T" || exit 1

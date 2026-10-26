@@ -12,12 +12,13 @@ engineer changing the manager in the UI between two reads."""
 import fnmatch, json, os, re, ssl, sys, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 log = open(sys.argv[2], "a"); port = int(sys.argv[3]); cert, key = sys.argv[4], sys.argv[5]
-objs = {}; loaded = None
+objs = {}; loaded = None; exclude = []
 def load():
     global loaded
     stamp = os.stat(sys.argv[1]).st_mtime_ns
     if stamp == loaded: return
     dump = json.load(open(sys.argv[1])); objs.clear(); loaded = stamp
+    exclude[:] = dump.get("exclude_list") or []
     rev = lambda o: o.get("_revision", 1)
     for g in dump["groups"]: objs["/policy/api/v1" + g["path"]] = dict(g, resource_type="Group", _revision=rev(g))
     for s in dump["services"]: objs["/policy/api/v1" + s["path"]] = dict(s, resource_type="Service", _revision=rev(s))
@@ -60,6 +61,15 @@ class H(BaseHTTPRequestHandler):
                 return self.send(400, {"error_message": "mock: no hierarchical read"})
             return self.send(200, tree())
         if path in objs: return self.send(200, objs[path])
+        if path.endswith("/statistics") and path[:-len("/statistics")] in objs:
+            # Rule hit counters, from each rule's _hits in the dump.
+            policy = path[:-len("/statistics")]
+            rules = [o for k, o in objs.items() if k.startswith(policy + "/rules/")]
+            return self.send(200, {"results": [{"statistics": {"results": [
+                {"internal_rule_id": str(r.get("rule_id", r["id"])), "hit_count": r.get("_hits", 0)} for r in rules]}}]})
+        if path == "/policy/api/v1/infra/settings/firewall/security/exclude-list":
+            return self.send(200, {"resource_type": "PolicyExcludeList", "id": "exclude-list", "path": "/infra/settings/firewall/security/exclude-list",
+                                   "members": list(exclude), "_revision": 1})
         if path == "/policy/api/v1/infra/services":
             found = [o for k, o in objs.items() if "/infra/services/" in k]
             return self.send(200, {"results": found, "result_count": len(found)})
