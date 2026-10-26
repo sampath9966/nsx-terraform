@@ -460,23 +460,13 @@ ok = ok and "$CI_DEFAULT_BRANCH" in j["rules"][0]["if"] and j["resource_group"] 
 ok = ok and j["script"] == ["scripts/cutover.sh"] and j["interruptible"] is False
 sys.exit(0 if ok else 1)
 PY
-check "the drift check runs from a schedule or Run pipeline on the default branch, read-only" python3 - "$ci" <<'PY'
+check "...and a cutover pipeline runs nothing else" python3 - "$ci" <<'PY'
 import sys, yaml
 d = yaml.safe_load(open(sys.argv[1]))
-j = d["drift"]
-ok = len(j["rules"]) == 1 and "$DRIFT_SITE" in j["rules"][0]["if"] and '"schedule"' in j["rules"][0]["if"] and "$CI_DEFAULT_BRANCH" in j["rules"][0]["if"]
-ok = ok and j["variables"]["NSX_CRED_SCOPE"] == "plan" and j["script"] == ["scripts/drift-job.sh"]
-sys.exit(0 if ok else 1)
+sys.exit(0 if all(any("$CUTOVER_SITE" in r.get("if", "") and r.get("when") == "never" for r in d[job]["rules"])
+                  for job in ("data", "terraform", "matrix", "managers")) else 1)
 PY
-check "...and a cutover or drift pipeline runs nothing else" python3 - "$ci" <<'PY'
-import sys, yaml
-d = yaml.safe_load(open(sys.argv[1]))
-for job in ("data", "terraform", "matrix", "managers"):
-    for var in ("$CUTOVER_SITE", "$DRIFT_SITE"):
-        if not any(var in r.get("if", "") and r.get("when") == "never" for r in d[job]["rules"]):
-            sys.exit(1)
-PY
-check "drift-job.sh without DRIFT_SITE says what to set" bash -c 'cd "$1" && ! out="$(scripts/drift-job.sh 2>&1)" && grep -q "DRIFT_SITE is not set" <<<"$out"' _ "$T"
+check "watch-job.sh without WATCH_SITE says what to set" bash -c 'cd "$1" && ! out="$(scripts/watch-job.sh 2>&1)" && grep -q "WATCH_SITE is not set" <<<"$out"' _ "$T"
 check "cutover.sh without CUTOVER_SITE says what to set" bash -c 'cd "$1" && ! out="$(scripts/cutover.sh 2>&1)" && grep -q "CUTOVER_SITE is not set" <<<"$out"' _ "$T"
 
 # GitLab state (http backend): one state per stack per manager.

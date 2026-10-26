@@ -347,20 +347,20 @@ for g in d["groups"]:
         g["_last_modified_user"] = "carol"; g["_last_modified_time"] = int(time.time() * 1000)
 json.dump(d, open(sys.argv[1], "w"))
 PY
-out="$(env -u NSXT_MANAGER_HOST -u NSXT_USERNAME -u NSXT_PASSWORD NSX_LON1_USERNAME=u NSX_LON1_PASSWORD=p NSX_ADOPT_TOKEN=T \
+out="$(env -u NSXT_MANAGER_HOST -u NSXT_USERNAME -u NSXT_PASSWORD NSX_LON1_USERNAME=u NSX_LON1_PASSWORD=p NSX_BOT_TOKEN=T \
 	CI_API_V4_URL="http://127.0.0.1:$gl_port/api/v4" CI_PROJECT_ID=7 CI_JOB_URL=http://gitlab.test/jobs/9 \
-	scripts/with-credentials.sh lon1 -- scripts/drift-job.sh --one lon1 local-security 2>&1)"
-check "drift on a managed manager raises an issue, with who changed it, from NSX" python3 - "$SCRATCH/t2-gl.log" <<'PY'
+	WATCH_SITE=lon1 WATCH_FULL=1 scripts/watch-job.sh 2>&1)"
+check "a change in the UI of a managed manager raises an issue, with who changed it, from NSX" python3 - "$SCRATCH/t2-gl.log" <<'PY'
 import json, sys
 p = [json.loads(x)["body"] for x in open(sys.argv[1]) if '"/api/v4/projects/7/issues"' in x and '"POST"' in x]
 d = p[-1]["description"] if p else ""
-ok = len(p) == 1 and p[0]["labels"] == "nsx-drift,site:lon1" and 'base_groups.nsxt_policy_group.this["App-Web"]' in d and "| carol |" in d
+ok = len(p) == 1 and p[0]["labels"] == "nsx-drift,site:lon1" and "`group App-Web`" in d and "| carol |" in d
 ok = ok and "every plan of this manager refuses to undo it silently" in d and "ACCEPT_KEYS" in d and "http://gitlab.test/jobs/9" in d
 sys.exit(0 if ok else 1)
 PY
-out="$(env -u NSXT_MANAGER_HOST -u NSXT_USERNAME -u NSXT_PASSWORD NSX_LON1_USERNAME=u NSX_LON1_PASSWORD=p NSX_ADOPT_TOKEN=T \
+out="$(env -u NSXT_MANAGER_HOST -u NSXT_USERNAME -u NSXT_PASSWORD NSX_LON1_USERNAME=u NSX_LON1_PASSWORD=p NSX_BOT_TOKEN=T \
 	CI_API_V4_URL="http://127.0.0.1:$gl_port/api/v4" CI_PROJECT_ID=7 \
-	scripts/with-credentials.sh lon1 -- scripts/drift-job.sh --one lon1 local-security 2>&1)"
+	WATCH_SITE=lon1 WATCH_FULL=1 scripts/watch-job.sh 2>&1)"
 check "...once: the next check finds it already raised" grep -q "already in an nsx-drift issue" <<<"$out"
 kill "$gl" 2>/dev/null
 cp "$SCRATCH/ui.orig" "$UI"
@@ -560,8 +560,8 @@ check "every shape NSX allows is taken, except what cannot be represented, each 
 	! grep -qE "NOT ADOPTED  (group|service) (Azure|Name-Prefix|Empty|IP-Only|MAC|gm_UDP|GRE|FTP|IGMP)" <<<"$1"' _ "$out"
 check "...system services by id, not by name" grep -q "^predefined_ids:" data/services/imported-lon1-mirror.yaml
 check "...and a policy NSX numbered with duplicates keeps them, marked" grep -q "allow_duplicate_sequence: true" data/policies/CSS.yaml
-v="$(NSX_YAML_FALLBACK=1 python3 scripts/validate-data.py 2>&1)"
-check "the copy validates with the built-in YAML reader, as on a CI image without PyYAML" bash -c '! grep -q "^ERROR" <<<"$1" && grep -q "0 error(s)" <<<"$1"' _ "$v"
+v="$(python3 scripts/validate-data.py 2>&1)"
+check "the copy validates" bash -c '! grep -q "^ERROR" <<<"$1" && grep -q "0 error(s)" <<<"$1"' _ "$v"
 check "...an unlisted tag scope in an adopted group is a warning, not an error" grep -q "^warning .*tag scope .unlisted-scope." <<<"$v"
 check "terraform fmt -check passes on everything the mirror wrote" bash -c 'terraform fmt -check -recursive stacks >/dev/null'
 out="$(tf plan local-security lon1)"
@@ -614,7 +614,7 @@ import {{
 }}
 ''')
 PY
-check "(setup) the second domain's copies validate beside the first ones" bash -c 'NSX_YAML_FALLBACK=1 python3 scripts/validate-data.py 2>&1 | grep -q "0 error(s)"'
+check "(setup) the second domain's copies validate beside the first ones" bash -c 'python3 scripts/validate-data.py 2>&1 | grep -q "0 error(s)"'
 out="$(tf plan local-security lon1)"
 check "the real provider imports the same ids from another domain, by their NSX ids, beside the default ones" bash -c 'grep -q "Plan: 3 to import, 0 to add, 0 to change, 0 to destroy" <<<"$1" && grep -q "/infra/domains/other/groups/Name-Prefix" <<<"$1"' _ "$out"
 check "...it applies as imports only" grep -q "Resources: 3 imported, 0 added, 0 changed, 0 destroyed" <<<"$(APPROVE=yes tf apply local-security lon1)"
@@ -629,7 +629,7 @@ echo "reading cost: the whole manager in one call, one login"
 cd "$T" || exit 1
 before="$(wc -l <"$SCRATCH/requests.log")"
 out="$(python3 scripts/import-estate.py --site lon1 --dump-only "$SCRATCH/cost-h.json" 2>&1)"
-check "a capture reads the whole manager in two calls (the tree, the exclusion list), after one login" bash -c 'grep -q "in 2 call(s) (hierarchical read)" <<<"$1" && [ "$(tail -n +"$(( $3 + 1 ))" "$2" | grep -c "^GET")" = 2 ] && [ "$(tail -n +"$(( $3 + 1 ))" "$2" | grep -c "session/create")" = 1 ]' _ "$out" "$SCRATCH/requests.log" "$before"
+check "a capture reads the whole manager in three calls: a login, the tree, the exclusion list" bash -c 'grep -q "in 3 call(s) (hierarchical read)" <<<"$1" && [ "$(tail -n +"$(( $3 + 1 ))" "$2" | grep -c "^GET")" = 2 ] && [ "$(tail -n +"$(( $3 + 1 ))" "$2" | grep -c "session/create")" = 1 ]' _ "$out" "$SCRATCH/requests.log" "$before"
 touch "$SCRATCH/requests.log.paged"
 out="$(python3 scripts/import-estate.py --site lon1 --dump-only "$SCRATCH/cost-p.json" 2>&1)"
 rm -f "$SCRATCH/requests.log.paged"
@@ -719,29 +719,6 @@ out="$(tf follow local-security lon1)"
 check "inside its window again the follower switches it back on" bash -c 'grep -q "Resources: 0 added, 1 changed, 0 destroyed" <<<"$1" && tail -n +"$(( $3 + 1 ))" "$2" | grep "^BODY" | grep -q "\"disabled\": false"' _ "$out" "$SCRATCH/requests.log" "$before"
 check "...and a normal plan then agrees with NSX and the schedule: no changes" grep -q "No changes" <<<"$(tf plan local-security lon1)"
 
-echo "a plan without refresh (NSX_PLAN_REFRESH=changed): no read per object; the apply checks what it changes"
-sed -i 's/    logged: true/    logged: false/' data/policies/sched.yaml
-before="$(wc -l <"$SCRATCH/requests.log")"
-out="$(NSX_PLAN_REFRESH=changed tf plan local-security lon1)"
-check "the plan reads no object from NSX, and shows the change" bash -c 'grep -q "0 to add, 1 to change, 0 to destroy" <<<"$1" && ! tail -n +"$(( $3 + 1 ))" "$2" | grep "^GET" | grep -q "/infra/"' _ "$out" "$SCRATCH/requests.log" "$before"
-touch "$SCRATCH/requests.log.writable"
-curl -sk -X PATCH -H 'Content-Type: application/json' --data '{"notes": "changed in the UI"}' \
-	"https://127.0.0.1:$port/policy/api/v1/infra/domains/default/security-policies/sched/rules/s1" >/dev/null
-out="$(APPROVE=yes tf apply local-security lon1)"
-check "the rule was changed in the UI since: the apply is refused, and says to plan with refresh" bash -c 'grep -q "1 changed in NSX since" <<<"$1" && grep -q "refusing to apply over a change made in NSX" <<<"$1" && ! grep -q "Apply complete" <<<"$1"' _ "$out"
-out="$(tf plan local-security lon1)"
-check "a plan with refresh sees the UI change too" bash -c 'grep -q "0 to add, 1 to change, 0 to destroy" <<<"$1" && grep -q "changed in the UI" <<<"$1"' _ "$out"
-check "...and, applied as it is, would undo that UI change: refused until approved" bash -c '! APPROVE=yes scripts/tf.sh apply local-security lon1 >/dev/null 2>&1'
-printf 'lon1 local-security module.policies["sched"].nsxt_policy_security_policy_rule.this["s1"]\n' >allow-revert.txt
-APPROVE=yes tf apply local-security lon1 >/dev/null
-rm allow-revert.txt
-sed -i 's/    logged: false/    logged: true/' data/policies/sched.yaml
-NSX_PLAN_REFRESH=changed tf plan local-security lon1 >/dev/null
-before="$(wc -l <"$SCRATCH/requests.log")"
-out="$(APPROVE=yes tf apply local-security lon1)"
-check "with nothing changed since, the apply checks the one object it changes, and applies" bash -c 'grep -q "revision check lon1: 1 object(s) the plan changes, 0 changed in NSX since" <<<"$1" && grep -q "1 changed, 0 destroyed" <<<"$1"' _ "$out"
-check "...reading that object alone before writing it" bash -c '[ "$(tail -n +"$(( $2 + 1 ))" "$1" | grep "^GET" | grep "/infra/" | grep -vc "/sched/rules/s1")" = 0 ]' _ "$SCRATCH/requests.log" "$before"
-rm -f "$SCRATCH/requests.log.writable"
 rm -f "$SCRATCH/requests.log.writable"
 
 echo "a change made in NSX is never silently undone; accepting it is one step"
@@ -751,8 +728,8 @@ curl -sk -X PATCH -H 'Content-Type: application/json' --data '{"notes": "an engi
 rm -f "$SCRATCH/requests.log.writable"
 out="$(tf plan local-security lon1)"
 check "the plan that would undo it is refused, naming the field and both ways out" bash -c 'grep -q "would undo a change made in NSX outside this repository: notes: NSX has \"an engineer fixed this in the UI\"" <<<"$1" && grep -q "allow-revert.txt" <<<"$1"' _ "$out"
-out="$(python3 scripts/accept-drift.py --site lon1 rule=sched/s1 2>&1)"
-check "accept-drift writes what NSX holds into data/, keeping the rule's schedule" bash -c 'grep -q "accepted  rule sched/s1" <<<"$1" && grep -q "notes: an engineer fixed this in the UI" data/policies/sched.yaml && grep -q "timezone: UTC" data/policies/sched.yaml' _ "$out"
+out="$(python3 scripts/drift.py accept --site lon1 rule=sched/s1 2>&1)"
+check "accepting writes what NSX holds into data/, keeping the rule's schedule" bash -c 'grep -q "accepted  rule sched/s1" <<<"$1" && grep -q "notes: an engineer fixed this in the UI" data/policies/sched.yaml && grep -q "timezone: UTC" data/policies/sched.yaml' _ "$out"
 check "...in one NSX read (and a login)" grep -q "(2 NSX call(s))" <<<"$out"
 check "...and the plan then changes nothing" grep -q "No changes" <<<"$(tf plan local-security lon1)"
 check "(the copy validates)" python3 scripts/validate-data.py
@@ -761,7 +738,7 @@ tf plan local-security lon1 >/dev/null
 out="$(tf summary local-security lon1)"
 check "a real plan reads in firewall terms" grep -q "| changed | \`rule sched/s1\` | logged true → false" <<<"$out"
 sed -i 's/    logged: false/    logged: true/' data/policies/sched.yaml
-# An engineer switches it on in the UI outside its window: the drift check raises it, high.
+# An engineer switches it on in the UI outside its window: the watch raises it, high.
 export NSX_SCHEDULE_NOW=2026-11-03T12:00:00Z
 touch "$SCRATCH/requests.log.writable"; tf follow local-security lon1 >/dev/null; rm -f "$SCRATCH/requests.log.writable"
 python3 - "$UI" <<'PY'
@@ -769,20 +746,11 @@ import json, sys, time
 d = json.load(open(sys.argv[1]))
 r = next(p for p in d["policies"] if p["id"] == "sched")["rules"][0]
 r["disabled"] = False  # on, in the UI, outside the window
-time.sleep(0.01); json.dump(d, open(sys.argv[1], "w"))
+r["_last_modified_user"] = "dave"; r["_last_modified_time"] = int(time.time() * 1000) + 60000
+json.dump(d, open(sys.argv[1], "w"))
 PY
-json="$SCRATCH/sched-drift.json"
-DRIFT_JSON="$json" tf drift local-security lon1 >/dev/null
-python3 - "$json" <<'PY'
-import importlib.util, json, sys
-spec = importlib.util.spec_from_file_location("d", "scripts/drift-issue.py"); d = importlib.util.module_from_spec(spec); spec.loader.exec_module(d)
-plan = json.load(open(sys.argv[1]))
-items = d.plan_changes(plan)
-d.schedule_items("lon1", "local-security", plan, items)
-hit = [i for i in items if i["key"].endswith('this["s1"]')]
-sys.exit(0 if hit and hit[0].get("severity") == "high" and "ON outside its schedule" in hit[0]["detail"] else 1)
-PY
-check "switched on in the UI outside its window: the drift check raises it as high severity" test $? -eq 0
+out="$(python3 scripts/drift.py watch --site lon1 --full --report-only 2>&1)"
+check "switched on in the UI outside its window: the watch raises it as high severity" grep -q "changed  *rule sched/s1  disabled True → False.*  dave .*HIGH" <<<"$out"
 out="$(python3 scripts/rule-hits.py --site lon1 2>&1)"
 check "native hit counters: a managed rule with no hit is listed, for a read and a call per policy" bash -c 'grep -q "  unused      sched/s1" <<<"$1" && grep -q "; 4 NSX call(s)" <<<"$1"' _ "$out"
 unset NSX_SCHEDULE_NOW

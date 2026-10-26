@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The change watch (scripts/nsx-watch.py): drift found by comparing what NSX
+# The change watch (scripts/drift.py watch): drift found by comparing what NSX
 # holds with data/, without Terraform. What the importer wrote compares equal to
 # the manager it read; a change made in the UI does not; and what is not drift
 # (another tool's objects, a pending apply, the pipeline's own changes) is not
@@ -56,7 +56,7 @@ json.dump({"groups": groups, "services": services, "policies": policies, "domain
 PY
 python3 scripts/import-estate.py --site lon1 --from-dump reports/lon1.json --mirror >/dev/null 2>&1
 check "(setup) the copy validates" python3 scripts/validate-data.py
-watch() { python3 scripts/nsx-watch.py --site lon1 --from-dump reports/lon1.json --report-only 2>&1; }
+watch() { python3 scripts/drift.py watch --site lon1 --from-dump reports/lon1.json --report-only 2>&1; }
 
 echo "what the importer wrote compares equal to what it read"
 out="$(watch)"
@@ -106,7 +106,7 @@ d = json.load(open("reports/lon1.json"))
 d["policies"][0]["rules"][0].update(action="DROP", _last_modified_user="svc-terraform", _last_modified_time=1900000000000)
 json.dump(d, open("reports/lon1.json", "w"))
 PY
-check "a change by a pipeline account (NSX_PIPELINE_USERS) is not drift" bash -c '! NSX_PIPELINE_USERS=svc-terraform python3 scripts/nsx-watch.py --site lon1 --from-dump reports/lon1.json --report-only 2>&1 | grep -q "rule app/r1"'
+check "a change by a pipeline account (NSX_PIPELINE_USERS) is not drift" bash -c '! NSX_PIPELINE_USERS=svc-terraform python3 scripts/drift.py watch --site lon1 --from-dump reports/lon1.json --report-only 2>&1 | grep -q "rule app/r1"'
 cp "$SCRATCH/lon1.json" reports/lon1.json
 git_quiet init -q . && git_quiet add -A && git_quiet commit -q -m base
 python3 - <<'PY'
@@ -117,7 +117,7 @@ json.dump(d, open("reports/lon1.json", "w"))
 PY
 sed -i '0,/action: ALLOW/s//action: DROP/' data/policies/app.yaml
 git_quiet commit -qam "a merged change, not applied yet"
-check "a difference whose data/ file was committed after NSX last changed is a pending apply, not drift" bash -c '! python3 scripts/nsx-watch.py --site lon1 --from-dump reports/lon1.json --report-only 2>&1 | grep -q "rule app/r1"'
+check "a difference whose data/ file was committed after NSX last changed is a pending apply, not drift" bash -c '! python3 scripts/drift.py watch --site lon1 --from-dump reports/lon1.json --report-only 2>&1 | grep -q "rule app/r1"'
 git_quiet checkout -q HEAD~1 -- data/policies/app.yaml
 cp "$SCRATCH/lon1.json" reports/lon1.json
 
@@ -132,10 +132,10 @@ check "(setup) the schedule validates" python3 scripts/validate-data.py
 out="$(NSX_SCHEDULE_NOW=2026-11-02T12:00:00Z watch)"
 check "a scheduled rule on in NSX outside its window is high severity" bash -c 'grep -q "changed  *rule app/r1  disabled True → False" <<<"$1"' _ "$out"
 python3 - <<'PY'
-import json, os, sys, importlib.util
+import json, os, sys
 os.environ["NSX_SCHEDULE_NOW"] = "2026-11-02T12:00:00Z"
-sys.argv = ["x"]
-spec = importlib.util.spec_from_file_location("w", "scripts/nsx-watch.py"); w = importlib.util.module_from_spec(spec); spec.loader.exec_module(w)
+sys.path.insert(0, "scripts")
+from nsxlib import drift as w
 d = json.load(open("reports/lon1.json"))
 objs = [dict(p, resource_type="SecurityPolicy") for p in d["policies"]] + [dict(r, resource_type="Rule") for p in d["policies"] for r in p["rules"]]
 items = [i for i in w.compare("lon1", "lm", objs, False) if i["key"] == "rule app/r1"]
@@ -157,7 +157,7 @@ for job in ("data", "terraform", "matrix", "managers"):
 sys.exit(0 if ok else 1)
 PY
 check "WATCH_SITE runs only the watch job, from a schedule, Run pipeline or a trigger (a log alert), read-only" test $? -eq 0
-check "a mirror skips its full read when nothing changed since its last copy" bash -c 'grep -q "nsx-watch.py --site \"\$site\" --changed-since" scripts/mirror.sh && grep -q "MIRROR_FULL" scripts/mirror.sh'
+check "a mirror skips its full read when nothing changed since its last copy" bash -c 'grep -q "drift.py changed --site \"\$site\" --since" scripts/mirror.sh && grep -q "MIRROR_FULL" scripts/mirror.sh'
 
 cd / || exit 1
 finish watch

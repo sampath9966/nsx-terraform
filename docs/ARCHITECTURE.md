@@ -769,12 +769,13 @@ Enforced, not just documented:
 
 Administrators will make UI changes, especially during incidents. Expect it.
 
-- Run a **scheduled plan** per stack and report drift; do not auto-revert. An
-  auto-revert during an active incident undoes the fix someone applied to stop
-  an outage. `scripts/drift.sh` does exactly this and no more: a refresh-only
-  plan, a report in `reports/`, exit code 2 when something diverged. It never
-  reverts, and it never writes back into `data/` — a tool that rewrote your data
-  files on a drift signal would silently overwrite the estate you imported.
+- Watch for changes, and raise them; do not auto-revert. An auto-revert during
+  an active incident undoes the fix someone applied to stop an outage. The
+  `watch` job (`scripts/drift.py watch`, docs/WATCH.md) compares what NSX holds
+  with `data/` for one API call and raises each change as an issue; every plan
+  refuses to undo a change made in NSX until it is accepted into `data/`
+  (`scripts/drift.py accept`) or its revert is approved (`allow-revert.txt`).
+  Nothing rewrites `data/` on a drift signal without a merge request.
 - Treat detected drift as a ticket: either bring the change into code or revert
   it deliberately.
 - Use `lifecycle.ignore_changes` sparingly and always with a comment naming the
@@ -974,17 +975,17 @@ make clean             # remove local plan files and caches; never touches state
 | `scripts/add-rule.py --policy P --rule R --scope G ...` | Adds a rule to the **existing** policy P, found by id or display name. Refuses if P does not exist unless `--create-policy`. `--dry-run` prints the block. |
 | `scripts/tag-vm.py --site S --vm V --set SCOPE=VALUE` | Tags a VM as a data edit on `data/vm-tags/<site>.yaml`. Also `--unset SCOPE`, `--remove`, `--list`, `--dry-run`. Refuses any scope not owned by `terraform` in the vocabulary, and refuses to leave a VM with an empty tag set. |
 | `scripts/import-estate.py --site S [--from-dump F]` | Adopts a live estate: data files, Terraform import blocks, and the import manifest. `--dump-only` captures without converting. Never overwrites — writes `<name>.new` instead. |
-| `scripts/drift.sh STACK SITE` | Refresh-only plan, report to `reports/`. Exit 2 on drift. Never reverts, never writes `data/`. |
+| `scripts/drift.py watch\|changed\|mirror\|accept --site S` | Changes made in NSX outside the repository: find them (one API call), raise them as issues, accept one into `data/`. Never writes to NSX. |
+| `scripts/schedule.py tfvars\|desired\|switch\|report\|notify\|convert` | Rules on only at certain times: what is on now, the time follower's switches, expiry issues, and converting a Local Manager's time windows. |
+| `make guardrails` | The zero-trust guardrails: `guardrails/`, a Terraform root with no provider and no state, run offline. Fails on an enforced guardrail; warns on the rest. |
 | `scripts/enable-gitops.sh [--remote URL\|--local-gitlab]` | Puts an existing tree under version control and turns on the review pipeline. The migration path for anything set up without it. Refuses to commit if state or plan files are present. |
 | `scripts/gitlab-setup.sh --url U --token T --project G/N` | Makes a GitLab project ready: creates it (and the group), pushes, sets the CI variables with the apply token protected, protects the default branch, and creates the apply environments. Idempotent. Works against any GitLab; `gitlab-up.sh` calls it. `--dry-run` reports without changing anything. |
 | `scripts/gitlab-up.sh [--status\|--password\|--down\|--destroy]` | Brings up GitLab CE and a runner in Docker, creates the project, pushes, registers the runner, prints the initial root password. For teams without a GitLab. Not a production deployment. |
 | `scripts/gitlab-child-pipeline.py` | Emits the per-manager plan/apply jobs for GitLab from the inventory. Plans only on a merge request; plans plus **manual** applies on the default branch. |
 | `scripts/post-plan-comment.sh STACK SITE FILE` | Posts a rendered plan onto the merge request. Never posts the plan file itself. No-op outside an MR or without `CI_API_TOKEN`. |
-| `scripts/ci_matrix_lib.py` | The matrix itself, importable. `ci-matrix.py` and `gitlab-child-pipeline.py` both read it, so GitHub and GitLab cannot drift apart. |
+| `scripts/nsxlib/` | The library every script is a command line over: `inventory` (the run matrix, so GitHub and GitLab cannot drift apart), `model` (data/), `nsx` (reading NSX), `convert`, `adopt`, `drift`, `schedules`, `gitlab`, `yamlio`. |
 
-`scripts/validate-data.py` and `scripts/ci-matrix.py` need only Python 3.9+;
-PyYAML is used when importable and `scripts/yamlcompat.py` parses the committed
-subset when it is not.
+The scripts need Python 3.9+ and PyYAML (the CI image has both).
 
 ### Review pipeline
 

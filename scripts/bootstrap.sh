@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-VERSION="1.9.0"
+VERSION="2.0.0"
 
 ROOT="$PWD"
 FORCE=0
@@ -1146,7 +1146,6 @@ write_file .gitignore <<'SCAFFOLD_EOF'
 # Saved plans are sensitive artifacts, not review attachments.
 tfplan
 tfplan.site
-tfplan.refresh
 *.tfplan
 plan.json
 plan.txt
@@ -1225,11 +1224,16 @@ selftest: ## Prove the generator and validators work. Offline. Exits 1 on any fa
 	@scripts/selftest.sh
 
 .PHONY: validate
-validate: schema-validate fmt-check ## Run every offline check (no credentials, no network)
+validate: schema-validate guardrails fmt-check ## Run every offline check (no credentials, no network)
 
 .PHONY: schema-validate
 schema-validate: ## Validate everything under data/ and inventory/ against the schemas
 	@$(PYTHON) scripts/validate-data.py
+
+.PHONY: guardrails
+guardrails: ## Check every rule against the zero-trust guardrails (Terraform, offline)
+	@terraform -chdir=guardrails init -backend=false -input=false >/dev/null
+	@terraform -chdir=guardrails plan -input=false -lock=false
 
 .PHONY: fmt
 fmt: ## Rewrite all Terraform files in canonical format
@@ -1271,7 +1275,7 @@ hand-back: ## Stop managing one object, without deleting it: STACK=<stack> ADDRE
 
 .PHONY: drift
 drift: ## Report drift for STACK at SITE. Reports only — never reverts, never writes data/.
-	@scripts/with-credentials.sh "$(SITE)" -- scripts/drift.sh "$(STACK)" "$(SITE)"
+	@scripts/with-credentials.sh "$(SITE)" -- scripts/tf.sh drift "$(STACK)" "$(SITE)"
 
 .PHONY: init
 init: ## terraform init for STACK against SITE
@@ -1325,8 +1329,10 @@ write_file docs/GUARDRAILS.md <<'SCAFFOLD_EOF'
 
 ## Guardrails
 
-Every merge request is checked against `data/guardrails.yaml`
-(`scripts/validate-data.py`, the `data` job). The security team sets each
+Every merge request is checked against `data/guardrails.yaml` by Terraform
+itself: `guardrails/` is a root with no provider and no state, run offline by
+the `data` job (locally: `make guardrails`). The checks are HCL you can read:
+`guardrails/tests.tf` holds one line per guardrail. The security team sets each
 guardrail's level, estate-wide and per manager:
 
 | Guardrail | Default | Catches | NIST |
@@ -1343,8 +1349,9 @@ guardrail's level, estate-wide and per manager:
 | `no-default-deny` | warn | an Application policy whose last rule is not a DROP or REJECT | SP 800-207 tenet 6; 800-53 SC-7(5) |
 | `static-membership` | warn | a group of addresses or picked VMs | SP 800-207 tenet 4 |
 
-`enforce` fails the merge request; `warn` reports; `"off"` does not check
-(quote it: bare, YAML reads `off` as false). Per manager:
+`enforce` fails the plan, so the merge request; `warn` is a warning in the
+plan; `"off"` does not check (quote it: bare, YAML reads `off` as false). Per
+manager, where a rule is planned on several, the strictest level applies:
 
 ```yaml
 sites:
@@ -1368,9 +1375,9 @@ sites:
 Without an owner, a ticket or an expiry it is refused; once expired the rule
 fails again.
 
-**Rules adopted from NSX** are findings, whatever the level: counted per
-guardrail on every run (`--findings` lists them), a backlog to work down,
-never a failed pipeline. Taking the estate over changes nothing about it;
+**Rules adopted from NSX** are findings, whatever the level: the plan's
+`findings` output lists them per guardrail, a backlog to work down, never a
+failed pipeline. Taking the estate over changes nothing about it;
 improving it is a series of ordinary merge requests.
 
 Change `data/guardrails.yaml` through the security team: protect it with a
@@ -1388,7 +1395,7 @@ what NSX has and what the plan would set. Two ways out, both in a merge request:
   each object (one call each) and opens a merge request writing what NSX holds
   into data/, keeping what NSX does not hold (owner, sites, schedule,
   exception). Its plan changes nothing. Locally:
-  `scripts/with-credentials.sh lon1 -- scripts/accept-drift.py --site lon1 rule=app/r1`.
+  `scripts/with-credentials.sh lon1 -- scripts/drift.py accept --site lon1 rule=app/r1`.
 - **Undo it**: list the object in `allow-revert.txt` (`<site> <stack> <address>`,
   the line plan-guard prints) in the merge request; its apply puts data/ back.
   Remove the line once applied.
@@ -1445,9 +1452,8 @@ the estate.
 | `mirror` job, nothing modified since the last copy | its schedule | 1 search: the full read is skipped |
 | `mirror` job, something modified | its schedule, and nightly with `MIRROR_FULL=1` | 1 hierarchical read |
 | `schedule` job, no rule to switch | every 5 minutes | 0 |
-| A plan with `NSX_PLAN_REFRESH=changed` | each merge request | 0 reads; before the apply, 1 per object it changes |
-| A plan with refresh (the default) | each merge request | 1 per managed object |
-| `drift` job: Terraform's refresh-only plan | weekly is plenty, as a second opinion | 1 per managed object |
+| A plan (Terraform's own refresh) | each merge request | 1 per managed object |
+| `make drift STACK= SITE=`: Terraform's refresh-only plan, by hand | when in doubt, as a second opinion | 1 per managed object |
 
 Every script reports its NSX calls; above `NSX_API_BUDGET` per run (10 by
 default) it warns. One login per manager per run (a session), not credentials
@@ -1486,15 +1492,6 @@ start the watch the moment one arrives, at no API cost:
 
 The watch job runs on `trigger` pipelines too. Without a log destination the
 5-minute schedule does the same, later.
-
-## Cheaper plans
-
-`NSX_PLAN_REFRESH=changed` (a CI/CD variable) plans without reading NSX: the
-watch keeps NSX and data/ compared in the meantime. Before an apply,
-`scripts/revision-check.py` reads each object the plan changes and compares its
-NSX revision with the one Terraform last saw; one changed since means the
-apply is refused, with who changed it, and a plan with refresh is needed. Leave
-it at the default (`full`) until the watch has run clean for a while.
 
 ## Setting it up
 
@@ -1558,11 +1555,11 @@ blocks is allowed then.
   rule only, without reading anything else from NSX, and `plan-guard --schedule`
   refuses the plan unless the only change is rules' `disabled`. It uses the
   apply credential: the merge request that added the schedule was the approval.
-- **The drift check** knows the schedules. A scheduled rule switched on in NSX
+- **The change watch** knows the schedules. A scheduled rule switched on in NSX
   outside its schedule is raised as a `[HIGH]` issue, labelled `severity::high`:
-  access the schedule does not grant. One left off inside its schedule, or a
-  switch the follower missed (the job failed, GitLab was down), is raised too.
-  The follower corrects both at its next run.
+  access the schedule does not grant. One switched off inside its schedule is
+  raised too. A switch the follower missed (the job failed, GitLab was down) is
+  no change made in NSX: the follower makes it at its next run.
 - **Expiry**: the `schedule` job raises an `nsx-schedule` issue 7 days before a
   rule expires (`NSX_SCHEDULE_WARN_DAYS`), when it has expired (it is then
   disabled), and 14 days after (`NSX_SCHEDULE_GRACE_DAYS`): time to remove it
@@ -1579,7 +1576,7 @@ shows what would be on at any moment.
 ## Moving a Local Manager's time windows over
 
 ```bash
-scripts/with-credentials.sh lon1 -- scripts/convert-time-windows.py --site lon1
+scripts/with-credentials.sh lon1 -- scripts/schedule.py convert --site lon1
 ```
 
 Read-only, two NSX reads at most. It writes `reports/time-windows-lon1.md`: for
@@ -1787,13 +1784,10 @@ From then on, for that manager:
 - Imported objects keep the ids NSX gave them (`_h-app01`, spaces and all); a
   new object you write follows the naming convention, which the validator
   enforces.
-- **A change made in the UI is drift.** Schedule the `drift` job: *Build →
-  Pipeline schedules*, on the default branch, with `DRIFT_SITE` = `all` (every
-  manager in mode: managed) or one manager, every hour or so. It runs a
-  refresh-only plan per manager and stack with the read-only credential,
-  changes nothing, and raises each change as an `nsx-drift` issue, with who made
-  it and when, as in mirror mode. Either bring the change into `data/` in a
-  merge request, or the next apply puts NSX back to the repository.
+- **A change made in the UI is drift.** The `watch` job finds it (every few
+  minutes, one API call; docs/WATCH.md) and raises it as an `nsx-drift` issue,
+  with who made it and when. Keep it (the `accept` job) or revert it on purpose
+  (allow-revert.txt); until then no apply undoes it.
 
 ## 1. Capture, read-only
 
@@ -1964,8 +1958,8 @@ policy also needs its `prevent_destroy` lifted in a reviewed commit.
 
 - `bootstrap.sh` will not overwrite estate data with `--force`, and refuses
   outright, even with `--force-data`, anything in `data/.import-manifest.json`.
-- Drift detection is read-only: `scripts/drift.sh` writes a report and never
-  writes back into `data/`. Drift is a ticket for a human.
+- Drift detection is read-only: the watch job raises an issue and never writes
+  back into `data/`. Drift is a ticket for a human.
 
 ## Adding a rule after importing
 
@@ -2023,6 +2017,26 @@ Groups are selected by tag, so membership follows the workload instead of being
 maintained by hand. Tags come either from your provisioning system or from
 `data/vm-tags/` — `docs/TAGGING.md` covers the choice.
 
+## How it works, at a glance
+
+```
+  data/*.yaml ──► validate-data.py ──► guardrails/ ──► plan ──► plan-guard ──► apply
+  (reviewed)      structure, refs      zero trust,     one per    no destroy,     manual,
+                                       NIST (HCL)      manager    no silent       the saved
+                                                                  revert          plan
+
+  NSX ──► drift.py watch ──► issue ──► accept (data/ takes NSX's)  or  allow-revert.txt
+          one API call                  scripts/drift.py accept         the next apply undoes it
+```
+
+Terraform does what Terraform can: the objects (`modules/`, `stacks/`), the
+zero-trust guardrails (`guardrails/`, offline, no provider). Python does what it
+cannot, and only that: reading an estate that already exists into data/
+(`import-estate.py`), finding changes made in NSX (`drift.py`), time windows
+(`schedule.py`), and the review gates around a plan (`plan-guard.py`,
+`change-control.py`). Every script is a command line over one library,
+`scripts/nsxlib/`, whose `__init__.py` is its map.
+
 ## Layout
 
 | Path | Holds |
@@ -2030,9 +2044,12 @@ maintained by hand. Tags come either from your provisioning system or from
 | `inventory/managers.yaml` | Every GM and LM. Adding a manager is a data change. |
 | `data/` | Groups, policies, services, per-site network/platform, VM tags. |
 | `data/schema/` | JSON Schema and the tag vocabulary. Enforced in CI. |
+| `data/guardrails.yaml` | The zero-trust guardrails' levels, set by the security team. |
 | `modules/` | One module per NSX object kind. `for_each`, never `count`. |
 | `stacks/` | One root module per state boundary, run once per manager. |
-| `scripts/` | Validation, CI matrix, credentials, import, rule and tag edits. |
+| `guardrails/` | The guardrails themselves: Terraform with no provider, run offline on every merge request. |
+| `scripts/` | Command lines: validation, import, drift, schedules, the pipeline's gates. |
+| `scripts/nsxlib/` | The library they are built on. |
 
 Five stacks, split by change cadence and blast radius so a daily rule edit never
 refreshes a transport zone:
@@ -2595,7 +2612,7 @@ jobs as a child pipeline. Adding an eleventh Local Manager stays a data change:
 add it to the inventory, and its plan job appears on the next merge request.
 
 GitHub Actions does the same thing with `scripts/ci-matrix.py --format github`.
-Both read the same `scripts/ci_matrix_lib.py`, so the two platforms cannot drift
+Both read the same `scripts/nsxlib/inventory.py`, so the two platforms cannot drift
 apart.
 
 ## Change control: two approvals before anything reaches NSX
@@ -2919,7 +2936,11 @@ data/
   platform/                Per-site T0, transport zones, edge clusters.
   vm-tags/                 Per-site VM tag assignments. Terraform owns the whole
                            tag set of every VM listed — read docs/TAGGING.md.
+  exclude-list/            Per-site DFW exclusion list: groups that bypass the DFW.
   schema/                  JSON Schema + the tag scope vocabulary. Enforced in CI.
+  guardrails.yaml          The zero-trust guardrails' levels (security team's).
+guardrails/                The guardrails themselves, in Terraform: no provider,
+                           no state, run offline on every merge request.
 modules/
   dfw-policy/              Parent policy + standalone rules, built from data.
   group/                   Groups with tag criteria or static membership.
@@ -2935,8 +2956,10 @@ stacks/
   local-network/           Per-LM: segments, T1s. One state per LM.
   platform/                Per-LM: T0, transport zones, edge clusters.
 envs/<site>.backend.hcl    Partial backend config, one file per manager.
-scripts/                   Bootstrap, validation, CI matrix, credential handling,
-                           estate import, rule and tag edits, GitOps setup.
+scripts/                   Command lines: validation, import, drift, schedules,
+                           the pipeline's gates, credentials, GitOps setup.
+  nsxlib/                  The library every script is built on. Its
+                           __init__.py is the map.
 deploy/gitlab/             A local GitLab in Docker, for teams without one.
                            Not a production deployment.
 .gitlab-ci.yml             MR -> validate -> plan -> approve -> merge -> apply.
@@ -4303,10 +4326,10 @@ resource "nsxt_policy_security_policy_rule" "this" {
   ip_version      = try(each.value.ip_version, "IPV4_IPV6")
   # A scheduled rule is off outside its windows and once it expires: scripts/
   # schedule.py works that out at plan time, the same on a GM and an LM.
-  disabled        = try(each.value.disabled, false) || contains(var.rules_off, each.key)
-  logged          = try(each.value.logged, true)
-  notes           = try(each.value.notes, null)
-  log_label       = try(each.value.log_label, null)
+  disabled  = try(each.value.disabled, false) || contains(var.rules_off, each.key)
+  logged    = try(each.value.logged, true)
+  notes     = try(each.value.notes, null)
+  log_label = try(each.value.log_label, null)
 
   source_groups         = local.rule_sources[each.key]
   destination_groups    = local.rule_destinations[each.key]
@@ -6046,17 +6069,7 @@ plan)
 	ensure_init
 	rm -f "$plan_file" "$plan_site_file"
 	schedule_vars
-	# NSX_PLAN_REFRESH=changed: no refresh, so a plan costs no NSX read per
-	# managed object. The change watch keeps NSX and data/ compared meanwhile,
-	# and the apply checks each object it changes first (revision-check.py).
-	refresh=()
-	if [ "${NSX_PLAN_REFRESH:-full}" = changed ]; then
-		refresh=(-refresh=false)
-		printf 'changed\n' >"$plan_file.refresh"
-	else
-		rm -f "$plan_file.refresh"
-	fi
-	run plan -out=tfplan -parallelism="$PARALLELISM" -input=false ${refresh[@]+"${refresh[@]}"} "$@"
+	run plan -out=tfplan -parallelism="$PARALLELISM" -input=false "$@"
 	printf '%s\n' "$site" >"$plan_site_file"
 	echo
 	if ! guard; then
@@ -6116,15 +6129,8 @@ apply)
 		echo "error: stack $stack is still on the placeholder local backend. State carries the security posture of the estate and needs a remote, encrypted, locked backend before any real apply. Set ALLOW_LOCAL_STATE=1 only for a lab." >&2
 		exit 1
 	fi
-	# A plan made without refresh: what it changes must not have changed in NSX
-	# since Terraform last read it. One read per object it changes.
-	if [ -f "$plan_file.refresh" ]; then
-		if ! (cd "$stack_dir" && terraform show -json tfplan) | python3 "$REPO_ROOT/scripts/revision-check.py" --site "$site"; then
-			exit 2
-		fi
-	fi
 	run apply -parallelism="$PARALLELISM" -input=false tfplan
-	rm -f "$plan_file" "$plan_site_file" "$plan_file.refresh"
+	rm -f "$plan_file" "$plan_site_file"
 	;;
 follow)
 	# The time follower: switch the scheduled rules whose schedule changed since
@@ -6171,22 +6177,11 @@ follow)
 	rm -f "$plan_file" "$plan_site_file"
 	;;
 drift)
-	# Refresh-only: state against the live manager. Proposes nothing and
-	# changes nothing; never touches the reviewed tfplan. With DRIFT_JSON set,
-	# the plan is also written there as JSON. Exit 0 no drift, 2 drift.
+	# Refresh-only: state against the live manager, by hand. Proposes nothing,
+	# changes nothing, never touches the reviewed tfplan. Exit 0 no drift, 2 drift.
 	ensure_init
 	schedule_vars
-	set +e
-	run plan -refresh-only -detailed-exitcode -input=false -out=drift.tfplan "$@"
-	status=$?
-	set -e
-	# The JSON is wanted with no drift too: a scheduled rule left in the wrong
-	# state by a missed switch is not drift between state and NSX.
-	if { [ "$status" = 2 ] || [ "$status" = 0 ]; } && [ -n "${DRIFT_JSON:-}" ]; then
-		run show -json drift.tfplan >"$DRIFT_JSON" || status=1
-	fi
-	rm -f "$stack_dir/drift.tfplan"
-	exit "$status"
+	run plan -refresh-only -detailed-exitcode -input=false "$@"
 	;;
 *)
 	usage 1
@@ -6438,98 +6433,6 @@ exec "$@"
 SCAFFOLD_EOF
 mark_executable scripts/with-credentials.sh
 
-write_file scripts/ci_matrix_lib.py <<'SCAFFOLD_EOF'
-"""The run matrix, derived from inventory/managers.yaml.
-
-Importable, unlike scripts/ci-matrix.py, whose hyphen keeps it out of reach of
-an import statement. Everything that needs to know which stacks run against
-which managers comes through here, so there is one definition and not three:
-scripts/ci-matrix.py for humans and GitHub Actions, and
-scripts/gitlab-child-pipeline.py for GitLab.
-"""
-
-from __future__ import annotations
-
-import os
-import re
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from yamlcompat import load_yaml  # noqa: E402
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-INVENTORY = REPO_ROOT / "inventory" / "managers.yaml"
-MODES = ("managed", "mirror", "hybrid")
-
-
-def mode_of(name: str, manager: dict) -> str:
-    """managed, mirror or hybrid, from the manager's mode in
-    inventory/managers.yaml only: changing it is a reviewed merge request, like
-    any other change. hybrid: managed, with the objects not yet cut over still
-    mirrored from the UI (scripts/cutover.sh with CUTOVER_POLICY)."""
-    mode = manager.get("mode", "managed")
-    if mode not in MODES:
-        sys.exit(f"error: {name}: mode {mode!r} in inventory/managers.yaml must be one of: {', '.join(MODES)}")
-    return mode
-
-# A Global Manager has no VM inventory and no local networking, so local-tags,
-# local-network and platform are Local Manager stacks only.
-GM_STACKS = ["global-security"]
-LM_STACKS = ["local-security", "local-tags", "local-network", "platform"]
-
-
-def misnamed_variables() -> list[tuple[str, str]]:
-    """NSX_* variables set with lower-case letters, and the name they should
-    have. Variable names are case-sensitive and every one these scripts read
-    is upper-case, so NSX_CA_FILE_hyd_gm01 is simply never seen."""
-    return sorted((k, k.upper()) for k in os.environ if k[:4].upper() == "NSX_" and k != k.upper())
-
-
-def managers(strict: bool = True) -> dict:
-    # A manager's mode once had a CI/CD variable too (1.3.0). It is read from
-    # the inventory only now; a leftover variable must not look like it works.
-    stale = sorted(k for k in os.environ if k.upper().startswith("NSX_MODE_"))
-    if stale:
-        sys.exit("error: a manager's mode comes from inventory/managers.yaml only (mode: mirror), not from "
-                 "CI/CD variables. Delete these variables and set the mode there, in a merge request:\n"
-                 + "\n".join(f"  {k}" for k in stale))
-    wrong = misnamed_variables()
-    if wrong:
-        sys.exit("error: these CI/CD variables are never read, because names are case-sensitive:\n"
-                 + "\n".join(f"  {k}  ->  rename it to {u}" for k, u in wrong))
-    if not INVENTORY.exists():
-        if strict:
-            sys.exit(f"error: {INVENTORY} does not exist")
-        return {}
-    doc = load_yaml(INVENTORY.read_text()) or {}
-    return doc.get("managers") or {}
-
-
-def entries(stack_filter: str | None = None, strict: bool = False) -> list[dict]:
-    out = []
-    for name, m in sorted(managers(strict=strict).items()):
-        if m.get("enabled") is False:
-            continue
-        role = m.get("role", "lm")
-        allowed = m.get("stacks") or (GM_STACKS if role == "gm" else LM_STACKS)
-        for stack in allowed:
-            if stack_filter and stack != stack_filter:
-                continue
-            out.append(
-                {
-                    "site": name,
-                    "stack": stack,
-                    "role": role,
-                    "host": m.get("host", ""),
-                    "tier": m.get("tier", ""),
-                    "vcf_instance": m.get("vcf_instance", ""),
-                    "mode": mode_of(name, m),
-                }
-            )
-    return out
-SCAFFOLD_EOF
-
 write_file scripts/ci-matrix.py <<'SCAFFOLD_EOF'
 #!/usr/bin/env python3
 """Derive the run matrix from inventory/managers.yaml.
@@ -6552,7 +6455,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ci_matrix_lib import entries, managers, mode_of  # noqa: E402
+from nsxlib.inventory import entries, managers, mode_of  # noqa: E402
 
 
 def export(site: str) -> int:
@@ -6607,456 +6510,131 @@ if __name__ == "__main__":
 SCAFFOLD_EOF
 mark_executable scripts/ci-matrix.py
 
-write_file scripts/yamlcompat.py <<'SCAFFOLD_EOF'
-"""YAML loading with no mandatory third-party dependency.
+write_file scripts/nsxlib/__init__.py <<'SCAFFOLD_EOF'
+"""The library every script in scripts/ is built on. Each script is a command
+line over these; none holds logic another needs.
 
-In order of preference:
+  yamlio      YAML in (PyYAML) and out (one stable emitter)
+  inventory   inventory/managers.yaml: managers, roles, modes, the run matrix
+  model       data/: files, keys, identities, what one manager should hold
+  nsx         reading NSX: one client, one session, every call counted
+  convert     an NSX object written as a data/ entry
+  adopt       what of an estate data/ may take over, and why the rest may not
+  drift       changes made in NSX outside the repository, and their issue
+  schedules   rules that are on only at certain times
+  gitlab      issues, merge requests and branches, from a pipeline job
 
-  1. PyYAML, when it is importable (the CI image has it).
-  2. Terraform's own yamldecode, when terraform is on PATH: a full YAML parser,
-     and the one the stacks use, so what validates here is what Terraform reads.
-     Many documents are decoded in one terraform call (load_all), and the data
-     files of this repository are all decoded on the first call.
-  3. A reader for the subset of YAML this repository writes: block mappings,
-     block and flow sequences, quoted and plain scalars, block scalars, comments.
+Only reads NSX. Writing to NSX is Terraform's job.
+"""
+SCAFFOLD_EOF
 
-NSX_YAML_FALLBACK=1 skips PyYAML, as on an image without it.
+write_file scripts/nsxlib/yamlio.py <<'SCAFFOLD_EOF'
+"""YAML in and out.
+
+Reading is PyYAML's (the CI image has it; elsewhere: pip install pyyaml).
+Writing is this small emitter, so a file written twice from the same data is
+byte-identical, diffs line by line, and reads the same in PyYAML and in
+Terraform's yamldecode (which still reads YAML 1.1's y/n/on/off as booleans).
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
-import os
-import re
-import shutil
-import subprocess
-import tempfile
-from pathlib import Path
+import sys
 from typing import Any
 
-try:  # pragma: no cover - environment dependent
-    import yaml as _pyyaml
-except ImportError:  # pragma: no cover
-    _pyyaml = None
-
-
-def reader() -> str:
-    """Which reader load_yaml uses here: pyyaml, terraform or subset."""
-    if _pyyaml is not None and os.environ.get("NSX_YAML_FALLBACK") != "1":
-        return "pyyaml"
-    if shutil.which("terraform") and os.environ.get("NSX_YAML_NO_TERRAFORM") != "1" and not _TERRAFORM_BROKEN:
-        return "terraform"
-    return "subset"
+try:
+    import yaml
+except ImportError:  # pragma: no cover - environment dependent
+    sys.exit("error: PyYAML is needed: pip install pyyaml (the CI image has it)")
 
 
 def load_yaml(text: str) -> Any:
-    return load_all([text])[0]
+    return yaml.safe_load(text)
 
 
-def load_all(texts: list[str]) -> list[Any]:
-    """Several documents at once: one terraform call where terraform reads them."""
-    how = reader()
-    if how == "pyyaml":
-        return [_pyyaml.safe_load(t) for t in texts]
-    if how == "subset":
-        return [_Parser(t).parse() for t in texts]
-    try:
-        return _load_with_terraform(texts)
-    except _Unusable:
-        # terraform is there but does not decode (a wrapper, a broken install):
-        # the subset reader instead, never a false "not valid YAML".
-        _TERRAFORM_BROKEN.append(True)
-        return [_Parser(t).parse() for t in texts]
+NEEDS_QUOTE = set(":{}[],&*#?|-<>=!%@`\"'")
 
 
-class _Unusable(Exception):
-    pass
-
-
-_TERRAFORM_BROKEN: list[bool] = []
-
-
-def _load_with_terraform(texts: list[str]) -> list[Any]:
-    if not _PRELOADED:
-        _PRELOADED.append(True)
-        root = Path(__file__).resolve().parent.parent
-        _decode([p.read_text() for d in ("data", "inventory") for p in sorted((root / d).rglob("*.yaml"))])
-    _decode([t for t in texts if _key(t) not in _DECODED])
-    out = []
-    for t in texts:
-        value = _DECODED[_key(t)]
-        if isinstance(value, YamlError):
-            raise value
-        out.append(value)
-    return out
-
-
-class YamlError(ValueError):
-    pass
-
-
-_DECODED: dict[str, Any] = {}
-_PRELOADED: list[bool] = []
-
-
-def _key(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()
-
-
-def _decode(texts: list[str]) -> None:
-    """Decode with terraform's yamldecode, all in one call; on a failure, file by
-    file, so each bad document gets its own error."""
-    todo = list(dict.fromkeys(t for t in texts if _key(t) not in _DECODED))
-    if not todo:
-        return
-    values = _terraform(todo)
-    if values is None:
-        if len(todo) == 1:
-            _DECODED[_key(todo[0])] = YamlError(_LAST_ERROR[0] or "not valid YAML")
-            return
-        for t in todo:
-            _decode([t])
-        return
-    for t, v in zip(todo, values):
-        _DECODED[_key(t)] = v
-
-
-_LAST_ERROR: list[str] = [""]
-
-
-def _terraform(texts: list[str]) -> list[Any] | None:
-    with tempfile.TemporaryDirectory() as work:
-        for i, t in enumerate(texts):
-            Path(work, f"{i:08d}.yaml").write_text(t)
-        # fileset, not range(): range stops at 1024 values. Its order is the
-        # files' names, which the zero padding makes the texts' order.
-        expression = 'jsonencode([for f in sort(fileset(path.cwd, "*.yaml")) : yamldecode(file("${path.cwd}/${f}"))])'
-        env = {k: v for k, v in os.environ.items() if not k.startswith("TF_CLI_ARGS")}
-        env.update(CHECKPOINT_DISABLE="1", TF_IN_AUTOMATION="1")
-        run = subprocess.run(["terraform", "console"], input=expression, cwd=work, env=env,
-                             capture_output=True, text=True)
-    if run.returncode != 0:
-        # Terraform frames its message in box-drawing characters and wraps it.
-        detail = re.sub(r"\x1b\[[0-9;]*m", "", run.stderr)
-        detail = " ".join(re.sub(r"[│╷╵]", " ", detail).split())
-        found = re.search(r'Call to function "(yamldecode|jsonencode)" failed: (.*?)(?:\.\s|\.$|$)', detail)
-        if not found:
-            raise _Unusable(detail)  # not about a document: terraform itself is unusable
-        # A document that is not YAML, or holds what Terraform cannot carry (.inf, .nan).
-        _LAST_ERROR[0] = found.group(2).strip() or "not valid YAML"
-        return None
-    literal = run.stdout.strip()
-    # The console prints an HCL string: JSON's escapes, plus $${ and %%{.
-    try:
-        values = json.loads(json.loads(literal.replace("$${", "${").replace("%%{", "%{")))
-    except ValueError as exc:
-        raise _Unusable(literal[:200]) from exc
-    if not isinstance(values, list) or len(values) != len(texts):
-        raise _Unusable(literal[:200])
-    return values
-
-
-_INT = re.compile(r"^[+-]?\d+$")
-_FLOAT = re.compile(r"^[+-]?(\d+\.\d*|\.\d+)([eE][+-]?\d+)?$")
-
-
-class _Parser:
-    def __init__(self, text: str) -> None:
-        self.lines: list[tuple[int, str, int]] = []
-        for lineno, raw in enumerate(text.splitlines(), 1):
-            self.lines.append((_indent(raw), raw, lineno))
-        self.raw_text = text
-        self.pos = 0
-
-    # -- line helpers ------------------------------------------------------
-    def _skip(self) -> None:
-        while self.pos < len(self.lines):
-            _, raw, _ = self.lines[self.pos]
-            stripped = raw.strip()
-            if not stripped or stripped.startswith("#") or stripped in ("---", "..."):
-                self.pos += 1
-            else:
-                return
-
-    def _peek(self):
-        self._skip()
-        if self.pos >= len(self.lines):
-            return None
-        return self.lines[self.pos]
-
-    def parse(self) -> Any:
-        value = self._parse_block(0)
-        self._skip()
-        if self.pos < len(self.lines):
-            _, raw, lineno = self.lines[self.pos]
-            raise YamlError(f"line {lineno}: unexpected content {raw.strip()!r}")
-        return value
-
-    def _parse_block(self, indent: int) -> Any:
-        entry = self._peek()
-        if entry is None:
-            return None
-        cur_indent, raw, _ = entry
-        if cur_indent < indent:
-            return None
-        if raw.strip().startswith("- "):
-            return self._parse_sequence(cur_indent)
-        if raw.strip() == "-":
-            return self._parse_sequence(cur_indent)
-        return self._parse_mapping(cur_indent)
-
-    def _parse_mapping(self, indent: int) -> dict:
-        result: dict[str, Any] = {}
-        while True:
-            entry = self._peek()
-            if entry is None:
-                break
-            cur_indent, raw, lineno = entry
-            if cur_indent < indent:
-                break
-            if cur_indent > indent:
-                raise YamlError(f"line {lineno}: unexpected indentation")
-            content = _strip_comment(raw.strip())
-            if content.startswith("- "):
-                break
-            key, sep, rest = _split_key(content)
-            if not sep:
-                raise YamlError(f"line {lineno}: expected 'key: value', got {content!r}")
-            self.pos += 1
-            result[key] = self._parse_value(rest.strip(), indent, lineno)
-        return result
-
-    def _parse_sequence(self, indent: int) -> list:
-        items: list[Any] = []
-        while True:
-            entry = self._peek()
-            if entry is None:
-                break
-            cur_indent, raw, lineno = entry
-            if cur_indent < indent:
-                break
-            content = _strip_comment(raw.strip())
-            if not content.startswith("-"):
-                break
-            if cur_indent > indent:
-                raise YamlError(f"line {lineno}: unexpected indentation in sequence")
-            rest = content[1:].strip()
-            self.pos += 1
-            if not rest:
-                items.append(self._parse_block(indent + 1))
-                continue
-            key, sep, tail = _split_key(rest)
-            if sep:
-                # Inline mapping start: '- key: value', continuation lines are
-                # indented past the dash.
-                item: dict[str, Any] = {}
-                item[key] = self._parse_value(tail.strip(), cur_indent + 2, lineno)
-                nested = self._peek()
-                if nested is not None and nested[0] > cur_indent:
-                    item.update(self._parse_mapping(nested[0]))
-                items.append(item)
-            else:
-                items.append(_scalar(rest))
-        return items
-
-    def _parse_value(self, rest: str, indent: int, lineno: int) -> Any:
-        if rest in ("|", "|-", "|+", ">", ">-", ">+"):
-            return self._parse_block_scalar(rest, indent)
-        if rest == "":
-            entry = self._peek()
-            if entry is None or entry[0] < indent:
-                return None
-            if entry[0] == indent:
-                # A sequence may sit at its key's own indent ("key:" then "- x"),
-                # as many editors and PyYAML write it.
-                content = entry[1].strip()
-                if content == "-" or content.startswith("- "):
-                    return self._parse_sequence(indent)
-                return None
-            return self._parse_block(entry[0])
-        return _scalar(rest)
-
-    def _parse_block_scalar(self, marker: str, indent: int) -> str:
-        collected: list[str] = []
-        block_indent = None
-        while self.pos < len(self.lines):
-            cur_indent, raw, _ = self.lines[self.pos]
-            if raw.strip() == "":
-                collected.append("")
-                self.pos += 1
-                continue
-            if cur_indent <= indent:
-                break
-            if block_indent is None:
-                block_indent = cur_indent
-            collected.append(raw[block_indent:])
-            self.pos += 1
-        while collected and collected[-1] == "":
-            collected.pop()
-        if marker.startswith("|"):
-            text = "\n".join(collected)
-        else:
-            folded: list[str] = []
-            for line in collected:
-                if line == "":
-                    folded.append("\n")
-                elif folded and folded[-1] not in ("", "\n"):
-                    folded[-1] = folded[-1] + " " + line
-                else:
-                    folded.append(line)
-            text = "".join(p if p == "\n" else p for p in folded)
-        if marker.endswith("-"):
-            return text
-        return text + "\n"
-
-
-def _indent(raw: str) -> int:
-    return len(raw) - len(raw.lstrip(" "))
-
-
-def _outside_quotes(text: str) -> list[bool]:
-    """For each character: True when it is outside a quoted scalar.
-
-    As in YAML, a quote opens a quoted scalar only where a scalar starts: at the
-    beginning, or after a space, '[', '{' or ','. Mid-word it is an ordinary
-    character, so a name like Azure-AD-IP's is a plain scalar. Inside '...' a
-    doubled '' is a quote; inside "..." a backslash escapes the next character.
-    """
-    out: list[bool] = []
-    quote = None
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        if quote == "'":
-            out.append(False)
-            if ch == "'":
-                if i + 1 < len(text) and text[i + 1] == "'":
-                    out.append(False)
-                    i += 2
-                    continue
-                quote = None
-        elif quote == '"':
-            out.append(False)
-            if ch == "\\" and i + 1 < len(text):
-                out.append(False)
-                i += 2
-                continue
-            if ch == '"':
-                quote = None
-        elif ch in "'\"" and (i == 0 or text[i - 1] in " \t[{,"):
-            quote = ch
-            out.append(False)
-        else:
-            out.append(True)
-        i += 1
-    return out
-
-
-def _strip_comment(text: str) -> str:
-    outside = _outside_quotes(text)
-    for i, ch in enumerate(text):
-        if ch == "#" and outside[i] and (i == 0 or text[i - 1] in " \t"):
-            return text[:i].rstrip()
-    return text.rstrip()
-
-
-def _split_key(text: str) -> tuple[str, bool, str]:
-    # A colon only separates a key when it is outside quotes and outside any
-    # [...] or {...}: '- { scope: workload, tag: x }' is one flow mapping, not
-    # a mapping whose first key is '{ scope'.
-    outside = _outside_quotes(text)
-    depth = 0
-    for i, ch in enumerate(text):
-        if not outside[i]:
-            continue
-        if ch in "[{":
-            depth += 1
-        elif ch in "]}":
-            depth -= 1
-        elif depth == 0 and ch == ":" and (i + 1 == len(text) or text[i + 1] in " \t"):
-            return _unquote(text[:i].strip()), True, text[i + 1 :]
-    return text, False, ""
-
-
-def _unquote(text: str) -> str:
-    """A quoted scalar's value: '' is ' in single quotes; escapes in double quotes."""
-    if len(text) >= 2 and text[0] == text[-1] == "'":
-        return text[1:-1].replace("''", "'")
-    if len(text) >= 2 and text[0] == text[-1] == '"':
-        body, out, i = text[1:-1], [], 0
-        simple = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", "\\": "\\", '"': '"', "/": "/", " ": " "}
-        while i < len(body):
-            ch = body[i]
-            if ch == "\\" and i + 1 < len(body):
-                nxt = body[i + 1]
-                if nxt in simple:
-                    out.append(simple[nxt])
-                    i += 2
-                    continue
-                if nxt in "xuU":
-                    width = {"x": 2, "u": 4, "U": 8}[nxt]
-                    out.append(chr(int(body[i + 2 : i + 2 + width], 16)))
-                    i += 2 + width
-                    continue
-            out.append(ch)
-            i += 1
-        return "".join(out)
+def scalar(value) -> str:
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return "null"
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value)
+    if (
+        text == ""
+        or text[0] in NEEDS_QUOTE
+        or text.strip() != text
+        # YAML 1.1 booleans too (y, n), which Terraform's yamldecode still reads as such.
+        or text.lower() in ("true", "false", "null", "yes", "no", "on", "off", "~", "y", "n")
+        or any(c in text for c in ":#'\"\\,[]{}")  # also safe inside a [flow, list]
+        or any(ord(c) < 32 or ord(c) == 127 for c in text)
+        or _looks_numeric(text)
+    ):
+        return '"' + "".join(_ESCAPES.get(c) or (f"\\x{ord(c):02x}" if ord(c) < 32 or ord(c) == 127 else c)
+                             for c in text) + '"'
     return text
 
 
-def _scalar(text: str) -> Any:
-    text = text.strip()
-    if text.startswith("[") and text.endswith("]"):
-        inner = text[1:-1].strip()
-        if not inner:
-            return []
-        return [_scalar(p) for p in _split_flow(inner)]
-    if text.startswith("{") and text.endswith("}"):
-        inner = text[1:-1].strip()
-        if not inner:
-            return {}
-        out = {}
-        for part in _split_flow(inner):
-            key, sep, value = _split_key(part)
-            if not sep:
-                raise YamlError(f"bad flow mapping entry: {part!r}")
-            out[key] = _scalar(value)
-        return out
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
-        return _unquote(text)
-    lowered = text.lower()
-    if lowered in ("true", "yes", "on"):
+# Double-quoted YAML: these characters are written escaped, anything else as is.
+_ESCAPES = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\t": "\\t", "\r": "\\r"}
+
+
+def key(value) -> str:
+    """A mapping key, quoted like any value when it needs to be: NSX ids can be
+    anything but '/' (Azure-AD-IP's, 'WIN11 IC', 100, -x, @y)."""
+    return scalar(str(value))
+
+
+def _looks_numeric(text: str) -> bool:
+    try:
+        float(text)
         return True
-    if lowered in ("false", "no", "off"):
+    except ValueError:
         return False
-    if lowered in ("null", "~", ""):
-        return None
-    if _INT.match(text):
-        return int(text)
-    if _FLOAT.match(text):
-        return float(text)
-    return text
 
 
-def _split_flow(text: str) -> list[str]:
-    outside = _outside_quotes(text)
-    parts: list[str] = []
-    depth = 0
-    current: list[str] = []
-    for i, ch in enumerate(text):
-        if outside[i] and ch in "[{":
-            depth += 1
-        elif outside[i] and ch in "]}":
-            depth -= 1
-        elif outside[i] and ch == "," and depth == 0:
-            parts.append("".join(current).strip())
-            current = []
-            continue
-        current.append(ch)
-    if current:
-        parts.append("".join(current).strip())
-    return [p for p in parts if p]
+def emit(value, indent: int = 0) -> list[str]:
+    pad = "  " * indent
+    lines: list[str] = []
+    if isinstance(value, dict):
+        for name, item in value.items():
+            if isinstance(item, dict) and item:
+                lines.append(f"{pad}{key(name)}:")
+                lines.extend(emit(item, indent + 1))
+            elif isinstance(item, list) and item:
+                flow = f"{pad}{key(name)}: [{', '.join(scalar(x) for x in item)}]"
+                if all(not isinstance(x, (dict, list)) for x in item) and len(item) <= 4 and len(flow) <= 100:
+                    lines.append(flow)
+                elif all(not isinstance(x, (dict, list)) for x in item):
+                    # One member per line: a long list is read, and diffed, line by line.
+                    lines.append(f"{pad}{key(name)}:")
+                    lines.extend(f"{pad}  - {scalar(x)}" for x in item)
+                else:
+                    lines.append(f"{pad}{key(name)}:")
+                    lines.extend(emit(item, indent + 1))
+            elif isinstance(item, (dict, list)):
+                lines.append(f"{pad}{key(name)}: {{}}" if isinstance(item, dict) else f"{pad}{key(name)}: []")
+            else:
+                lines.append(f"{pad}{key(name)}: {scalar(item)}")
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                rendered = emit(item, indent + 1)
+                first = rendered[0].lstrip()
+                lines.append(f"{pad}- {first}")
+                lines.extend(rendered[1:])
+            else:
+                lines.append(f"{pad}- {scalar(item)}")
+    return lines
+
+
+def to_yaml(value) -> str:
+    return "\n".join(emit(value)) + "\n"
 SCAFFOLD_EOF
 
 write_file scripts/validate-data.py <<'SCAFFOLD_EOF'
@@ -7076,6 +6654,8 @@ Two layers:
     that every tag scope is in the vocabulary, that no raw policy path or secret
     has been pasted into a data file.
 
+The zero-trust guardrails are checked by Terraform itself: guardrails/.
+
   scripts/validate-data.py           # errors fail, warnings are printed
   scripts/validate-data.py --strict  # warnings fail too
 """
@@ -7083,30 +6663,17 @@ Two layers:
 from __future__ import annotations
 
 import argparse
-import ipaddress
 import json
-import os
 import re
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from yamlcompat import load_yaml  # noqa: E402
+from nsxlib.convert import is_ip_literal  # noqa: E402
+from nsxlib.schedules import problems as schedule_problems  # noqa: E402
+from nsxlib.yamlio import load_yaml  # noqa: E402
 
-
-def is_ip_literal(value: str) -> bool:
-    """An address, CIDR or range (a-b, or a - b as the NSX UI writes it), as NSX
-    takes in a rule's source or destination."""
-    parts = value.split("-", 1)
-    if parts[0] != parts[0].lstrip() or parts[-1] != parts[-1].rstrip():
-        return False
-    try:
-        for part in parts:
-            ipaddress.ip_network(part.strip(), strict=False)
-        return True
-    except ValueError:
-        return False
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA = REPO_ROOT / "data"
@@ -7381,19 +6948,6 @@ def check_inventory(report: Report) -> dict:
             report.warn(where, f"{name}: no envs/{name}.backend.hcl — nothing can initialise for this manager.")
 
     return managers
-
-
-def schedule_problems(schedule) -> list[str]:
-    """scripts/schedule.py's own check, so a schedule that validates is one the
-    pipeline can enforce."""
-    import importlib.util  # noqa: PLC0415
-
-    spec = importlib.util.spec_from_file_location("nsx_schedule", Path(__file__).resolve().parent / "schedule.py")
-    if spec is None or spec.loader is None:
-        return ["scripts/schedule.py is missing: bring the tree up to date"]
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.problems(schedule)
 
 
 def as_date(value) -> date:
@@ -7803,218 +7357,25 @@ def check_policies(
                 report.warn(where, f"{label}: neither source nor destination is set — this matches everything in scope.")
 
 
-# --------------------------------------------------------------------------
-# Zero-trust guardrails (data/guardrails.yaml)
-# --------------------------------------------------------------------------
-
-GUARDRAILS_FILE = DATA / "guardrails.yaml"
-# id -> (default level, NIST reference, what it means)
-GUARDRAILS = {
-    "any-any-any": ("enforce", "SP 800-207 tenet 3; 800-53 AC-3, AC-6",
-                    "an ALLOW from any source to any destination on any service"),
-    "any-service": ("warn", "800-53 AC-6", "an ALLOW on any service: name the ports"),
-    "any-source": ("warn", "800-53 AC-6", "an ALLOW from any source"),
-    "any-destination": ("warn", "800-53 AC-6", "an ALLOW to any destination"),
-    "dfw-wide-allow": ("warn", "800-53 SC-7(5)", "an ALLOW applied to every workload (Apply To ANY, in rule and policy)"),
-    "ip-literals": ("warn", "SP 800-207 tenet 4", "addresses in a rule: workloads are named by attributes (tags), not addresses"),
-    "deny-not-logged": ("warn", "800-53 AU-2, AU-12", "a DROP or REJECT with logging off"),
-    "allow-not-logged": ("off", "800-53 AU-2, AU-12", "an ALLOW with logging off"),
-    "prod-nonprod": ("enforce", "800-53 SC-7, AC-4", "an ALLOW between production and non-production"),
-    "no-default-deny": ("warn", "SP 800-207 tenet 6; 800-53 SC-7(5)", "an Application policy whose last rule is not a DROP or REJECT"),
-    "static-membership": ("warn", "SP 800-207 tenet 4", "a group of addresses or picked VMs, not attributes"),
-    "exclusion-list": ("enforce", "800-53 SC-7, CM-7; SP 800-207 tenet 1",
-                       "a group in the DFW exclusion list: its members bypass the firewall entirely"),
-}
-LEVELS = {"off": 0, "warn": 1, "enforce": 2}
-
-
-def load_guardrails(report: Report) -> dict:
-    config: dict = {"levels": {k: v[0] for k, v in GUARDRAILS.items()}, "sites": {}, "env_scope": "env", "production": {"prod"}}
-    if not GUARDRAILS_FILE.exists():
-        return config
-    try:
-        doc = load_yaml(GUARDRAILS_FILE.read_text()) or {}
-    except Exception as exc:  # noqa: BLE001
-        report.error("data/guardrails.yaml", f"unparseable YAML: {exc}")
-        return config
-    def level_of(setting):
-        level = setting.get("level") if isinstance(setting, dict) else setting
-        return "off" if level is False else level  # a bare off is YAML's false
-
-    for gid, setting in (doc.get("guardrails") or {}).items():
-        if gid not in GUARDRAILS:
-            report.error("data/guardrails.yaml", f"unknown guardrail {gid!r} (known: {', '.join(GUARDRAILS)})")
-            continue
-        level = level_of(setting)
-        if level not in LEVELS:
-            report.error("data/guardrails.yaml", f"{gid}: level {level!r} is not enforce, warn or off")
-            continue
-        config["levels"][gid] = level
-    for site, overrides in (doc.get("sites") or {}).items():
-        for gid, setting in (overrides or {}).items():
-            level = level_of(setting)
-            if gid in GUARDRAILS and level in LEVELS:
-                config["sites"].setdefault(str(site), {})[gid] = level
-            else:
-                report.error("data/guardrails.yaml", f"sites.{site}.{gid}: unknown guardrail or level")
-    config["env_scope"] = str(doc.get("env_tag_scope") or "env")
-    config["production"] = {str(v) for v in doc.get("production") or ["prod"]}
-    return config
-
-
-def group_env(group: dict, config: dict) -> set[str]:
-    """The environments a group's tag conditions name (scope env, by default)."""
-    found = set()
-    for criterion in group.get("criteria") or []:
-        for condition in (criterion or {}).get("conditions") or []:
-            value = str(condition.get("value", ""))
-            if condition.get("key", "Tag") == "Tag" and value.startswith(config["env_scope"] + "|"):
-                found.add(value.split("|", 1)[1])
-    return found
-
-
-def exception_of(where: str, label: str, exception, report: Report) -> set[str]:
-    """The guardrails a current, complete exception lets off; errors for the rest."""
-    if not isinstance(exception, dict):
-        return set()
-    missing = [f for f in ("guardrails", "owner", "ticket", "expires") if not exception.get(f)]
-    if missing:
-        report.error(where, f"{label}.exception: needs {', '.join(missing)}: an exception is owned, tracked and ends")
-        return set()
-    try:
-        ends = as_date(exception["expires"])
-    except (TypeError, ValueError):
-        report.error(where, f"{label}.exception.expires: not a date (YYYY-MM-DD)")
-        return set()
-    if ends < date.today():
-        report.error(where, f"{label}.exception expired on {ends}: renew it, or bring it within the guardrails")
-        return set()
-    exempt = {str(g) for g in exception["guardrails"]}
-    unknown = exempt - set(GUARDRAILS)
-    if unknown:
-        report.error(where, f"{label}.exception: unknown guardrail(s) {', '.join(sorted(unknown))}")
-    return exempt
-
-
-def check_exclusions(groups: dict[str, dict], sites: set[str], imported: set[str], report: Report,
-                     flag) -> int:
+def check_exclusions(groups: dict[str, dict], sites: set[str], report: Report) -> None:
     """data/exclude-list/<site>.yaml: groups whose members bypass the DFW. Each
-    must exist at that site, and carry an exception (guardrail exclusion-list)."""
-    count = 0
+    must exist at that site. Its exception is the guardrails' (guardrails/)."""
     directory = DATA / "exclude-list"
+    schema = load_schema("exclude-list.schema.json")
     for path in sorted(directory.glob("*.yaml")) if directory.is_dir() else []:
-        where = _rel(path)
-        site = path.stem
+        where, site = _rel(path), path.stem
         if site not in sites:
             report.error(where, f"{site!r} is not a manager in inventory/managers.yaml (the file is named after its manager)")
             continue
         doc = load_yaml(path.read_text()) or {}
-        schema = load_schema("exclude-list.schema.json")
         if schema:
             check_schema(doc, schema, where, "", report)
-        for name, member in (doc.get("members") or {}).items():
-            count += 1
-            member = member if isinstance(member, dict) else {}
+        for name in doc.get("members") or {}:
             group = groups.get(name)
             if group is None:
                 report.error(where, f"members.{name}: no group {name!r} in data/ (groups or references)")
-                continue
-            at = group.get("sites") or []
-            if group.get("owner", "lm") == "lm" and not (site in at or "*" in at):
+            elif group.get("owner", "lm") == "lm" and not (site in (group.get("sites") or []) or "*" in (group.get("sites") or [])):
                 report.error(where, f"members.{name}: group {name!r} does not exist at {site}")
-            exempt = exception_of(where, f"members.{name}", member.get("exception"), report)
-            flag(where, f"members.{name}", "exclusion-list", [site], exempt)
-    return count
-
-
-def check_guardrails(docs: dict[Path, dict], groups: dict[str, dict], managers: dict, imported: set[str],
-                     report: Report) -> tuple[int, list[str]]:
-    """Every rule and policy against the guardrails. Written here: the level
-    applies. Adopted from NSX: a finding whatever the level, a backlog to work
-    down, never a blocked pipeline. Returns (errors raised, findings)."""
-    config = load_guardrails(report)
-    gm_sites = [name for name, m in managers.items() if (m or {}).get("role") == "gm"]
-    today = date.today()
-    counts = [0]
-    findings: list[str] = []
-
-    def level(gid: str, sites: list[str]) -> str:
-        levels = [config["sites"].get(s, {}).get(gid) for s in sites]
-        levels = [lv for lv in levels if lv] or [config["levels"][gid]]
-        return max(levels, key=lambda lv: LEVELS[lv])
-
-    def flag(where: str, label: str, gid: str, sites: list[str], exempt: set[str], detail: str = "") -> None:
-        lv = level(gid, sites)
-        if lv == "off" or gid in exempt:
-            return
-        nist, meaning = GUARDRAILS[gid][1], GUARDRAILS[gid][2]
-        text = f"{label}: guardrail {gid} ({nist}): {meaning}{detail}"
-        if where in imported:
-            findings.append(f"{gid}\t{where}: {text}")
-        elif lv == "enforce":
-            counts[0] += 1
-            report.error(where, f"{text}. Change the rule, or record an exception (owner, ticket, expires).")
-        else:
-            report.warn(where, text)
-
-    for path, doc in docs.items():
-        where = _rel(path)
-        policy = doc.get("policy") or {}
-        rules = doc.get("rules") or {}
-        sites = gm_sites if policy.get("owner") == "gm" else [s for s in policy.get("sites") or [] if s != "*"]
-        if "*" in (policy.get("sites") or []):
-            sites = [n for n, m in managers.items() if (m or {}).get("role") != "gm"]
-        ordered = sorted((r.get("sequence_number", 0), k) for k, r in rules.items() if isinstance(r, dict))
-        if policy.get("category") == "Application" and ordered:
-            last = rules[ordered[-1][1]]
-            if last.get("action") not in ("DROP", "REJECT"):
-                flag(where, "policy", "no-default-deny", sites, set())
-        for key, rule in rules.items():
-            if not isinstance(rule, dict):
-                continue
-            label = f"rules.{key}"
-            exempt = exception_of(where, label, rule.get("exception"), report)
-            action = rule.get("action")
-            src = [s for s in rule.get("source_groups") or [] if s != "ANY"]
-            dst = [s for s in rule.get("destination_groups") or [] if s != "ANY"]
-            svc = [s for s in rule.get("services") or [] if s != "ANY"] or list(rule.get("service_entries") or {})
-            logged = rule.get("logged", True) is not False
-            if action == "ALLOW":
-                if not src and not dst and not svc:
-                    flag(where, label, "any-any-any", sites, exempt)
-                else:
-                    if not svc:
-                        flag(where, label, "any-service", sites, exempt)
-                    if not src:
-                        flag(where, label, "any-source", sites, exempt)
-                    if not dst:
-                        flag(where, label, "any-destination", sites, exempt)
-                if [s for s in rule.get("scope") or ["ANY"] if s != "ANY"] == [] and \
-                        [s for s in policy.get("scope") or ["ANY"] if s != "ANY"] == []:
-                    flag(where, label, "dfw-wide-allow", sites, exempt)
-                if not logged:
-                    flag(where, label, "allow-not-logged", sites, exempt)
-                envs_src = set().union(*[group_env(groups.get(n) or {}, config) for n in src]) if src else set()
-                envs_dst = set().union(*[group_env(groups.get(n) or {}, config) for n in dst]) if dst else set()
-                prod = config["production"]
-                if envs_src and envs_dst and ((envs_src & prod and envs_dst - prod) or (envs_dst & prod and envs_src - prod)):
-                    flag(where, label, "prod-nonprod", sites, exempt,
-                         f" ({', '.join(sorted(envs_src))} -> {', '.join(sorted(envs_dst))})")
-            if action in ("DROP", "REJECT") and not logged:
-                flag(where, label, "deny-not-logged", sites, exempt)
-            if any(is_ip_literal(s) for s in src + dst if s not in groups):
-                flag(where, label, "ip-literals", sites, exempt)
-    for name, group in groups.items():
-        if group.get("reference"):
-            continue
-        criteria = group.get("criteria") or []
-        if criteria and all(isinstance(c, dict) and (c.get("ip_addresses") or c.get("external_ids") or c.get("mac_addresses"))
-                            for c in criteria):
-            where = group.get("_where", "data/groups")
-            sites = gm_sites if group.get("owner") == "gm" else [s for s in group.get("sites") or [] if s != "*"]
-            flag(where, f"group {name}", "static-membership", sites, set())
-    check_exclusions(groups, set(managers), imported, report, flag)
-    return counts[0], findings
 
 
 BACKEND_SECRET = re.compile(
@@ -8211,7 +7572,6 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--strict", action="store_true", help="treat warnings as failures")
     ap.add_argument("--quiet", action="store_true", help="print only the summary")
-    ap.add_argument("--findings", action="store_true", help="list each guardrail finding in rules adopted from NSX")
     args = ap.parse_args()
 
     report = Report()
@@ -8228,7 +7588,7 @@ def main() -> int:
     groups = check_groups(group_docs, scopes, sites, imported, report)
     services = check_services(service_docs, sites, imported, report)
     check_policies(policy_docs, groups, services, sites, imported, report)
-    enforced, findings = check_guardrails(policy_docs, groups, managers, imported, report)
+    check_exclusions(groups, sites, report)
     tagged_vms = check_vm_tags(scopes, sites, report)
     check_env_backends(report)
     check_delegations(managers, report)
@@ -8249,25 +7609,6 @@ def main() -> int:
         f"{tagged_vms} tagged VM(s): "
         f"{len(report.errors)} error(s), {len(report.warnings)} warning(s)"
     )
-    if findings:
-        per: dict[str, int] = {}
-        for f in findings:
-            per[f.split("\t", 1)[0]] = per.get(f.split("\t", 1)[0], 0) + 1
-        print(f"guardrails: {len(findings)} finding(s) in rules adopted from NSX, a backlog, never a failed pipeline: "
-              + ", ".join(f"{gid} {n}" for gid, n in sorted(per.items(), key=lambda kv: -kv[1]))
-              + ("" if args.findings else ". --findings lists them."))
-        if args.findings:
-            for f in findings:
-                print("finding  " + f.split("\t", 1)[1])
-
-    import yamlcompat  # noqa: PLC0415
-    how = yamlcompat.reader()
-    if how == "terraform":
-        print("note: PyYAML is not installed here: YAML was read with Terraform's yamldecode, as the stacks read it.")
-    elif how == "subset":
-        print("note: neither PyYAML nor terraform is here: YAML was read with the built-in reader, which accepts the "
-              "YAML this repository writes but not every form YAML allows.")
-
     if report.errors:
         return 1
     if args.strict and report.warnings:
@@ -8318,7 +7659,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from yamlcompat import load_yaml  # noqa: E402
+from nsxlib.yamlio import load_yaml  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 POLICY_DIR = REPO_ROOT / "data" / "policies"
@@ -8520,7 +7861,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from yamlcompat import load_yaml  # noqa: E402
+from nsxlib.yamlio import load_yaml  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VM_TAGS = REPO_ROOT / "data" / "vm-tags"
@@ -8708,72 +8049,319 @@ if __name__ == "__main__":
 SCAFFOLD_EOF
 mark_executable scripts/tag-vm.py
 
-write_file scripts/import-estate.py <<'SCAFFOLD_EOF'
-#!/usr/bin/env python3
-"""Adopt an existing NSX estate into this repository.
-
-The estate exists already. Nothing here creates NSX objects — it reads what is
-there and writes it out as data files plus Terraform import blocks, so that
-Terraform takes ownership of the objects you already run instead of building a
-parallel set beside them.
-
-Two sources:
-
-  # live manager — credentials from the environment, as everywhere else
-  scripts/with-credentials.sh lon1 -- scripts/import-estate.py --site lon1
-
-  # offline: capture once, convert as often as you like
-  scripts/with-credentials.sh lon1 -- scripts/import-estate.py --site lon1 \
-      --dump-only reports/lon1-raw.json
-  scripts/import-estate.py --site lon1 --from-dump reports/lon1-raw.json
-
-One piece at a time: --policy adopts only the named policies (repeat it) and
-what they need, the groups they reference (nested groups included) and their
-custom services. Anything already in data/ is skipped: it is managed already.
-
-  scripts/import-estate.py --site lon1 --from-dump reports/lon1-raw.json \
-      --policy legacy-app --tranche legacy-app
-
-What it writes (never over the top of anything). <tranche> is --tranche, or
-"all" for a whole manager:
-
-  data/groups/imported-<site>-<tranche>.yaml     groups, criteria from expressions
-  data/policies/<policy-id>.yaml                 one file per policy, for add-rule.py
-  data/services/imported-<site>-<tranche>.yaml   custom services; predefined referenced
-  stacks/<stack>/import-<site>-<tranche>.tf      import blocks, for this site only
-  data/.import-manifest.json                     what was imported, and from where
-
-The import blocks are guarded by the site, so a tranche for one Local Manager
-never touches the plans of the others that share the stack.
-
-If a target file already exists it is written as <name>.new and reported. Your
-data is never overwritten by this tool, and bootstrap.sh refuses to overwrite
-anything listed in the manifest even with --force-data.
-
-Mirror mode: --mirror converts EVERY adoptable object of the manager, not a
-chosen policy, into files this tool owns for that manager and regenerates on
-every run, so objects added, changed or deleted in the UI follow:
-
-  data/groups/imported-<site>-mirror.yaml, data/services/imported-<site>-mirror.yaml,
-  data/policies/<policy-id>.yaml, stacks/<stack>/import-<site>-mirror.tf
-
-Each starts with the line "# nsx-mirror: <site>". Those files are overwritten
-and removed by the next run; nothing else is touched, and objects declared in
-any other file are left to that file. The output is stable: a run against an
-unchanged manager rewrites the same bytes. scripts/mirror.sh runs this from
-the pipeline for managers with "mode: mirror" in the inventory.
-
-IMPORT ID FORMAT: policy resources in the nsxt provider have taken more than
-one import id format across versions — the policy path, or "domain/id". This
-script defaults to the path and can emit either (--id-format). Confirm on your
-first tranche: a wrong format fails immediately and harmlessly at plan time
-with a "not found" style error, before anything is written to state.
+write_file scripts/nsxlib/inventory.py <<'SCAFFOLD_EOF'
+"""inventory/managers.yaml: the managers, their role and mode, and which stacks
+run against each. scripts/ci-matrix.py and scripts/gitlab-child-pipeline.py
+both build their run matrix from entries(), so the two platforms agree.
 """
 
 from __future__ import annotations
 
-import argparse
-import ipaddress
+import os
+import sys
+from pathlib import Path
+
+from nsxlib.yamlio import load_yaml
+
+INVENTORY = Path(__file__).resolve().parents[2] / "inventory" / "managers.yaml"
+MODES = ("managed", "mirror", "hybrid")
+# A Global Manager has no VM inventory and no local networking.
+GM_STACKS = ["global-security"]
+LM_STACKS = ["local-security", "local-tags", "local-network", "platform"]
+
+
+def managers(strict: bool = True) -> dict:
+    """Every manager in the inventory, by name."""
+    # A manager's mode once had a CI/CD variable too (1.3.0). A leftover one
+    # must not look like it works.
+    stale = sorted(k for k in os.environ if k.upper().startswith("NSX_MODE_"))
+    if stale:
+        sys.exit("error: a manager's mode comes from inventory/managers.yaml only (mode: mirror), not from "
+                 "CI/CD variables. Delete these variables and set the mode there, in a merge request:\n"
+                 + "\n".join(f"  {k}" for k in stale))
+    wrong = misnamed_variables()
+    if wrong:
+        sys.exit("error: these CI/CD variables are never read, because names are case-sensitive:\n"
+                 + "\n".join(f"  {k}  ->  rename it to {u}" for k, u in wrong))
+    if not INVENTORY.exists():
+        if strict:
+            sys.exit(f"error: {INVENTORY} does not exist")
+        return {}
+    return (load_yaml(INVENTORY.read_text()) or {}).get("managers") or {}
+
+
+def manager(site: str) -> dict:
+    return managers(strict=False).get(site) or {}
+
+
+def role(site: str) -> str:
+    """gm or lm."""
+    return manager(site).get("role", "lm")
+
+
+def mode_of(name: str, entry: dict) -> str:
+    """managed, mirror or hybrid. From the inventory only: changing it is a
+    reviewed merge request like any other change. hybrid: managed, with what is
+    not cut over yet still mirrored from the UI (scripts/cutover.sh)."""
+    mode = entry.get("mode", "managed")
+    if mode not in MODES:
+        sys.exit(f"error: {name}: mode {mode!r} in inventory/managers.yaml must be one of: {', '.join(MODES)}")
+    return mode
+
+
+def mode(site: str) -> str:
+    return mode_of(site, manager(site))
+
+
+def misnamed_variables() -> list[tuple[str, str]]:
+    """NSX_* variables set with lower-case letters, and the name they should
+    have: names are case-sensitive, so NSX_CA_FILE_hyd_gm01 is never read."""
+    return sorted((k, k.upper()) for k in os.environ if k[:4].upper() == "NSX_" and k != k.upper())
+
+
+def entries(stack_filter: str | None = None, strict: bool = False) -> list[dict]:
+    """One row per (manager, stack) the pipeline runs."""
+    out = []
+    for name, m in sorted(managers(strict=strict).items()):
+        if m.get("enabled") is False:
+            continue
+        kind = m.get("role", "lm")
+        for stack in m.get("stacks") or (GM_STACKS if kind == "gm" else LM_STACKS):
+            if stack_filter and stack != stack_filter:
+                continue
+            out.append({"site": name, "stack": stack, "role": kind, "host": m.get("host", ""), "tier": m.get("tier", ""),
+                        "vcf_instance": m.get("vcf_instance", ""), "mode": mode_of(name, m)})
+    return out
+SCAFFOLD_EOF
+
+write_file scripts/nsxlib/model.py <<'SCAFFOLD_EOF'
+"""The repository's data model: data/ and inventory/, read once.
+
+An object has a KEY (what data/ calls it: the file name of a policy, the
+mapping key of a group, rule or service) and an IDENTITY (what NSX calls it):
+
+    ("group",   domain, nsx_id)
+    ("policy",  domain, nsx_id)
+    ("rule",    domain, policy nsx_id, rule nsx_id)
+    ("service", nsx_id)
+
+Keys are chosen once and never change; identities are how a key is matched to
+what NSX holds. A file whose first line is "# nsx-mirror: <site>" is owned by
+that manager's mirror: rewritten by every sync, never edited by hand.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from nsxlib.inventory import mode
+from nsxlib.yamlio import load_yaml, to_yaml
+
+REPO = Path(__file__).resolve().parents[2]
+DATA = REPO / "data"
+MIRROR_MARK = "# nsx-mirror: "
+KINDS = ("groups", "services", "policies", "exclude-list")
+
+
+@dataclass
+class DataFile:
+    path: Path
+    kind: str           # groups, services, policies, exclude-list
+    doc: dict
+    mirror: str | None  # the manager whose mirror owns it, if one does
+
+    @property
+    def rel(self) -> str:
+        return str(self.path.relative_to(REPO))
+
+
+def mirror_of(text: str) -> str | None:
+    first = text.split("\n", 1)[0].strip()
+    return first[len(MIRROR_MARK):] if first.startswith(MIRROR_MARK) else None
+
+
+def data_files(kinds: tuple[str, ...] = KINDS) -> list[DataFile]:
+    out = []
+    for kind in kinds:
+        for path in sorted((DATA / kind).glob("*.yaml")):
+            text = path.read_text()
+            out.append(DataFile(path, kind, load_yaml(text) or {}, mirror_of(text)))
+    return out
+
+
+def rewrite(path: Path, change) -> str | None:
+    """Apply change(doc) to a data file and write it back, its leading comment
+    block kept. A file with comments further in is left alone (they would be
+    lost) and what change returned, the entry to paste by hand, is returned."""
+    text = path.read_text()
+    lines = text.splitlines()
+    head = []
+    for line in lines:
+        if not (line.startswith("#") or not line.strip()):
+            break
+        head.append(line)
+    doc = load_yaml(text) or {}
+    snippet = change(doc)
+    if any(line.lstrip().startswith("#") for line in lines[len(head):]):
+        return snippet
+    path.write_text("\n".join(head).rstrip("\n") + ("\n\n" if head else "") + to_yaml(doc))
+    return None
+
+
+# --- keys: what data/ already calls things ----------------------------------
+
+def mirror_files(site: str) -> set[Path]:
+    """The files this manager's mirror owns."""
+    return {f.path for f in data_files() if f.mirror == site}
+
+
+def existing_keys(exclude: set[Path] = frozenset()) -> dict[str, set[str]]:
+    """Keys data/ declares (outside the files in exclude): managed already."""
+    found: dict[str, set[str]] = {"groups": set(), "services": set(), "policies": set()}
+    for f in data_files(("groups", "services", "policies")):
+        if f.path in exclude:
+            continue
+        if f.kind == "groups":
+            found["groups"] |= set(f.doc.get("groups") or {})
+        elif f.kind == "services":
+            found["services"] |= set(f.doc.get("custom") or {})
+        else:
+            found["policies"].add(f.path.stem)  # a policy's key is its file's name, as the stacks key it
+    return found
+
+
+def declared_objects(exclude: set[Path] = frozenset()) -> dict[str, dict[str, dict]]:
+    """Groups and custom services data/ declares: key -> definition."""
+    out: dict[str, dict[str, dict]] = {"groups": {}, "services": {}}
+    for f in data_files(("groups", "services")):
+        if f.path not in exclude:
+            section = "groups" if f.kind == "groups" else "custom"
+            out[f.kind].update({k: v if isinstance(v, dict) else {} for k, v in (f.doc.get(section) or {}).items()})
+    return out
+
+
+def known_keys() -> tuple[dict[tuple, str], set[str], set[str]]:
+    """identity -> the key data/ gives it, and the group and policy keys taken."""
+    known: dict[tuple, str] = {}
+    groups: set[str] = set()
+    policies: set[str] = set()
+    for f in data_files(("groups", "policies")):
+        if f.kind == "groups":
+            for section in ("groups", "references"):
+                for k, g in (f.doc.get(section) or {}).items():
+                    g = g if isinstance(g, dict) else {}
+                    groups.add(str(k))
+                    known[("group", g.get("domain") or "default", str(g.get("nsx_id", k)))] = str(k)
+            continue
+        header = f.doc.get("policy") or {}
+        where, pid = header.get("domain") or "default", str(header.get("id") or f.path.stem)
+        policies.add(f.path.stem)
+        known[("policy", where, pid)] = f.path.stem
+        for k, r in (f.doc.get("rules") or {}).items():
+            known[("rule", where, pid, str((r or {}).get("nsx_id", k)))] = str(k)
+    return known, groups, policies
+
+
+# --- what one manager should hold -------------------------------------------
+
+@dataclass
+class Desired:
+    """What data/ says one manager holds, for comparing with NSX."""
+    objects: dict = field(default_factory=dict)    # identity -> (key, definition, file)
+    paths: dict = field(default_factory=dict)      # group path -> key (references included)
+    services: dict = field(default_factory=dict)   # service path, or "name:<display name>" -> key
+    mirrored: set = field(default_factory=set)     # identities a hybrid manager still mirrors
+    excluded: set = field(default_factory=set)     # group keys in the DFW exclusion list
+
+
+def desired(site: str, role: str) -> Desired:
+    tree = "/global-infra" if role == "gm" else "/infra"
+    hybrid = mode(site) == "hybrid"
+    out = Desired()
+
+    def mine(d: dict) -> bool:
+        if role == "gm":
+            return d.get("owner") == "gm"
+        sites = d.get("sites") or []
+        return d.get("owner", "lm") == "lm" and (site in sites or "*" in sites)
+
+    for f in data_files():
+        mirrored = hybrid and f.mirror == site  # the mirror job's to follow, not the watch's
+        if f.kind == "groups":
+            for section in ("groups", "references"):
+                for key, g in (f.doc.get(section) or {}).items():
+                    g = g if isinstance(g, dict) else {}
+                    ident = ("group", g.get("domain") or "default", str(g.get("nsx_id", key)))
+                    prefix = "/global-infra" if g.get("owner") == "gm" else "/infra"
+                    out.paths[f"{prefix}/domains/{ident[1]}/groups/{ident[2]}"] = str(key)
+                    if section == "groups" and mirrored:
+                        out.mirrored.add(ident)
+                    elif section == "groups" and mine(g):
+                        out.objects[ident] = (str(key), g, f.rel)
+        elif f.kind == "services":
+            out.services.update({f"{tree}/services/{k}": str(k) for k in f.doc.get("predefined_ids") or {}})
+            out.services.update({f"name:{n}": str(k) for k, n in (f.doc.get("predefined") or {}).items()})
+            for key, sv in (f.doc.get("custom") or {}).items():
+                sv = sv if isinstance(sv, dict) else {}
+                owner = sv.get("owner", "gm")
+                out.services[f"{'/global-infra' if owner == 'gm' else '/infra'}/services/{key}"] = str(key)
+                sites = sv.get("sites") or ["*"]
+                if mirrored:
+                    out.mirrored.add(("service", str(key)))
+                elif (role == "gm" and owner == "gm") or (role != "gm" and owner == "lm" and (site in sites or "*" in sites)):
+                    out.objects[("service", str(key))] = (str(key), sv, f.rel)
+        elif f.kind == "policies":
+            header = f.doc.get("policy") or {}
+            if not mine(header) or header.get("rule_management", "standalone") != "standalone":
+                continue
+            where, pid = header.get("domain") or "default", str(header.get("id") or f.path.stem)
+            rules = {("rule", where, pid, str((r or {}).get("nsx_id", k))): (f"{f.path.stem}/{k}", r or {}, f.rel)
+                     for k, r in (f.doc.get("rules") or {}).items()}
+            if mirrored:
+                out.mirrored |= {("policy", where, pid), *rules}
+            else:
+                out.objects[("policy", where, pid)] = (f.path.stem, header, f.rel)
+                out.objects.update(rules)
+        elif f.path.stem == site:
+            out.excluded |= set(f.doc.get("members") or {})
+    return out
+
+
+def mirror_addresses(site: str) -> tuple[set[str], tuple[str, ...]]:
+    """The Terraform addresses of what this manager's mirror still owns: exact
+    ones, and prefixes for each policy's resources."""
+    exact: set[str] = set()
+    prefixes: list[str] = []
+    for f in data_files():
+        if f.mirror != site:
+            continue
+        if f.kind == "groups":
+            for k in f.doc.get("groups") or {}:
+                exact |= {f'module.base_groups.nsxt_policy_group.this["{k}"]', f'module.composite_groups.nsxt_policy_group.this["{k}"]'}
+        elif f.kind == "services":
+            exact |= {f'module.services.nsxt_policy_service.this["{k}"]' for k in f.doc.get("custom") or {}}
+        elif f.kind == "policies":
+            prefixes.append(f'module.policies["{f.path.stem}"].')
+        else:
+            exact |= {f'nsxt_policy_firewall_exclude_list_member.this["{k}"]' for k in f.doc.get("members") or {}}
+    return exact, tuple(prefixes)
+SCAFFOLD_EOF
+
+write_file scripts/nsxlib/nsx.py <<'SCAFFOLD_EOF'
+"""Reading NSX: one client, one login per run, every call counted.
+
+    client = Client.from_env("lon1")          # NSXT_* from scripts/with-credentials.sh
+    estate = client.read(LM_BASE, "default")  # the whole manager: groups, services, policies, exclusion list
+    changed = client.search("lm", since_ms)   # what changed since then, in one call
+    print(client.calls)
+
+Only reads. Writing to NSX is Terraform's job, never this module's.
+"""
+
+from __future__ import annotations
+
+import base64
 import json
 import os
 import re
@@ -8782,134 +8370,206 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
-from pathlib import Path
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DATA = REPO_ROOT / "data"
-MANIFEST = DATA / ".import-manifest.json"
-
-# First line of every file mirror mode owns, followed by the manager's name.
-MIRROR_MARK = "# nsx-mirror: "
 
 GM_BASE = "/global-manager/api/v1/global-infra"
 LM_BASE = "/policy/api/v1/infra"
+SEARCHED = ("Group", "SecurityPolicy", "Rule", "Service", "PolicyExcludeList")
 
 
-# --------------------------------------------------------------------------
-# Fetching
-# --------------------------------------------------------------------------
-
-CA_SITE = ""  # set in main(): the manager whose CA file applies
-
-
-def nsx_ca_file() -> str | None:
-    """The CA to trust for this manager, as scripts/tf.sh chooses it:
-    NSX_CA_FILE_<SITE> first, then NSX_CA_FILE."""
-    key = re.sub(r"[^A-Z0-9]", "_", CA_SITE.upper())
-    for name in (f"NSX_CA_FILE_{key}", "NSX_CA_FILE"):
-        path = os.environ.get(name)
-        if path:
-            if not os.path.isfile(path):
-                sys.exit(f"error: {name} is set to '{path}', which is not a readable file")
-            return path
-    return None
+def domain_of(path: str, default: str = "default") -> str:
+    """The domain an object's path puts it in."""
+    found = re.match(r"^/(?:global-)?infra/domains/([^/]+)/", path or "")
+    return found.group(1) if found else default
 
 
-# Every call to NSX is counted (CALLS) and reported, so a job's cost is known.
-# One login per manager per run: a session, reused, instead of credentials on
-# every call (each of which, with remote authentication, is an LDAP or vIDM
-# lookup on the manager). Where a session cannot be had, basic authentication.
-CALLS = 0
-SESSIONS: dict[tuple[str, str], dict[str, str] | None] = {}
+class Client:
+    """A read-only session on one manager."""
+
+    def __init__(self, site: str, host: str, user: str, password: str, insecure: bool = False) -> None:
+        self.site, self.host, self.user, self.password, self.insecure = site, host, user, password, insecure
+        self.calls = 0
+        self._session: dict[str, str] | None = None
+        self._session_tried = False
+
+    @classmethod
+    def from_env(cls, site: str, host: str | None = None) -> "Client":
+        """Credentials from the environment, as scripts/with-credentials.sh sets them."""
+        host = os.environ.get("NSXT_MANAGER_HOST") or host
+        user, password = os.environ.get("NSXT_USERNAME"), os.environ.get("NSXT_PASSWORD")
+        if not (host and user and password):
+            sys.exit(f"error: no NSX credentials. Wrap the call: scripts/with-credentials.sh {site} -- <command>")
+        # The flag the NSX provider reads, so a script and a plan trust the same way.
+        insecure = os.environ.get("NSXT_ALLOW_UNVERIFIED_SSL", "").strip().lower() in ("true", "1", "yes")
+        if insecure:
+            print(f"warning: TLS verification of {host} is OFF (NSXT_ALLOW_UNVERIFIED_SSL): whoever answers "
+                  "at that address receives the credentials.", file=sys.stderr)
+        return cls(site, host, user, password, insecure)
+
+    # --- transport -----------------------------------------------------------
+
+    def _ca_file(self) -> str | None:
+        """NSX_CA_FILE_<SITE>, then NSX_CA_FILE: the CA scripts/tf.sh trusts for this manager."""
+        key = re.sub(r"[^A-Z0-9]", "_", self.site.upper())
+        for name in (f"NSX_CA_FILE_{key}", "NSX_CA_FILE"):
+            path = os.environ.get(name)
+            if path:
+                if not os.path.isfile(path):
+                    sys.exit(f"error: {name} is set to '{path}', which is not a readable file")
+                return path
+        return None
+
+    def _context(self) -> ssl.SSLContext:
+        context = ssl.create_default_context()
+        # Python 3.13's strict RFC 5280 checks reject internal CAs without keyUsage,
+        # which Terraform accepts; the chain and the hostname are still verified.
+        context.verify_flags &= ~ssl.VERIFY_X509_STRICT
+        ca_file = self._ca_file()
+        if ca_file:
+            context.load_verify_locations(cafile=ca_file)
+        if self.insecure:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        return context
+
+    def _unreachable(self, exc: urllib.error.URLError) -> None:
+        hint = ""
+        if "CERTIFICATE_VERIFY_FAILED" in str(exc.reason):
+            key = re.sub(r"[^A-Z0-9]", "_", self.site.upper())
+            hint = (f"\n       The manager presents a certificate this machine does not trust. Point NSX_CA_FILE_{key} "
+                    "(or NSX_CA_FILE) at the PEM of its CA, or of the certificate itself if it is self-signed.")
+        sys.exit(f"error: cannot reach {self.host}: {exc.reason}{hint}")
+
+    def _auth(self) -> dict[str, str]:
+        """A session, created once per run: with LDAP or vIDM accounts every
+        authenticated call is a directory lookup on the manager. Basic
+        authentication where a session cannot be had."""
+        if not self._session_tried:
+            self._session_tried = True
+            data = urllib.parse.urlencode({"j_username": self.user, "j_password": self.password}).encode()
+            request = urllib.request.Request(f"https://{self.host}/api/session/create", data=data, method="POST",
+                                             headers={"Content-Type": "application/x-www-form-urlencoded"})
+            try:
+                self.calls += 1
+                with urllib.request.urlopen(request, context=self._context(), timeout=60) as response:
+                    cookie = "; ".join(c.split(";", 1)[0] for c in response.headers.get_all("Set-Cookie") or [])
+                    xsrf = response.headers.get("X-XSRF-TOKEN")
+                    if cookie:
+                        self._session = {"Cookie": cookie, **({"X-XSRF-TOKEN": xsrf} if xsrf else {})}
+            except urllib.error.HTTPError:
+                self._session = None
+            except urllib.error.URLError as exc:
+                self._unreachable(exc)
+        if self._session:
+            return self._session
+        token = base64.b64encode(f"{self.user}:{self.password}".encode()).decode()
+        return {"Authorization": f"Basic {token}"}
+
+    def get(self, path: str, missing_ok: bool = False) -> dict:
+        """GET one path. missing_ok: a 400 or 404 answers {} instead of stopping."""
+        request = urllib.request.Request(f"https://{self.host}{path}", headers={"Accept": "application/json", **self._auth()})
+        try:
+            self.calls += 1
+            with urllib.request.urlopen(request, context=self._context(), timeout=120) as response:
+                return json.loads(response.read().decode())
+        except urllib.error.HTTPError as exc:
+            if missing_ok and exc.code in (400, 404):
+                return {}
+            if exc.code in (401, 403) and self._session:
+                self._session = None  # expired or refused: once more, with basic authentication
+                return self.get(path, missing_ok)
+            sys.exit(f"error: {exc.code} from {path}: {exc.read()[:300].decode(errors='replace')}")
+        except urllib.error.URLError as exc:
+            self._unreachable(exc)
+        return {}
+
+    def get_all(self, path: str) -> list:
+        """A list, every page of it (the policy API pages at 1000)."""
+        out: list = []
+        cursor = None
+        while True:
+            page = self.get(path + (f"?cursor={urllib.parse.quote(cursor)}" if cursor else ""))
+            out.extend(page.get("results", []))
+            cursor = page.get("cursor")
+            if not cursor:
+                return out
+
+    # --- what scripts read ---------------------------------------------------
+
+    def read(self, base: str, domain: str = "default") -> dict:
+        """Everything this repository represents, from one manager.
+
+        A Global Manager in every domain (a global rule may use a location
+        domain's group); a Local Manager in its own. One hierarchical call where
+        the manager offers it (NSX 4.2 does), list by list otherwise
+        (NSX_READ=paged forces that). The exclusion list is one call more."""
+        before = self.calls
+        estate = None if os.environ.get("NSX_READ") == "paged" else self._read_tree(base, domain)
+        how = "hierarchical read"
+        if estate is None:
+            estate, how = self._read_paged(base, domain), "paged read"
+        estate["exclude_list"] = self.exclude_list(base)
+        print(f"read {self.host}: {len(estate['groups'])} group(s), {len(estate['policies'])} policy/policies, "
+              f"{len(estate['services'])} service(s), {len(estate['exclude_list'])} excluded, "
+              f"in {self.calls - before} call(s) ({how})", file=sys.stderr)
+        return estate
+
+    def _read_tree(self, base: str, domain: str) -> dict | None:
+        for query in ("type_filter=Domain;Group;SecurityPolicy;Rule;Service",
+                      "filter=Type-Domain|Group|SecurityPolicy|Rule|Service"):
+            tree = self.get(f"{base}?{query}", missing_ok=True)
+            found = flatten_tree(tree) if tree.get("children") else {}
+            if not found.get("Domain"):
+                continue
+            domains = [domain] + (sorted(d["id"] for d in found["Domain"] if d.get("id") and d["id"] != domain)
+                                  if base == GM_BASE else [])
+            groups = [g for g in found["Group"] if domain_of(g.get("path", ""), "") in domains]
+            policies = [p for p in found["SecurityPolicy"] if domain_of(p.get("path", ""), "") in domains]
+            return {"groups": groups, "services": found["Service"], "policies": policies,
+                    "domain": domain, "domains": domains}
+        return None
+
+    def _read_paged(self, base: str, domain: str) -> dict:
+        domains = [domain]
+        if base == GM_BASE:
+            # The manager's own domain first: on an id clash between domains, it wins.
+            domains += sorted(d["id"] for d in self.get_all(f"{base}/domains") if d.get("id") and d["id"] != domain)
+        groups, policies = [], []
+        for d in domains:
+            at = f"{base}/domains/{urllib.parse.quote(d, safe='')}"
+            groups += self.get_all(f"{at}/groups")
+            # The list omits rules: each policy in full. Ids made in the UI hold spaces, quotes, '#'.
+            policies += [self.get(f"{at}/security-policies/{urllib.parse.quote(p['id'], safe='')}")
+                         for p in self.get_all(f"{at}/security-policies")]
+        return {"groups": groups, "services": self.get_all(f"{base}/services"), "policies": policies,
+                "domain": domain, "domains": domains}
+
+    def exclude_list(self, base: str) -> list[str]:
+        """The DFW exclusion list of a Local Manager: what it holds bypasses the firewall."""
+        if base != LM_BASE:
+            return []
+        return [str(m) for m in self.get(f"{base}/settings/firewall/security/exclude-list", missing_ok=True).get("members") or []]
+
+    def search(self, role: str, since_ms: int) -> list[dict]:
+        """Objects of the kinds this repository manages, modified since since_ms: one call."""
+        base = "/global-manager/api/v1" if role == "gm" else "/policy/api/v1"
+        query = f"resource_type:({' OR '.join(SEARCHED)}) AND _last_modified_time:[{since_ms} TO *]"
+        out, cursor = [], None
+        while True:
+            params = {"query": query, **({"cursor": cursor} if cursor else {})}
+            page = self.get(f"{base}/search/query?{urllib.parse.urlencode(params)}")
+            out.extend(page.get("results") or [])
+            cursor = page.get("cursor")
+            if not cursor or not page.get("results"):
+                return out
 
 
-def _context(insecure: bool) -> ssl.SSLContext:
-    context = ssl.create_default_context()
-    # Python 3.13 turned on RFC 5280 strict checks, which reject internal CAs that
-    # lack a keyUsage extension. Terraform's Go TLS stack accepts them, and so did
-    # Python before 3.13; without this the capture and the plan would disagree
-    # about the same manager. The chain and the hostname are still verified.
-    context.verify_flags &= ~ssl.VERIFY_X509_STRICT
-    ca_file = nsx_ca_file()
-    if ca_file:
-        context.load_verify_locations(cafile=ca_file)
-    if insecure:
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-    return context
-
-
-def _unreachable(host: str, exc: urllib.error.URLError) -> None:
-    hint = ""
-    if "CERTIFICATE_VERIFY_FAILED" in str(exc.reason):
-        hint = (
-            "\n       The manager is presenting a certificate this machine does not trust. Point "
-            f"NSX_CA_FILE_{re.sub(r'[^A-Z0-9]', '_', CA_SITE.upper())} (or NSX_CA_FILE) at the PEM of "
-            "its CA, or of the certificate itself if it is self-signed. --insecure is for a lab only."
-        )
-    sys.exit(f"error: cannot reach {host}: {exc.reason}{hint}")
-
-
-def session(host: str, user: str, password: str, insecure: bool) -> dict[str, str] | None:
-    """Headers of a session on this manager, created once; None: use basic auth."""
-    global CALLS
-    if (host, user) in SESSIONS:
-        return SESSIONS[(host, user)]
-    data = urllib.parse.urlencode({"j_username": user, "j_password": password}).encode()
-    request = urllib.request.Request(f"https://{host}/api/session/create", data=data, method="POST",
-                                     headers={"Content-Type": "application/x-www-form-urlencoded"})
-    headers = None
-    try:
-        CALLS += 1
-        with urllib.request.urlopen(request, context=_context(insecure), timeout=60) as response:
-            cookie = "; ".join(c.split(";", 1)[0] for c in response.headers.get_all("Set-Cookie") or [])
-            xsrf = response.headers.get("X-XSRF-TOKEN")
-            if cookie:
-                headers = {"Cookie": cookie, **({"X-XSRF-TOKEN": xsrf} if xsrf else {})}
-    except urllib.error.HTTPError:
-        headers = None  # sessions not allowed for this account: basic authentication
-    except urllib.error.URLError as exc:
-        _unreachable(host, exc)
-    SESSIONS[(host, user)] = headers
-    return headers
-
-
-def api_get(host: str, path: str, user: str, password: str, insecure: bool, missing_ok: bool = False) -> dict:
-    """GET one path. missing_ok: a 400/404 answers {} instead of stopping."""
-    global CALLS
-    import base64
-
-    request = urllib.request.Request(f"https://{host}{path}", headers={"Accept": "application/json"})
-    headers = session(host, user, password, insecure)
-    if headers:
-        for name, value in headers.items():
-            request.add_header(name, value)
-    else:
-        request.add_header("Authorization", "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode())
-    try:
-        CALLS += 1
-        with urllib.request.urlopen(request, context=_context(insecure), timeout=120) as response:
-            return json.loads(response.read().decode())
-    except urllib.error.HTTPError as exc:
-        if missing_ok and exc.code in (400, 404):
-            return {}
-        if exc.code in (401, 403) and headers:
-            SESSIONS[(host, user)] = None  # the session expired or is refused: once more, without it
-            return api_get(host, path, user, password, insecure, missing_ok)
-        sys.exit(f"error: {exc.code} from {path}: {exc.read()[:300].decode(errors='replace')}")
-    except urllib.error.URLError as exc:
-        _unreachable(host, exc)
-    return {}
-
-
-def hierarchy(tree: dict) -> dict[str, list[dict]]:
-    """Domains, groups, policies (rules inside), services, from one hierarchical
-    read: each object sits in its parent's children as Child<Type> -> <Type>."""
+def flatten_tree(tree: dict) -> dict[str, list[dict]]:
+    """Domains, groups, policies (rules inside) and services from a hierarchical
+    read, where each object sits in its parent's children as Child<Type> -> <Type>."""
     found: dict[str, list[dict]] = {"Domain": [], "Group": [], "SecurityPolicy": [], "Service": []}
 
-    def walk(node: dict, policy: dict | None) -> None:
-        for child in node.get("children") or []:
+    def walk(children: list, policy: dict | None) -> None:
+        for child in children or []:
             kind = str(child.get("resource_type", ""))[len("Child"):]
             obj = child.get(kind)
             if not isinstance(obj, dict):
@@ -8917,112 +8577,47 @@ def hierarchy(tree: dict) -> dict[str, list[dict]]:
             obj = dict(obj)
             inner = obj.pop("children", None)
             if kind == "Rule" and policy is not None:
-                # A rule may come both inline and as a child: once.
-                rules = policy.setdefault("rules", [])
-                if not any(r.get("id") == obj.get("id") for r in rules):
-                    rules.append(obj)
+                if not any(r.get("id") == obj.get("id") for r in policy["rules"]):  # inline and as a child: once
+                    policy["rules"].append(obj)
             elif kind in found:
                 if kind == "SecurityPolicy":
                     obj["rules"] = list(obj.get("rules") or [])
                 found[kind].append(obj)
-            walk({"children": inner or []}, obj if kind == "SecurityPolicy" else policy)
+            walk(inner or [], obj if kind == "SecurityPolicy" else policy)
 
-    walk(tree, None)
+    walk(tree.get("children") or [], None)
     return found
+SCAFFOLD_EOF
+
+write_file scripts/nsxlib/convert.py <<'SCAFFOLD_EOF'
+"""An NSX object, as the API returns it, written as a data/ entry.
+
+One converter for everything that reads NSX: the importer writes its output,
+the change watch compares it with data/, accepting a change writes it back. So a
+difference found is a real difference, never two converters disagreeing.
+
+References are written by key: group_paths and service_paths map an NSX path
+to the key data/ uses for it. A path with no key is kept as it is.
+"""
+
+from __future__ import annotations
+
+import ipaddress
+
+STATIC_NOTE = ("IMPORTED AS-IS from the live manager. Replace this note with the real reason "
+               "the membership is static, and what would let it become dynamic.")
+EMPTY_NOTE = ("IMPORTED AS-IS: this group has no membership criteria in NSX, so it matches nothing "
+              "(or its members are managed elsewhere). Replace this note with the reason, or delete the group.")
 
 
-def exclude_list(host: str, user: str, password: str, base: str, insecure: bool) -> list[str]:
-    """The DFW exclusion list of a Local Manager: what it holds bypasses the
-    firewall entirely. One call."""
-    if base != LM_BASE:
-        return []
-    found = api_get(host, f"{base}/settings/firewall/security/exclude-list", user, password, insecure, True)
-    return [str(m) for m in found.get("members") or []]
-
-
-def fetch_estate(host: str, user: str, password: str, base: str, domain: str, insecure: bool) -> dict:
-    """Groups, services and policies. On a Global Manager, from every domain: a
-    global policy's rules may use a location domain's groups (e.g. WL-Mum), and
-    location domains hold policies of their own. A Local Manager has only
-    'default' (its view of the Global Manager's domains is not its own).
-
-    One hierarchical read where the manager offers it: the whole tree in one
-    call. Otherwise (NSX_READ=paged forces it) list by list and a call per
-    policy, as before."""
-    before = CALLS
-    if os.environ.get("NSX_READ", "hierarchical") != "paged":
-        for query in ("type_filter=Domain;Group;SecurityPolicy;Rule;Service",
-                      "filter=Type-Domain|Group|SecurityPolicy|Rule|Service"):
-            tree = api_get(host, f"{base}?{query}", user, password, insecure, True)  # missing_ok
-            found = hierarchy(tree) if tree.get("children") else {}
-            if found.get("Domain"):
-                domains = [domain]
-                if base == GM_BASE:
-                    domains += sorted(d["id"] for d in found["Domain"] if d.get("id") and d["id"] != domain)
-                within = lambda o: domain_of(o.get("path", ""), "") in domains  # noqa: E731
-                groups = [g for g in found["Group"] if within(g)]
-                policies = [p for p in found["SecurityPolicy"] if within(p)]
-                services = found["Service"]
-                print(f"reading {host} ({base}, domain(s) {', '.join(domains)}): {len(groups)} group(s), "
-                      f"{len(policies)} policy/policies, {len(services)} service(s), "
-                      f"in {CALLS - before} call(s) (hierarchical read)", file=sys.stderr)
-                return {"groups": groups, "services": services, "policies": policies, "domain": domain,
-                        "domains": domains, "exclude_list": exclude_list(host, user, password, base, insecure),
-                        "calls": CALLS - before}
-
-    def results(path: str) -> list:
-        # The policy API pages lists (1000 per page by default). Follow the cursor,
-        # or a large estate is silently cut short.
-        out: list = []
-        cursor = None
-        while True:
-            page = api_get(host, path + (f"?cursor={urllib.parse.quote(cursor)}" if cursor else ""), user, password, insecure)
-            out.extend(page.get("results", []))
-            cursor = page.get("cursor")
-            if not cursor:
-                return out
-
-    domains = [domain]
-    if base == GM_BASE:
-        # The manager's own domain first: on an id clash between domains, it wins.
-        domains += sorted(d["id"] for d in results(f"{base}/domains") if d.get("id") and d["id"] != domain)
-    print(f"reading {host} ({base}, domain(s) {', '.join(domains)})", file=sys.stderr)
-    groups: list = []
-    policies: list = []
-    for d in domains:
-        found_groups = results(f"{base}/domains/{urllib.parse.quote(d, safe='')}/groups")
-        groups += found_groups
-        count = 0
-        for summary in results(f"{base}/domains/{urllib.parse.quote(d, safe='')}/security-policies"):
-            # The list endpoint omits rules; fetch each policy in full.
-            policies.append(
-                api_get(
-                    host,
-                    # Ids made in the UI may hold spaces, quotes or '#'.
-                    f"{base}/domains/{urllib.parse.quote(d, safe='')}/security-policies/{urllib.parse.quote(summary['id'], safe='')}",
-                    user,
-                    password,
-                    insecure,
-                )
-            )
-            count += 1
-        print(f"  domain {d}: {len(found_groups)} group(s), {count} policy/policies", file=sys.stderr)
-    services = results(f"{base}/services")
-    print(f"  {len(services)} service(s), in {CALLS - before} call(s) (paged read)", file=sys.stderr)
-
-    return {"groups": groups, "services": services, "policies": policies, "domain": domain, "domains": domains,
-            "exclude_list": exclude_list(host, user, password, base, insecure), "calls": CALLS - before}
-
-
-def domain_of(path: str, default: str) -> str:
-    """The domain an object's path puts it in."""
-    found = re.match(r"^/(?:global-)?infra/domains/([^/]+)/", path or "")
-    return found.group(1) if found else default
+def is_system(obj: dict) -> bool:
+    """NSX's own objects: never adopted, never drift."""
+    return bool(obj.get("_system_owned")) or obj.get("_create_user") == "system"
 
 
 def is_ip_literal(value: str) -> bool:
-    """An address, CIDR or range (a-b, or a - b as the NSX UI writes it), as NSX
-    takes in a rule's source or destination."""
+    """An address, CIDR or range (a-b, or a - b as the NSX UI writes it), as a
+    rule's source or destination may hold instead of a group."""
     parts = value.split("-", 1)
     if parts[0] != parts[0].lstrip() or parts[-1] != parts[-1].rstrip():
         return False
@@ -9034,129 +8629,38 @@ def is_ip_literal(value: str) -> bool:
         return False
 
 
-# --------------------------------------------------------------------------
-# YAML emitting — small and controlled, so output is stable and diffable.
-# --------------------------------------------------------------------------
-
-NEEDS_QUOTE = set(":{}[],&*#?|-<>=!%@`\"'")
-
-
-def scalar(value) -> str:
-    if value is True:
-        return "true"
-    if value is False:
-        return "false"
-    if value is None:
-        return "null"
-    if isinstance(value, (int, float)):
-        return str(value)
-    text = str(value)
-    if (
-        text == ""
-        or text[0] in NEEDS_QUOTE
-        or text.strip() != text
-        # YAML 1.1 booleans too (y, n), which Terraform's yamldecode still reads as such.
-        or text.lower() in ("true", "false", "null", "yes", "no", "on", "off", "~", "y", "n")
-        or any(c in text for c in ":#'\"\\,[]{}")  # also safe inside a [flow, list]
-        or any(ord(c) < 32 or ord(c) == 127 for c in text)
-        or _looks_numeric(text)
-    ):
-        return '"' + "".join(_ESCAPES.get(c) or (f"\\x{ord(c):02x}" if ord(c) < 32 or ord(c) == 127 else c)
-                             for c in text) + '"'
-    return text
-
-
-# Double-quoted YAML: these characters are written escaped, anything else as is.
-_ESCAPES = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\t": "\\t", "\r": "\\r"}
-
-
-def key(value) -> str:
-    """A mapping key, quoted like any value when it needs to be: NSX ids can be
-    anything but '/' (Azure-AD-IP's, 'WIN11 IC', 100, -x, @y)."""
-    return scalar(str(value))
-
-
-def _looks_numeric(text: str) -> bool:
-    try:
-        float(text)
-        return True
-    except ValueError:
-        return False
-
-
-def emit(value, indent: int = 0) -> list[str]:
-    pad = "  " * indent
-    lines: list[str] = []
-    if isinstance(value, dict):
-        for name, item in value.items():
-            if isinstance(item, dict) and item:
-                lines.append(f"{pad}{key(name)}:")
-                lines.extend(emit(item, indent + 1))
-            elif isinstance(item, list) and item:
-                flow = f"{pad}{key(name)}: [{', '.join(scalar(x) for x in item)}]"
-                if all(not isinstance(x, (dict, list)) for x in item) and len(item) <= 4 and len(flow) <= 100:
-                    lines.append(flow)
-                elif all(not isinstance(x, (dict, list)) for x in item):
-                    # One member per line: a long list is read, and diffed, line by line.
-                    lines.append(f"{pad}{key(name)}:")
-                    lines.extend(f"{pad}  - {scalar(x)}" for x in item)
-                else:
-                    lines.append(f"{pad}{key(name)}:")
-                    lines.extend(emit(item, indent + 1))
-            elif isinstance(item, (dict, list)):
-                lines.append(f"{pad}{key(name)}: {{}}" if isinstance(item, dict) else f"{pad}{key(name)}: []")
-            else:
-                lines.append(f"{pad}{key(name)}: {scalar(item)}")
-    elif isinstance(value, list):
-        for item in value:
-            if isinstance(item, dict):
-                rendered = emit(item, indent + 1)
-                first = rendered[0].lstrip()
-                lines.append(f"{pad}- {first}")
-                lines.extend(rendered[1:])
-            else:
-                lines.append(f"{pad}- {scalar(item)}")
-    return lines
-
-
-def to_yaml(value) -> str:
-    return "\n".join(emit(value)) + "\n"
-
-
-# --------------------------------------------------------------------------
-# Conversion
-# --------------------------------------------------------------------------
-
 def tags_of(obj: dict) -> list[dict]:
     return [{"scope": t.get("scope", ""), "tag": t.get("tag", "")} for t in obj.get("tags") or []]
 
 
-def condition(expression: dict) -> dict:
-    return {
-        "key": expression.get("key", "Tag"),
-        "member_type": expression.get("member_type", "VirtualMachine"),
-        "operator": expression.get("operator", "EQUALS"),
-        "value": expression.get("value", ""),
-    }
+def _condition(expression: dict) -> dict:
+    return {"key": expression.get("key", "Tag"), "member_type": expression.get("member_type", "VirtualMachine"),
+            "operator": expression.get("operator", "EQUALS"), "value": expression.get("value", "")}
 
 
-def convert_group(group: dict, path_to_name: dict, owner: str, sites: list[str]) -> dict:
+def _keys(paths, lookup: dict) -> list[str]:
+    return [lookup.get(p, p) for p in paths or [] if p != "ANY"]
+
+
+def _optional(out: dict, **fields) -> None:
+    """Set only what is set: an absent field reads as its default in data/."""
+    out.update({k: v for k, v in fields.items() if v})
+
+
+# --- groups ------------------------------------------------------------------
+
+def group(obj: dict, group_paths: dict, owner: str, sites: list[str]) -> dict:
     criteria: list[dict] = []
     conjunction = None
     static = False
-
-    for expression in group.get("expression", []):
+    for expression in obj.get("expression", []):
         kind = expression.get("resource_type")
         if kind == "Condition":
-            criteria.append({"conditions": [condition(expression)]})
+            criteria.append({"conditions": [_condition(expression)]})
         elif kind == "NestedExpression":
-            conditions = [
-                condition(inner)
-                for inner in expression.get("expressions", [])
-                if inner.get("resource_type") == "Condition"
-            ]
-            if conditions:
-                criteria.append({"conditions": conditions})
+            inner = [_condition(e) for e in expression.get("expressions", []) if e.get("resource_type") == "Condition"]
+            if inner:
+                criteria.append({"conditions": inner})
         elif kind == "IPAddressExpression":
             criteria.append({"ip_addresses": expression.get("ip_addresses", [])})
             static = True
@@ -9169,230 +8673,221 @@ def convert_group(group: dict, path_to_name: dict, owner: str, sites: list[str])
                              "external_ids": list(expression.get("external_ids", []))})
             static = True
         elif kind == "PathExpression":
-            criteria.append(
-                {"member_groups": [path_to_name.get(p, p) for p in expression.get("paths", [])]}
-            )
+            criteria.append({"member_groups": [group_paths.get(p, p) for p in expression.get("paths", [])]})
         elif kind == "ConjunctionOperator":
             conjunction = expression.get("conjunction_operator")
+    # Identity firewall: Active Directory groups, by distinguished name and SID.
+    identity = [{k: g[k] for k in ("distinguished_name", "domain_base_distinguished_name", "sid") if g.get(k)}
+                for e in obj.get("extended_expression") or [] if e.get("resource_type") == "IdentityGroupExpression"
+                for g in e.get("identity_groups") or []]
 
-    out: dict = {"display_name": group.get("display_name", group.get("_nsx_id", group["id"])), "owner": owner}
-    if group.get("_nsx_id"):
-        out["nsx_id"] = group["_nsx_id"]  # the key is <id>@<domain>
-    if group.get("description"):
-        out["description"] = group["description"]
+    out: dict = {"display_name": obj.get("display_name", obj.get("_nsx_id", obj["id"])), "owner": owner}
+    _optional(out, nsx_id=obj.get("_nsx_id"), description=obj.get("description"))
     if owner == "lm":
         out["sites"] = list(sites)
     if static:
-        out["why_static"] = (
-            "IMPORTED AS-IS from the live manager. Replace this note with the real reason "
-            "the membership is static, and what would let it become dynamic."
-        )
-    if (group.get("group_type") or []) == ["IPAddress"]:
+        out["why_static"] = STATIC_NOTE
+    if (obj.get("group_type") or []) == ["IPAddress"]:
         out["group_type"] = "IPAddress"  # "IP Addresses Only" in the UI
     if conjunction and len(criteria) > 1:
         out["conjunction"] = conjunction
-    # Identity firewall: Active Directory groups, by distinguished name and SID.
-    identity = [
-        {k: g[k] for k in ("distinguished_name", "domain_base_distinguished_name", "sid") if g.get(k)}
-        for e in group.get("extended_expression") or [] if e.get("resource_type") == "IdentityGroupExpression"
-        for g in e.get("identity_groups") or []
-    ]
-    if identity:
-        out["identity_groups"] = identity
-    if criteria:
-        out["criteria"] = criteria
-    elif not identity:
-        out["why_empty"] = (
-            "IMPORTED AS-IS: this group has no membership criteria in NSX, so it matches nothing "
-            "(or its members are managed elsewhere). Replace this note with the reason, or delete the group."
-        )
-    if tags_of(group):
-        out["tags"] = tags_of(group)
+    _optional(out, identity_groups=identity, criteria=criteria)
+    if not criteria and not identity:
+        out["why_empty"] = EMPTY_NOTE
+    _optional(out, tags=tags_of(obj))
     return out
 
 
-def convert_rule(rule: dict, group_paths: dict, service_paths: dict) -> dict:
-    def names(paths, lookup):
-        out = []
-        for path in paths or []:
-            if path == "ANY":
-                continue
-            out.append(lookup.get(path, path))
-        return out
+# --- rules and policies ----------------------------------------------------------
 
-    converted: dict = {
-        "name": rule.get("display_name", rule.get("_nsx_id", rule["id"])),
-        "sequence_number": rule.get("sequence_number", 100),
-        "action": rule.get("action", "ALLOW"),
-        "direction": rule.get("direction", "IN_OUT"),
-    }
-    if rule.get("description"):
-        converted["description"] = rule["description"]
-    if rule.get("ip_protocol") and rule["ip_protocol"] != "IPV4_IPV6":
-        converted["ip_version"] = rule["ip_protocol"]
-
-    sources = names(rule.get("source_groups"), group_paths)
-    destinations = names(rule.get("destination_groups"), group_paths)
-    services = names(rule.get("services"), service_paths)
-    scope = names(rule.get("scope"), group_paths)
-
-    if sources:
-        converted["source_groups"] = sources
-    if destinations:
-        converted["destination_groups"] = destinations
-    if services:
-        converted["services"] = services
-    if rule.get("service_entries"):
+def rule(obj: dict, group_paths: dict, service_paths: dict) -> dict:
+    out: dict = {"name": obj.get("display_name", obj.get("_nsx_id", obj["id"])),
+                 "sequence_number": obj.get("sequence_number", 100),
+                 "action": obj.get("action", "ALLOW"), "direction": obj.get("direction", "IN_OUT")}
+    _optional(out, description=obj.get("description"))
+    if obj.get("ip_protocol") and obj["ip_protocol"] != "IPV4_IPV6":
+        out["ip_version"] = obj["ip_protocol"]
+    _optional(out, source_groups=_keys(obj.get("source_groups"), group_paths),
+              destination_groups=_keys(obj.get("destination_groups"), group_paths),
+              services=_keys(obj.get("services"), service_paths))
+    if obj.get("service_entries"):
         # Ports written in the rule itself: the same entries a service holds.
-        entries = convert_service({"id": rule["id"], "service_entries": rule["service_entries"]})
-        converted["service_entries"] = {k: v for k, v in entries.items() if k not in ("display_name", "description")}
-    if rule.get("sources_excluded"):
-        converted["sources_excluded"] = True
-    if rule.get("destinations_excluded"):
-        converted["destinations_excluded"] = True
-    if rule.get("disabled"):
-        converted["disabled"] = True
-    converted["logged"] = bool(rule.get("logged", False))
-    if rule.get("notes"):
-        converted["notes"] = rule["notes"]
-    if rule.get("tag"):
-        converted["log_label"] = rule["tag"]
-    profiles = [p for p in rule.get("profiles") or [] if p != "ANY"]
-    if profiles:
-        converted["profiles"] = profiles
-    if tags_of(rule):
-        converted["tags"] = tags_of(rule)
+        entries = service({"id": obj["id"], "service_entries": obj["service_entries"]})
+        out["service_entries"] = {k: v for k, v in entries.items() if k not in ("display_name", "description")}
+    _optional(out, sources_excluded=bool(obj.get("sources_excluded")),
+              destinations_excluded=bool(obj.get("destinations_excluded")), disabled=bool(obj.get("disabled")))
+    out["logged"] = bool(obj.get("logged", False))
+    _optional(out, notes=obj.get("notes"), log_label=obj.get("tag"),
+              profiles=[p for p in obj.get("profiles") or [] if p != "ANY"], tags=tags_of(obj))
     # Apply To "ANY" (the policy's own scope) is written as ANY: an empty list
     # would read as a rule that forgot its Apply To, and is refused.
-    converted["scope"] = scope or ["ANY"]
-    if rule.get("_nsx_id"):
-        converted["nsx_id"] = rule["_nsx_id"]  # the key is the display name
-    return converted
+    out["scope"] = _keys(obj.get("scope"), group_paths) or ["ANY"]
+    _optional(out, nsx_id=obj.get("_nsx_id"))
+    return out
 
 
-def convert_policy(policy: dict, group_paths: dict, service_paths: dict, owner: str, sites: list[str]) -> dict:
-    header: dict = {
-        "id": policy.get("_nsx_id", policy["id"]),  # NSX's id; the file name is the key
-        "name": policy.get("display_name", policy.get("_nsx_id", policy["id"])),
-        "category": policy.get("category", "Application"),
-        "owner": owner,
-    }
-    if policy.get("description"):
-        header["description"] = policy["description"]
+def policy(obj: dict, group_paths: dict, service_paths: dict, owner: str, sites: list[str]) -> dict:
+    """The whole policy file: {"policy": header, "rules": {key: rule}}."""
+    header: dict = {"id": obj.get("_nsx_id", obj["id"]),  # NSX's id; the file name is the key
+                    "name": obj.get("display_name", obj.get("_nsx_id", obj["id"])),
+                    "category": obj.get("category", "Application"), "owner": owner}
+    _optional(header, description=obj.get("description"))
     if owner == "lm":
         header["sites"] = list(sites)
-    header["sequence_number"] = policy.get("sequence_number", 100)
-    if policy.get("stateful") is False:
+    header["sequence_number"] = obj.get("sequence_number", 100)
+    if obj.get("stateful") is False:
         header["stateful"] = False
-    if policy.get("locked"):
-        header["locked"] = True
-    if policy.get("comments"):
-        header["comments"] = policy["comments"]
-    if tags_of(policy):
-        header["tags"] = tags_of(policy)
+    _optional(header, locked=bool(obj.get("locked")), comments=obj.get("comments"), tags=tags_of(obj))
     header["rule_management"] = "standalone"
-    header["scope"] = [
-        group_paths.get(p, p) for p in policy.get("scope", []) if p != "ANY"
-    ] or ["ANY"]
-
-    rules = {}
-    for rule in policy.get("rules", []):
-        rules[rule["id"]] = convert_rule(rule, group_paths, service_paths)
+    header["scope"] = _keys(obj.get("scope"), group_paths) or ["ANY"]
+    rules = {r["id"]: rule(r, group_paths, service_paths) for r in obj.get("rules", [])}
     numbers = [r["sequence_number"] for r in rules.values()]
     if len(numbers) != len(set(numbers)):
         header["allow_duplicate_sequence"] = True
-
     return {"policy": header, "rules": rules}
 
 
-def convert_service(service: dict) -> dict:
-    out: dict = {"display_name": service.get("display_name", service["id"])}
-    if service.get("description"):
-        out["description"] = service["description"]
-    l4: list[dict] = []
-    icmp: list[dict] = []
-    other: dict[str, list[dict]] = {}
-    for entry in service.get("service_entries", []):
-        kind = entry.get("resource_type")
-        if kind == "L4PortSetServiceEntry":
-            item = {
-                "protocol": entry.get("l4_protocol", "TCP"),
-                "destination_ports": [str(p) for p in entry.get("destination_ports", [])],
-            }
-            if entry.get("display_name"):
-                item["display_name"] = entry["display_name"]
-            if entry.get("source_ports"):
-                item["source_ports"] = [str(p) for p in entry["source_ports"]]
-            l4.append(item)
-        elif kind == "ICMPTypeServiceEntry":
-            item = {"protocol": entry.get("protocol", "ICMPv4")}
-            if entry.get("display_name"):
-                item["display_name"] = entry["display_name"]
-            if entry.get("icmp_type") is not None:
-                item["icmp_type"] = str(entry["icmp_type"])
-            if entry.get("icmp_code") is not None:
-                item["icmp_code"] = str(entry["icmp_code"])
-            icmp.append(item)
-        elif kind == "IPProtocolServiceEntry":
-            item = {"protocol": int(entry["protocol_number"])}
-            if entry.get("display_name"):
-                item["display_name"] = entry["display_name"]
-            other.setdefault("ip_protocol", []).append(item)
-        elif kind == "ALGTypeServiceEntry":
-            item = {"algorithm": entry["alg"], "destination_port": str((entry.get("destination_ports") or [""])[0])}
-            if entry.get("display_name"):
-                item["display_name"] = entry["display_name"]
-            if entry.get("source_ports"):
-                item["source_ports"] = [str(p) for p in entry["source_ports"]]
-            other.setdefault("algorithm", []).append(item)
-        elif kind == "IGMPTypeServiceEntry":
-            other.setdefault("igmp", []).append({"display_name": entry["display_name"]} if entry.get("display_name") else {})
-        elif kind == "EtherTypeServiceEntry":
-            item = {"ether_type": int(entry["ether_type"])}
-            if entry.get("display_name"):
-                item["display_name"] = entry["display_name"]
-            other.setdefault("ether_type", []).append(item)
-    if l4:
-        out["l4_port_set"] = l4
-    if icmp:
-        out["icmp"] = icmp
-    out.update(other)
+# --- services --------------------------------------------------------------------
+
+def _entry(entry: dict, **fields) -> dict:
+    out = dict(fields)
+    _optional(out, display_name=entry.get("display_name"))
     return out
 
 
-# What this converter and the modules represent exactly. Anything else would be
-# lost on the first apply (an unset attribute is cleared), so such objects are
-# never adopted: they stay in the UI and are reported.
+def _ports(values) -> list[str]:
+    return [str(p) for p in values or []]
+
+
+def service(obj: dict) -> dict:
+    out: dict = {"display_name": obj.get("display_name", obj["id"])}
+    _optional(out, description=obj.get("description"))
+    found: dict[str, list[dict]] = {}
+    for e in obj.get("service_entries", []):
+        kind = e.get("resource_type")
+        if kind == "L4PortSetServiceEntry":
+            item = _entry(e, protocol=e.get("l4_protocol", "TCP"), destination_ports=_ports(e.get("destination_ports")))
+            _optional(item, source_ports=_ports(e.get("source_ports")))
+            found.setdefault("l4_port_set", []).append(item)
+        elif kind == "ICMPTypeServiceEntry":
+            item = _entry(e, protocol=e.get("protocol", "ICMPv4"))
+            for field in ("icmp_type", "icmp_code"):
+                if e.get(field) is not None:
+                    item[field] = str(e[field])
+            found.setdefault("icmp", []).append(item)
+        elif kind == "IPProtocolServiceEntry":
+            found.setdefault("ip_protocol", []).append(_entry(e, protocol=int(e["protocol_number"])))
+        elif kind == "ALGTypeServiceEntry":
+            item = _entry(e, algorithm=e["alg"], destination_port=str((e.get("destination_ports") or [""])[0]))
+            _optional(item, source_ports=_ports(e.get("source_ports")))
+            found.setdefault("algorithm", []).append(item)
+        elif kind == "IGMPTypeServiceEntry":
+            found.setdefault("igmp", []).append(_entry(e))
+        elif kind == "EtherTypeServiceEntry":
+            found.setdefault("ether_type", []).append(_entry(e, ether_type=int(e["ether_type"])))
+    # Order as data/ writes it: ports, ICMP, then the rest as NSX listed them.
+    for kind in ("l4_port_set", "icmp"):
+        if kind in found:
+            out[kind] = found.pop(kind)
+    out.update(found)
+    return out
+SCAFFOLD_EOF
+
+write_file scripts/nsxlib/adopt.py <<'SCAFFOLD_EOF'
+"""What of a manager's estate data/ may take over, and why the rest stays in the UI.
+
+    chosen = select(estate, site, role, domain)                # the whole manager
+    chosen = select(estate, site, role, domain, ["legacy-app"]) # one policy and what it needs
+
+An object is adopted only when data/ can say exactly what NSX holds: Terraform
+clears what it does not set, so anything less would change the object on the
+first apply. What cannot be adopted is named, with the reason, never dropped.
+
+Three more things keep two owners from fighting over one object:
+  * another tool's objects (NCP, vSphere with Tanzu, ... inventory/ownership.yaml)
+    are never adopted; a rule may still use such a group, by name (references:);
+  * what data/ already declares is managed already, and never adopted again;
+  * a Local Manager never adopts the Global Manager's objects, and an id two
+    managers share in data/ is not adopted twice.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+
+from nsxlib import convert, model
+from nsxlib.convert import is_system
+from nsxlib.nsx import domain_of
+from nsxlib.yamlio import load_yaml
+
+
+class Refused(Exception):
+    """A policy asked for by name cannot be adopted: nothing is written."""
+
+
+# --- 1. what data/ can represent exactly -------------------------------------
+
 GROUP_EXPRESSIONS = {"Condition", "NestedExpression", "IPAddressExpression", "MACAddressExpression",
                      "ExternalIDExpression", "PathExpression", "ConjunctionOperator"}
 EXTERNAL_ID_TYPES = {"VirtualMachine", "VirtualNetworkInterface", "CloudNativeServiceInstance", "PhysicalServer"}
 SERVICE_ENTRIES = {"L4PortSetServiceEntry", "ICMPTypeServiceEntry", "IPProtocolServiceEntry", "ALGTypeServiceEntry",
                    "IGMPTypeServiceEntry", "EtherTypeServiceEntry"}
-ALGORITHMS = {"ORACLE_TNS", "FTP", "SUN_RPC_TCP", "SUN_RPC_UDP", "MS_RPC_TCP", "MS_RPC_UDP", "NBNS_BROADCAST", "NBDG_BROADCAST", "TFTP"}
+ALGORITHMS = {"ORACLE_TNS", "FTP", "SUN_RPC_TCP", "SUN_RPC_UDP", "MS_RPC_TCP", "MS_RPC_UDP", "NBNS_BROADCAST",
+              "NBDG_BROADCAST", "TFTP"}
+
+# Every field NSX returns is represented, known to be safe to leave, or makes
+# the object not adoptable, by name.
+METADATA = {"id", "path", "relative_path", "parent_path", "remote_path", "resource_type", "unique_id",
+            "realization_id", "marked_for_delete", "overridden", "display_name", "description", "tags",
+            "children", "origin_site_id", "owner_id", "is_default"}
+KNOWN_FIELDS = {
+    "rule": {"action", "destination_groups", "destinations_excluded", "direction", "disabled", "ip_protocol",
+             "logged", "notes", "profiles", "rule_id", "scope", "sequence_number", "service_entries", "services",
+             "source_groups", "sources_excluded", "tag"},
+    "policy": {"category", "comments", "internal_sequence_number", "lock_modified_by", "lock_modified_time",
+               "locked", "rules", "scope", "sequence_number", "stateful", "tcp_strict", "rule_count"},
+    "group": {"expression", "extended_expression", "group_type", "state"},
+    "service": {"service_entries", "service_type"},
+}
+NAMED_FIELDS = {
+    "scheduler_path": "a time window, which Terraform cannot express (scripts/schedule.py convert turns it into "
+                      "a schedule:, docs/SCHEDULES.md)",
+    "connectivity_strategy": "a connectivity strategy, which Terraform cannot express",
+    "application_connectivity_strategy": "an application connectivity strategy, which Terraform cannot express",
+    "connectivity_preference": "a connectivity preference, which Terraform cannot express",
+    "logging_enabled": "policy-wide logging, which Terraform cannot express",
+    "reference": "a federation reference group, which belongs to the Global Manager",
+}
+UNSET = (None, False, "", "NONE", [], {}, ["ANY"])
+_condition_values: dict[str, set[str]] = {}
 
 
-def condition_values() -> dict[str, set[str]]:
-    """What data/schema/group.schema.json accepts in a condition: a condition
-    with anything else is not adopted, so the copy always validates."""
-    schema = json.loads((DATA / "schema" / "group.schema.json").read_text())
-    item = schema["properties"]["groups"]["additionalProperties"]["properties"]["criteria"]["items"]
-    fields = item["properties"]["conditions"]["items"]["properties"]
-    return {k: set(fields[k]["enum"]) for k in ("key", "member_type", "operator")}
-
-
-CONDITION_VALUES: dict[str, set[str]] = {}
+def field_unsupported(kind: str, obj: dict) -> str | None:
+    """The first field this object carries that data/ cannot represent, or None."""
+    for name in sorted(obj):
+        if name.startswith("_") or name in METADATA or name in KNOWN_FIELDS[kind] or obj[name] in UNSET:
+            continue
+        if name in NAMED_FIELDS:
+            return f"has {NAMED_FIELDS[name]} ({name})"
+        return f"carries {name}={json.dumps(obj[name], default=str)[:60]}, which this tool does not represent"
+    return None
 
 
 def condition_unsupported(expression: dict) -> str | None:
-    if not CONDITION_VALUES:
-        CONDITION_VALUES.update(condition_values())
-    for field, default in (("key", "Tag"), ("member_type", "VirtualMachine"), ("operator", "EQUALS")):
-        value = expression.get(field, default)
-        if value not in CONDITION_VALUES[field]:
-            return f"a condition with {field} {value}"
+    if not _condition_values:
+        # What data/schema/group.schema.json accepts: an adopted copy always validates.
+        schema = json.loads((model.DATA / "schema" / "group.schema.json").read_text())
+        item = schema["properties"]["groups"]["additionalProperties"]["properties"]["criteria"]["items"]
+        fields = item["properties"]["conditions"]["items"]["properties"]
+        _condition_values.update({k: set(fields[k]["enum"]) for k in ("key", "member_type", "operator")})
+    for name, default in (("key", "Tag"), ("member_type", "VirtualMachine"), ("operator", "EQUALS")):
+        value = expression.get(name, default)
+        if value not in _condition_values[name]:
+            return f"a condition with {name} {value}"
     if expression.get("scope_operator", "EQUALS") != "EQUALS":
-        # The provider has no scope_operator: written without it, the condition
-        # would match a different set of members.
+        # The provider has no scope_operator: without it the condition matches other members.
         return f"a condition with scope_operator {expression['scope_operator']}"
     if not str(expression.get("value", "")):
         return "a condition with an empty value"
@@ -9400,26 +8895,26 @@ def condition_unsupported(expression: dict) -> str | None:
 
 
 def group_unsupported(group: dict) -> str | None:
-    kinds = set()
+    kinds = {e.get("resource_type") for e in group.get("expression", [])}
     for expression in group.get("expression", []):
-        kinds.add(expression.get("resource_type"))
         if expression.get("resource_type") == "NestedExpression":
-            inner = {e.get("resource_type") for e in expression.get("expressions", [])}
-            if inner - {"Condition", "ConjunctionOperator"}:
-                return "nested expression containing " + ", ".join(sorted(str(k) for k in inner - {"Condition", "ConjunctionOperator"}))
+            inner = {e.get("resource_type") for e in expression.get("expressions", [])} - {"Condition", "ConjunctionOperator"}
+            if inner:
+                return "nested expression containing " + ", ".join(sorted(map(str, inner)))
     if kinds - GROUP_EXPRESSIONS:
-        return "membership by " + ", ".join(sorted(str(k) for k in kinds - GROUP_EXPRESSIONS))
+        return "membership by " + ", ".join(sorted(map(str, kinds - GROUP_EXPRESSIONS)))
     for expression in group.get("expression", []):
-        if expression.get("resource_type") == "ExternalIDExpression" and expression.get("member_type", "VirtualMachine") not in EXTERNAL_ID_TYPES:
+        if expression.get("resource_type") == "ExternalIDExpression" and \
+                expression.get("member_type", "VirtualMachine") not in EXTERNAL_ID_TYPES:
             return f"external ids of {expression.get('member_type')}"
         conditions = [expression] if expression.get("resource_type") == "Condition" else [
             e for e in expression.get("expressions", []) if e.get("resource_type") == "Condition"]
         for c in conditions:
             if why := condition_unsupported(c):
                 return why
-    extended = {e.get("resource_type") for e in group.get("extended_expression") or []}
-    if extended - {"IdentityGroupExpression"}:
-        return "extended criteria of type " + ", ".join(sorted(str(k) for k in extended - {"IdentityGroupExpression"}))
+    extended = {e.get("resource_type") for e in group.get("extended_expression") or []} - {"IdentityGroupExpression"}
+    if extended:
+        return "extended criteria of type " + ", ".join(sorted(map(str, extended)))
     group_type = group.get("group_type") or []
     if group_type and group_type != ["IPAddress"]:
         return "group_type " + ", ".join(group_type)
@@ -9430,46 +8925,39 @@ def service_unsupported(service: dict) -> str | None:
     entries = service.get("service_entries", [])
     kinds = {e.get("resource_type") for e in entries} - SERVICE_ENTRIES
     if kinds:
-        return "service entries of type " + ", ".join(sorted(str(k) for k in kinds))
+        return "service entries of type " + ", ".join(sorted(map(str, kinds)))
     for e in entries:
-        if e.get("resource_type") == "ALGTypeServiceEntry" and (e.get("alg") not in ALGORITHMS or len(e.get("destination_ports") or []) != 1):
+        kind = e.get("resource_type")
+        if kind == "ALGTypeServiceEntry" and (e.get("alg") not in ALGORITHMS or len(e.get("destination_ports") or []) != 1):
             return f"an ALG entry {e.get('alg')} with {len(e.get('destination_ports') or [])} destination port(s)"
-        if e.get("resource_type") == "IPProtocolServiceEntry" and e.get("protocol_number") is None:
+        if kind == "IPProtocolServiceEntry" and e.get("protocol_number") is None:
             return "an IP protocol entry without a protocol number"
-        if e.get("resource_type") == "EtherTypeServiceEntry" and e.get("ether_type") is None:
+        if kind == "EtherTypeServiceEntry" and e.get("ether_type") is None:
             return "an EtherType entry without an ether type"
     return None
 
 
-def unsupported_objects(groups: list[dict], services: list[dict], start: dict[str, str] | None = None,
-                        elsewhere: dict[str, str] | None = None) -> dict[str, str]:
-    """path -> reason, for groups and custom services that cannot be adopted.
-    A group that nests an unsupported group is unsupported too. start: paths
-    already known to be unadoptable (federation()). elsewhere: objects another
-    tool owns; they are used by name, never adopted, so their content does not
-    matter here."""
-    elsewhere = elsewhere or {}
-    bad: dict[str, str] = {p: why for p, why in (start or {}).items() if p not in elsewhere}
-    for g in groups:
-        if not is_system(g) and g.get("path") not in elsewhere and (
-                why := field_unsupported("group", g) or group_unsupported(g)):
-            bad[g["path"]] = why
-    for s in services:
-        if not is_system(s) and s.get("path") not in elsewhere and (
-                why := field_unsupported("service", s) or service_unsupported(s)):
-            bad[s["path"]] = why
+def unsupported_objects(groups: list[dict], services: list[dict], start: dict[str, str],
+                        elsewhere: dict[str, str]) -> dict[str, str]:
+    """path -> why, for groups and custom services that cannot be adopted. A
+    group nesting one of them cannot either. start: paths known to be blocked
+    already. elsewhere: another tool's objects, used by name, never adopted."""
+    bad = {p: why for p, why in start.items() if p not in elsewhere}
+    for kind, objects, check in (("group", groups, group_unsupported), ("service", services, service_unsupported)):
+        for o in objects:
+            if not is_system(o) and o.get("path") not in elsewhere and (why := field_unsupported(kind, o) or check(o)):
+                bad[o["path"]] = why
     changed = True
     while changed:
         changed = False
         for g in groups:
             if g.get("path") in bad or is_system(g) or g.get("path") in elsewhere:
                 continue
-            for expression in g.get("expression", []):
-                hit = [p for p in expression.get("paths", []) if p in bad] if expression.get("resource_type") == "PathExpression" else []
-                if hit:
-                    bad[g["path"]] = "nests " + ", ".join(h.rsplit("/", 1)[-1] for h in hit)
-                    changed = True
-                    break
+            hit = [p for e in g.get("expression", []) if e.get("resource_type") == "PathExpression"
+                   for p in e.get("paths", []) if p in bad]
+            if hit:
+                bad[g["path"]] = "nests " + ", ".join(h.rsplit("/", 1)[-1] for h in hit)
+                changed = True
     return bad
 
 
@@ -9478,21 +8966,26 @@ def rule_unsupported(rule: dict, bad: dict[str, str]) -> str | None:
         return why
     if rule.get("service_entries") and (why := service_unsupported({"service_entries": rule["service_entries"]})):
         return "inline " + why
-    used = sorted({p for f in ("source_groups", "destination_groups", "scope", "services") for p in rule.get(f) or [] if p in bad})
+    used = sorted({p for f in ("source_groups", "destination_groups", "scope", "services") for p in rule.get(f) or []
+                   if p in bad})
     if used:
         return "uses " + "; ".join(f"{u.rsplit('/', 1)[-1]} ({bad[u]})" for u in used)
     return None
 
 
-def is_system(obj: dict) -> bool:
-    return bool(obj.get("_system_owned")) or obj.get("_create_user") == "system"
+def policy_unsupported(policy: dict, bad: dict[str, str]) -> str | None:
+    """Why the policy as a whole stays in the UI (its rules aside), or None."""
+    if why := field_unsupported("policy", policy):
+        return why
+    blocked = [p.rsplit("/", 1)[-1] for p in policy.get("scope") or [] if p in bad]
+    if blocked:
+        return f"its Apply To uses {', '.join(blocked)}, which cannot be adopted"
+    return None
 
 
-# --------------------------------------------------------------------------
-# Objects another tool owns: never adopted, never drift, still usable by name
-# --------------------------------------------------------------------------
+# --- 2. who owns it ----------------------------------------------------------
 
-OWNERSHIP = REPO_ROOT / "inventory" / "ownership.yaml"
+OWNERSHIP = model.REPO / "inventory" / "ownership.yaml"
 # What NSX marks an object created by a principal identity (NCP, vSphere with
 # Tanzu, VCF Automation, any certificate-based integration) with.
 PROTECTED = {"PROTECTED", "REQUIRE_OVERRIDE"}
@@ -9503,9 +8996,6 @@ def ownership_rules() -> list[dict]:
     """inventory/ownership.yaml's owned_elsewhere list; the defaults without one."""
     if not OWNERSHIP.exists():
         return list(DEFAULT_OWNERSHIP)
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from yamlcompat import load_yaml  # noqa: PLC0415
-
     rules = (load_yaml(OWNERSHIP.read_text()) or {}).get("owned_elsewhere")
     return [r for r in rules or [] if isinstance(r, dict)]
 
@@ -9529,57 +9019,30 @@ def owned_elsewhere(obj: dict, rules: list[dict]) -> str | None:
     return None
 
 
-# --------------------------------------------------------------------------
-# Every field NSX returns is either represented, known to be safe to leave, or
-# makes the object not adoptable, named. Nothing is dropped silently: a field
-# Terraform does not set is cleared, or kept on an object it then claims to own.
-# --------------------------------------------------------------------------
-
-METADATA = {"id", "path", "relative_path", "parent_path", "remote_path", "resource_type", "unique_id",
-            "realization_id", "marked_for_delete", "overridden", "display_name", "description", "tags",
-            "children", "origin_site_id", "owner_id", "is_default"}
-KNOWN_FIELDS = {
-    "rule": {"action", "destination_groups", "destinations_excluded", "direction", "disabled", "ip_protocol",
-             "logged", "notes", "profiles", "rule_id", "scope", "sequence_number", "service_entries", "services",
-             "source_groups", "sources_excluded", "tag"},
-    "policy": {"category", "comments", "internal_sequence_number", "lock_modified_by", "lock_modified_time",
-               "locked", "rules", "scope", "sequence_number", "stateful", "tcp_strict", "rule_count"},
-    "group": {"expression", "extended_expression", "group_type", "state"},
-    "service": {"service_entries", "service_type"},
-}
-# Fields with a name, because what they carry matters.
-NAMED_FIELDS = {
-    "scheduler_path": "a time window, which Terraform cannot express (scripts/convert-time-windows.py turns it into a schedule:, docs/SCHEDULES.md)",
-    "connectivity_strategy": "a connectivity strategy, which Terraform cannot express",
-    "application_connectivity_strategy": "an application connectivity strategy, which Terraform cannot express",
-    "connectivity_preference": "a connectivity preference, which Terraform cannot express",
-    "logging_enabled": "policy-wide logging, which Terraform cannot express",
-    "reference": "a federation reference group, which belongs to the Global Manager",
-}
-UNSET = (None, False, "", "NONE", [], {}, ["ANY"])
+def creators(site: str, objects: list[tuple[str, dict]], rules: list[dict]) -> list[str]:
+    """Who creates what on this manager: which tool owns which objects."""
+    rows: dict[tuple[str, str], dict[str, int]] = {}
+    for kind, o in objects:
+        if not is_system(o):
+            row = rows.setdefault((str(o.get("_create_user") or "?"),
+                                   "owned elsewhere" if owned_elsewhere(o, rules) else "adoptable"), {})
+            row[kind] = row.get(kind, 0) + 1
+    if not rows:
+        return []
+    lines = [f"who creates what on {site} (system objects aside):",
+             f"  {'CREATED BY':<40} {'GROUPS':>7} {'POLICIES':>8} {'RULES':>6} {'SERVICES':>8}  TREATED AS"]
+    for (who, verdict), n in sorted(rows.items(), key=lambda kv: (-sum(kv[1].values()), kv[0])):
+        lines.append(f"  {who[:40]:<40} {n.get('group', 0):>7} {n.get('policy', 0):>8} "
+                     f"{n.get('rule', 0):>6} {n.get('service', 0):>8}  {verdict}")
+    lines.append("  An account that is a tool, not a person, belongs in inventory/ownership.yaml (created_by:).")
+    return lines
 
 
-def field_unsupported(kind: str, obj: dict) -> str | None:
-    """The first field this object carries that nothing here represents, or None."""
-    for name in sorted(obj):
-        if name.startswith("_") or name in METADATA or name in KNOWN_FIELDS[kind]:
-            continue
-        value = obj[name]
-        if value in UNSET:
-            continue
-        what = NAMED_FIELDS.get(name)
-        if what:
-            return f"has {what} ({name})"
-        shown = json.dumps(value, default=str)
-        return f"carries {name}={shown[:60]}, which this tool does not represent"
-    return None
-
-
-# --------------------------------------------------------------------------
-# Readable keys. An id the UI generated (a UUID) says nothing in a review, so
-# such an object is keyed by its display name, with the id kept as nsx_id. A
-# key never changes once chosen: what data/ already calls an object, it keeps.
-# --------------------------------------------------------------------------
+# --- 3. keys -----------------------------------------------------------------
+# A UUID the UI generated says nothing in a review, so such an object is keyed
+# by its display name, with the id kept as nsx_id. A key never changes once
+# chosen (a new key would be a destroy and create): what data/ calls an
+# object, it keeps.
 
 UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
@@ -9588,40 +9051,9 @@ def slug(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-._")[:80]
 
 
-def known_keys() -> tuple[dict[tuple, str], set[str], set[str]]:
-    """(kind, domain, nsx id[, rule nsx id]) -> the key data/ uses, and the group
-    and policy keys taken, from every file data/ has (mirror files included)."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from yamlcompat import load_all  # noqa: PLC0415
-
-    files = sorted((DATA / "groups").glob("*.yaml")) + sorted((DATA / "policies").glob("*.yaml"))
-    docs = load_all([f.read_text() for f in files]) if files else []
-    known: dict[tuple, str] = {}
-    groups: set[str] = set()
-    policies: set[str] = set()
-    for f, doc in zip(files, docs):
-        doc = doc or {}
-        if f.parent.name == "groups":
-            for section in ("groups", "references"):
-                for k, g in (doc.get(section) or {}).items():
-                    g = g if isinstance(g, dict) else {}
-                    groups.add(str(k))
-                    known[("group", g.get("domain") or "default", str(g.get("nsx_id", k)))] = str(k)
-        else:
-            header = doc.get("policy") or {}
-            where = header.get("domain") or "default"
-            pid = str(header.get("id") or f.stem)
-            policies.add(f.stem)
-            known[("policy", where, pid)] = f.stem
-            for k, r in (doc.get("rules") or {}).items():
-                r = r if isinstance(r, dict) else {}
-                known[("rule", where, pid, str(r.get("nsx_id", k)))] = str(k)
-    return known, groups, policies
-
-
-def readable(kind: str, nsx: str, name: str, where: str, taken: set[str]) -> str:
-    """A key for an object no file names yet: its id, or for a UUID its display
-    name (<name>@<domain> outside default), made unique."""
+def readable(nsx: str, name: str, where: str, taken: set[str]) -> str:
+    """A key for an object no file names yet: its id (<id>@<domain> outside
+    default), or for a UUID its display name, made unique."""
     base = slug(name) if UUID.match(nsx) else ""
     if not base:
         return nsx if where == "default" else f"{nsx}@{where}"
@@ -9634,219 +9066,87 @@ def readable(kind: str, nsx: str, name: str, where: str, taken: set[str]) -> str
 
 
 def assign_keys(groups: list[dict], policies: list[dict]) -> None:
-    """Set each object's key (o['id']), keeping the NSX id in o['_nsx_id']."""
-    known, taken_groups, taken_policies = known_keys()
+    """Set each object's key in o["id"], the NSX id in o["_nsx_id"] where they differ."""
+    known, taken_groups, taken_policies = model.known_keys()
     for kind, objects, taken in (("group", groups, taken_groups), ("policy", policies, taken_policies)):
         fresh = []
         for o in sorted(objects, key=lambda o: (o.get("path", ""), o.get("id", ""))):
-            nsx = str(o.get("_nsx_id", o["id"]))
-            where = domain_of(o.get("path", ""), "default")
+            nsx, where = str(o.get("_nsx_id", o["id"])), domain_of(o.get("path", ""))
             key = known.get((kind, where, nsx))
             if key is None:
                 fresh.append((o, nsx, where))
-                continue
-            o["_nsx_id"], o["id"] = nsx, key
-        # Ids that are not UUIDs keep their own key; they are placed first, so a
-        # display name can never take a key an id already has.
-        fresh.sort(key=lambda f: bool(UUID.match(f[1])))
-        for o, nsx, where in fresh:
-            key = readable(kind, nsx, o.get("display_name", ""), where, taken)
+            else:
+                o["_nsx_id"], o["id"] = nsx, key
+        # Ids that are not UUIDs first: a display name never takes a key an id has.
+        for o, nsx, where in sorted(fresh, key=lambda f: bool(UUID.match(f[1]))):
+            key = readable(nsx, o.get("display_name", ""), where, taken)
             taken.add(key)
             o["_nsx_id"], o["id"] = nsx, key
-        for o in objects:
-            if o["_nsx_id"] == o["id"]:
-                del o["_nsx_id"]
     for policy in policies:
-        where = domain_of(policy.get("path", ""), "default")
-        pid = str(policy.get("_nsx_id", policy["id"]))
-        taken = set()
-        fresh = []
+        where, pid = domain_of(policy.get("path", "")), str(policy.get("_nsx_id", policy["id"]))
+        taken, fresh = set(), []
         for rule in policy.get("rules", []):
-            nsx = str(rule["id"])
-            key = known.get(("rule", where, pid, nsx))
+            key = known.get(("rule", where, pid, str(rule["id"])))
             if key is None:
                 fresh.append(rule)
             else:
-                rule["_nsx_id"], rule["id"] = nsx, key
+                rule["_nsx_id"], rule["id"] = str(rule["id"]), key
                 taken.add(key)
         for rule in sorted(fresh, key=lambda r: (bool(UUID.match(str(r["id"]))), str(r["id"]))):
-            nsx = str(rule["id"])
-            key = readable("rule", nsx, rule.get("display_name", ""), "default", taken)
+            key = readable(str(rule["id"]), rule.get("display_name", ""), "default", taken)
             taken.add(key)
-            rule["_nsx_id"], rule["id"] = nsx, key
-        for rule in policy.get("rules", []):
-            if rule["_nsx_id"] == rule["id"]:
-                del rule["_nsx_id"]
+            rule["_nsx_id"], rule["id"] = str(rule["id"]), key
+    for o in groups + policies + [r for p in policies for r in p.get("rules", [])]:
+        if o.get("_nsx_id") == o["id"]:
+            del o["_nsx_id"]
 
 
-def ownership_report(site: str, objects: list[tuple[str, dict]], rules: list[dict]) -> list[str]:
-    """Who creates what on this manager: the answer to which tool owns which objects."""
-    rows: dict[tuple[str, str], dict[str, int]] = {}
-    for kind, o in objects:
-        if is_system(o):
-            continue
-        who = str(o.get("_create_user") or "?")
-        why = owned_elsewhere(o, rules)
-        row = rows.setdefault((who, "owned elsewhere" if why else "adoptable"), {})
-        row[kind] = row.get(kind, 0) + 1
-    if not rows:
-        return []
-    lines = [f"who creates what on {site} (system objects aside):",
-             f"  {'CREATED BY':<40} {'GROUPS':>7} {'POLICIES':>8} {'RULES':>6} {'SERVICES':>8}  TREATED AS"]
-    for (who, verdict), counts in sorted(rows.items(), key=lambda kv: (-sum(kv[1].values()), kv[0])):
-        lines.append(f"  {who[:40]:<40} {counts.get('group', 0):>7} {counts.get('policy', 0):>8} "
-                     f"{counts.get('rule', 0):>6} {counts.get('service', 0):>8}  {verdict}")
-    lines.append("  An account that is a tool, not a person, belongs in inventory/ownership.yaml (created_by:).")
-    return lines
-
-
-# --------------------------------------------------------------------------
-# Writing
-# --------------------------------------------------------------------------
-
-class Writer:
-    def __init__(self, dry_run: bool, overwrite: bool = False) -> None:
-        self.dry_run = dry_run
-        self.overwrite = overwrite
-        self.written: list[str] = []
-        self.deferred: list[str] = []
-
-    def write(self, path: Path, text: str) -> None:
-        rel = str(path.relative_to(REPO_ROOT))
-        target = path
-        if path.exists() and not self.overwrite:
-            target = path.with_suffix(path.suffix + ".new")
-            self.deferred.append(f"{rel} -> {target.name}")
-        else:
-            self.written.append(rel)
-        if self.dry_run:
-            return
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text)
-
-
-def import_block(address: str, identifier: str) -> str:
-    return f'import {{\n  to = {address}\n  id = "{identifier}"\n}}\n\n'
-
-
-def object_id(kind: str, domain: str, path: str, nsx_id: str, fmt: str) -> str:
-    if fmt == "path":
-        return path
-    if fmt == "domain-id" and kind != "service":
-        return f"{domain}/{nsx_id}"
-    return nsx_id
-
-
-def hcl_string(value: str) -> str:
-    """A Terraform string literal: JSON escaping, plus HCL's own template markers."""
-    return json.dumps(value).replace("${", "$${").replace("%{", "%%{")
-
-
-def ident(text: str) -> str:
-    return re.sub(r"[^a-z0-9_]", "_", text.lower())
-
-
-def import_file(site: str, tranche: str, role: str, kinds: list[tuple[str, str, dict]], header: str) -> str:
-    """Import blocks for one tranche, one block per resource kind, each a for_each
-    over a map. On a Local Manager the map is empty unless var.site is this site,
-    so the file is inert in every other manager's plan of the same stack."""
-    name = f"import_{ident(site)}_{ident(tranche)}"
-    lines = [header, "locals {"]
-    for kind, _, entries in kinds:
-        lines.append(f"  {name}_{kind} = {{")
-        # Aligned on '=' as terraform fmt aligns it, so 'fmt -check' passes as written.
-        width = max((len(hcl_string(k)) for k in entries), default=0)
-        for key, value in entries.items():
-            if isinstance(value, dict):
-                inner = ", ".join(f"{k} = {hcl_string(v)}" for k, v in value.items())
-                lines.append(f"    {hcl_string(key).ljust(width)} = {{ {inner} }}")
-            else:
-                lines.append(f"    {hcl_string(key).ljust(width)} = {hcl_string(value)}")
-        lines.append("  }")
-    lines.append("}")
-    lines.append("")
-    for kind, to, entries in kinds:
-        if not entries:
-            continue
-        source = f"local.{name}_{kind}"
-        if role != "gm":
-            source = f"var.site == {hcl_string(site)} ? {source} : {{}}"
-        value = "each.value.id" if "each.value.policy" in to else "each.value"
-        lines += ["import {", f"  for_each = {source}", f"  to       = {to}", f"  id       = {value}", "}", ""]
-    return "\n".join(lines) + "\n"
-
-
-def mirror_files(site: str) -> set[Path]:
-    """The data files mirror mode owns for this manager, by their first line."""
-    own: set[Path] = set()
-    for kind in ("groups", "services", "policies", "exclude-list"):
-        for f in (DATA / kind).glob("*.yaml"):
-            if f.read_text().split("\n", 1)[0].strip() == f"{MIRROR_MARK}{site}":
-                own.add(f)
-    return own
-
-
-def declared_objects(exclude: frozenset[Path] | set[Path] = frozenset()) -> dict[str, dict[str, dict]]:
-    """Groups and custom services data/ declares, id -> definition."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from yamlcompat import load_yaml  # noqa: PLC0415
-
-    out: dict[str, dict[str, dict]] = {"groups": {}, "services": {}}
-    for kind, key in (("groups", "groups"), ("services", "custom")):
-        for f in sorted((DATA / kind).glob("*.yaml")):
-            if f in exclude:
-                continue
-            for name, definition in ((load_yaml(f.read_text()) or {}).get(key) or {}).items():
-                out[kind][name] = definition if isinstance(definition, dict) else {}
-    return out
-
+# --- 4. Global Manager and Local Managers ------------------------------------
 
 def federation(role: str, site: str, groups: list, services: list, policies: list,
                declared: dict, group_paths: dict, service_paths: dict) -> dict[str, str]:
-    """What cannot be adopted on this manager because of the Global Manager / Local
-    Manager split, path -> reason; fills group_paths and service_paths with the
-    global objects a Local Manager's rules may use.
+    """path -> why, for what cannot be adopted on this manager because of the
+    Global/Local Manager split. Adds to group_paths and service_paths the global
+    objects a Local Manager's rules may use: those data/ declares as owner: gm.
 
-    data/ is keyed by id, and each object has one owner, so an object belongs to
-    exactly one manager's stack and two stacks never fight over it. Here that
-    is kept true: a local object whose id another manager already owns in
-    data/ is not adopted (its name would resolve to the other object), and a
-    reference that resolves to nothing data/ declares is not adopted either,
-    rather than written as a raw path."""
+    Each object has one owner in data/, so exactly one manager's stack manages
+    it. A local object whose id another manager already owns in data/ is not
+    adopted (its key would name the other object), nor is a reference to
+    something data/ does not declare (it would be written as a raw path)."""
     default_owner = {"groups": "lm", "services": "gm"}
 
     def elsewhere(kind: str, definition: dict) -> bool:
         owner = definition.get("owner", default_owner[kind])
         if role == "gm":
             return owner != "gm"
-        sites_ = definition.get("sites") or []
-        return owner == "gm" or not (site in sites_ or "*" in sites_)
+        sites = definition.get("sites") or []
+        return owner == "gm" or not (site in sites or "*" in sites)
 
     if role != "gm":
-        # A Local Manager sees the Global Manager's objects under /global-infra,
-        # read-only. Its own rules may use those that data/ declares as owner: gm.
-        for gid, definition in declared["groups"].items():
-            if definition.get("owner", "lm") == "gm":
-                group_paths[f"/global-infra/domains/{definition.get('domain', 'default')}/groups/{definition.get('nsx_id', gid)}"] = gid
-        for sid, definition in declared["services"].items():
-            if definition.get("owner", "gm") == "gm":
-                service_paths[f"/global-infra/services/{sid}"] = sid
+        # A Local Manager sees the Global Manager's objects under /global-infra, read-only.
+        for key, d in declared["groups"].items():
+            if d.get("owner", "lm") == "gm":
+                group_paths[f"/global-infra/domains/{d.get('domain', 'default')}/groups/{d.get('nsx_id', key)}"] = key
+        for key, d in declared["services"].items():
+            if d.get("owner", "gm") == "gm":
+                service_paths[f"/global-infra/services/{key}"] = key
 
     problems: dict[str, str] = {}
     for kind, objects in (("groups", groups), ("services", services)):
         for obj in objects:
-            definition = declared[kind].get(obj["id"])
-            if definition is not None and not is_system(obj) and elsewhere(kind, definition):
-                whose = "the Global Manager's" if definition.get("owner", default_owner[kind]) == "gm" else "another manager's"
+            d = declared[kind].get(obj["id"])
+            if d is not None and not is_system(obj) and elsewhere(kind, d):
+                whose = "the Global Manager's" if d.get("owner", default_owner[kind]) == "gm" else "another manager's"
                 problems[obj["path"]] = f"its id is also {whose} {kind[:-1]} in data/, so the names would collide"
 
     def check(path: str, known: dict, what: str) -> None:
         if path in ("ANY", "") or path in known or path in problems:
             return
-        if what == "group" and not path.startswith("/") and is_ip_literal(path):
+        if what == "group" and not path.startswith("/") and convert.is_ip_literal(path):
             return  # an address, CIDR or range written in the rule itself
         if path.startswith("/global-infra/") and role != "gm":
-            problems[path] = f"uses the global {what} {path.rsplit('/', 1)[-1]}, which data/ does not declare: adopt or mirror the Global Manager first"
+            problems[path] = (f"uses the global {what} {path.rsplit('/', 1)[-1]}, which data/ does not declare: "
+                              "adopt or mirror the Global Manager first")
         else:
             problems[path] = f"refers to {path}, which {site} does not hold"
 
@@ -9854,313 +9154,197 @@ def federation(role: str, site: str, groups: list, services: list, policies: lis
         for path in policy.get("scope") or []:
             check(path, group_paths, "group")
         for rule in policy.get("rules", []):
-            for field in ("source_groups", "destination_groups", "scope"):
-                for path in rule.get(field) or []:
+            for name in ("source_groups", "destination_groups", "scope"):
+                for path in rule.get(name) or []:
                     check(path, group_paths, "group")
             for path in rule.get("services") or []:
                 check(path, service_paths, "service")
     for group in groups:
-        for expression in group.get("expression", []):
-            if expression.get("resource_type") != "PathExpression":
-                continue
-            for path in expression.get("paths", []):
-                if path.startswith("/global-infra/") and role != "gm":
-                    # A site-local group cannot be built from a global one here.
-                    problems.setdefault(group["path"], f"nests the global group {path.rsplit('/', 1)[-1]}")
-                else:
-                    check(path, group_paths, "group")
+        for path in nested_paths(group):
+            if path.startswith("/global-infra/") and role != "gm":
+                problems.setdefault(group["path"], f"nests the global group {path.rsplit('/', 1)[-1]}")
+            else:
+                check(path, group_paths, "group")
     return problems
 
 
-def existing_keys(exclude: frozenset[Path] | set[Path] = frozenset()) -> dict[str, set[str]]:
-    """What data/ already declares: those objects are managed and never re-imported.
-    Files in exclude are not counted (mirror mode's own, about to be rewritten)."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from yamlcompat import load_yaml  # noqa: PLC0415
+# --- 5. the choice -------------------------------------------------------------
 
-    found: dict[str, set[str]] = {"groups": set(), "services": set(), "policies": set()}
-    for f in sorted((DATA / "groups").glob("*.yaml")):
-        if f in exclude:
-            continue
-        found["groups"].update(((load_yaml(f.read_text()) or {}).get("groups") or {}).keys())
-    for f in sorted((DATA / "services").glob("*.yaml")):
-        if f in exclude:
-            continue
-        found["services"].update(((load_yaml(f.read_text()) or {}).get("custom") or {}).keys())
-    for f in sorted((DATA / "policies").glob("*.yaml")):
-        if f in exclude:
-            continue
-        # A policy's key is its file's name, as the stacks key it; the importer
-        # keys what it reads the same way (assign_keys).
-        found["policies"].add(f.stem)
-    return found
+def nested_paths(group: dict) -> list[str]:
+    return [p for e in group.get("expression", []) if e.get("resource_type") == "PathExpression" for p in e.get("paths", [])]
+
+
+def used_groups(policy: dict) -> set[str]:
+    out = set(policy.get("scope") or [])
+    for rule in policy.get("rules", []):
+        for name in ("source_groups", "destination_groups", "scope"):
+            out.update(rule.get(name) or [])
+    return out
 
 
 def needed_by(policies: list[dict], groups: list[dict]) -> tuple[set[str], set[str]]:
     """Group and service paths the policies use, nested groups followed to the end."""
-    group_paths: set[str] = set()
-    service_paths: set[str] = set()
-    for policy in policies:
-        group_paths.update(policy.get("scope") or [])
-        for rule in policy.get("rules", []):
-            for field in ("source_groups", "destination_groups", "scope"):
-                group_paths.update(rule.get(field) or [])
-            service_paths.update(rule.get("services") or [])
+    group_paths: set[str] = set().union(*(used_groups(p) for p in policies)) if policies else set()
+    service_paths = {s for p in policies for r in p.get("rules", []) for s in r.get("services") or []}
     by_path = {g.get("path"): g for g in groups}
     pending = list(group_paths)
     while pending:
-        group = by_path.get(pending.pop())
-        for expression in (group or {}).get("expression", []):
-            if expression.get("resource_type") == "PathExpression":
-                for nested in expression.get("paths", []):
-                    if nested not in group_paths:
-                        group_paths.add(nested)
-                        pending.append(nested)
-    group_paths.discard("ANY")
-    service_paths.discard("ANY")
-    return group_paths, service_paths
+        for nested in nested_paths(by_path.get(pending.pop()) or {}):
+            if nested not in group_paths:
+                group_paths.add(nested)
+                pending.append(nested)
+    return group_paths - {"ANY"}, service_paths - {"ANY"}
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    ap.add_argument("--site", required=True, help="manager id from inventory/managers.yaml")
-    ap.add_argument("--domain", default=None, help="NSX domain (default: 'default', or 'global' on a GM)")
-    ap.add_argument("--role", choices=["gm", "lm"], default=None, help="override the role from the inventory")
-    ap.add_argument("--from-dump", metavar="FILE", help="convert a previously captured dump instead of calling the API")
-    ap.add_argument("--dump-only", metavar="FILE", help="capture the raw API responses and stop")
-    ap.add_argument("--id-format", choices=["path", "domain-id", "id"], default="path")
-    ap.add_argument("--insecure", action="store_true", help="skip TLS verification (lab only)")
-    ap.add_argument("--dry-run", action="store_true", help="report what would be written")
-    ap.add_argument("--policy", action="append", default=[], metavar="ID",
-                    help="adopt only this policy and what it needs; repeat for more")
-    ap.add_argument("--list", action="store_true",
-                    help="survey: list the policies and whether each can be adopted; write nothing")
-    ap.add_argument("--tranche", default=None, metavar="NAME",
-                    help="name for this piece of work, used in the file names (default: the first --policy, or 'all')")
-    ap.add_argument("--mirror", action="store_true",
-                    help="mirror mode: every adoptable object, into files this tool owns and rewrites each run")
-    args = ap.parse_args()
-    if args.mirror and (args.policy or args.tranche or args.list or args.dump_only):
-        sys.exit("error: --mirror takes the whole manager: not with --policy, --tranche, --list or --dump-only")
-    if not args.mirror and args.tranche == "mirror":
-        sys.exit("error: the tranche name 'mirror' belongs to --mirror")
-    tranche = "mirror" if args.mirror else (args.tranche or (args.policy[0] if args.policy else "all"))
-    global CA_SITE
-    CA_SITE = args.site
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", tranche):
-        sys.exit(f"error: --tranche '{tranche}' must be letters, digits, '.', '_' or '-'")
+@dataclass
+class Choice:
+    """What to write, and what to report."""
+    groups: list = field(default_factory=list)       # NSX objects, keyed (assign_keys)
+    services: list = field(default_factory=list)
+    policies: list = field(default_factory=list)     # with only their adoptable rules
+    references: dict = field(default_factory=dict)   # another tool's groups, used by name
+    excluded: dict = field(default_factory=dict)     # exclusion-list key -> path
+    group_paths: dict = field(default_factory=dict)  # every path read -> its key
+    service_paths: dict = field(default_factory=dict)
+    managed: list = field(default_factory=list)      # in data/ already
+    owned_by_others: list = field(default_factory=list)
+    not_adopted: list = field(default_factory=list)  # cannot be represented exactly
+    creators: list = field(default_factory=list)
 
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from yamlcompat import load_yaml  # noqa: PLC0415
 
-    inventory_path = REPO_ROOT / "inventory" / "managers.yaml"
-    managers = {}
-    if inventory_path.exists():
-        managers = (load_yaml(inventory_path.read_text()) or {}).get("managers") or {}
-    manager = managers.get(args.site, {})
-    role = args.role or manager.get("role", "lm")
-    # On a Global Manager too, global objects live in domain "default" (another
-    # domain is one location's); scripts/tf.sh uses the same default.
-    domain = args.domain or manager.get("domain") or "default"
-    base = GM_BASE if role == "gm" else LM_BASE
+@dataclass
+class Estate:
+    """One manager's own objects (a Local Manager also lists the Global
+    Manager's: those are foreign here), keyed, with what blocks each."""
+    groups: list
+    services: list
+    policies: list
+    foreign: list
+    elsewhere: dict   # path -> why another tool owns it
+    federated: dict   # path -> why the GM/LM split blocks it
+    group_paths: dict
+    service_paths: dict
+    own: set          # this manager's mirror files (mirror mode only)
 
-    if args.from_dump:
-        estate = json.loads(Path(args.from_dump).read_text())
-        domain = estate.get("domain", domain)
-    else:
-        host = os.environ.get("NSXT_MANAGER_HOST") or manager.get("host")
-        user = os.environ.get("NSXT_USERNAME")
-        password = os.environ.get("NSXT_PASSWORD")
-        if not (host and user and password):
-            sys.exit(
-                "error: no credentials in the environment. Wrap the call:\n"
-                f"       scripts/with-credentials.sh {args.site} -- scripts/import-estate.py --site {args.site}"
-            )
-        # The flag the NSX provider reads, so the capture and the plan agree:
-        # where verification is switched off for Terraform, it is off here too.
-        insecure = args.insecure or os.environ.get("NSXT_ALLOW_UNVERIFIED_SSL", "").strip().lower() in ("true", "1", "yes")
-        if insecure:
-            print(f"warning: TLS verification of {host} is OFF (NSXT_ALLOW_UNVERIFIED_SSL or --insecure): "
-                  "whoever answers at that address receives the credentials.", file=sys.stderr)
-        estate = fetch_estate(host, user, password, base, domain, insecure)
 
-    if args.dump_only:
-        out = Path(args.dump_only)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(estate, indent=2))
-        print(f"wrote {out}")
-        return 0
-
-    # This manager's own tree only. A Local Manager also shows the Global
-    # Manager's objects (under /global-infra); those belong to the GM's data,
-    # never to an LM's, or the same object would be managed twice.
+def survey_estate(estate: dict, site: str, role: str, mirror: bool = False) -> Estate:
     tree = "/global-infra/" if role == "gm" else "/infra/"
-    foreign = [o for kind in ("groups", "services", "policies") for o in estate.get(kind, [])
-               if not str(o.get("path", tree)).startswith(tree)]
-    all_groups = [g for g in estate.get("groups", []) if str(g.get("path", tree)).startswith(tree)]
-    all_services = [s for s in estate.get("services", []) if str(s.get("path", tree)).startswith(tree)]
-    all_policies = [p for p in estate.get("policies", []) if str(p.get("path", tree)).startswith(tree)]
+    mine = lambda o: str(o.get("path", tree)).startswith(tree)  # noqa: E731
+    groups = [g for g in estate.get("groups", []) if mine(g)]
+    services = [s for s in estate.get("services", []) if mine(s)]
+    policies = [p for p in estate.get("policies", []) if mine(p)]
+    foreign = [o for kind in ("groups", "services", "policies") for o in estate.get(kind, []) if not mine(o)]
+    own = model.mirror_files(site) if mirror else set()
+    assign_keys(groups, policies)
+    rules = ownership_rules()
+    elsewhere = {o["path"]: why for o in groups + services + policies if o.get("path") and (why := owned_elsewhere(o, rules))}
+    # References become keys using everything read: a rule may name a group this run does not adopt.
+    group_paths = {g["path"]: g["id"] for g in groups if g.get("path")}
+    service_paths = {s["path"]: s["id"] for s in services if s.get("path")}
+    federated = federation(role, site, groups, services, policies, model.declared_objects(exclude=own),
+                           group_paths, service_paths)
+    return Estate(groups, services, policies, foreign, elsewhere, federated, group_paths, service_paths, own)
 
-    own: set[Path] = mirror_files(args.site) if args.mirror else set()
-    # data/ keys objects as NSX does, by domain and id: in 'default' by its id,
-    # in any other domain as <id>@<domain>, with the id as nsx_id; an id the UI
-    # generated (a UUID) by the display name instead. Always, not only when an
-    # id appears in two domains, and a key data/ already uses is kept, so a key
-    # never changes later (a new key would be a destroy and create). From here
-    # on o["id"] is the key.
-    assign_keys(all_groups, all_policies)
-    # What another tool owns (NCP, vSphere with Tanzu, VCF Automation...): never
-    # adopted, never drift. A rule may still use such a group, by name.
-    rules_ = ownership_rules()
-    elsewhere = {o["path"]: why for o in all_groups + all_services + all_policies
-                 if o.get("path") and (why := owned_elsewhere(o, rules_))}
-    creators = ownership_report(args.site, [("group", g) for g in all_groups] + [("service", s_) for s_ in all_services]
-                                + [("policy", p) for p in all_policies]
-                                + [("rule", r) for p in all_policies for r in p.get("rules", [])], rules_)
-    # References are converted to names using everything that was read, so a
-    # rule can name a group this tranche does not adopt.
-    group_paths = {g["path"]: g["id"] for g in all_groups if g.get("path")}
-    service_paths = {s["path"]: s["id"] for s in all_services if s.get("path")}
-    federated = federation(role, args.site, all_groups, all_services, all_policies,
-                           declared_objects(exclude=own), group_paths, service_paths)
 
-    if args.list:
-        return survey(args.site, all_groups, all_services, all_policies, federated, elsewhere)
-    sites = [args.site]
-    owner = "gm" if role == "gm" else "lm"
+def select(estate: dict, site: str, role: str, domain: str, wanted: list[str] = (), mirror: bool = False) -> Choice:
+    """What to adopt: one policy and what it needs (wanted), or everything
+    (mirror: everything no other file declares). Refused: a wanted policy
+    that cannot be adopted."""
+    e = survey_estate(estate, site, role, mirror)
+    out = Choice(group_paths=e.group_paths, service_paths=e.service_paths)
+    out.creators = creators(site, [("group", g) for g in e.groups] + [("service", s) for s in e.services]
+                            + [("policy", p) for p in e.policies]
+                            + [("rule", r) for p in e.policies for r in p.get("rules", [])], ownership_rules())
+    groups, services, policies = e.groups, e.services, e.policies
 
-    groups, services, policies = all_groups, all_services, all_policies
-    skipped: list[str] = []
-    if args.mirror:
-        # Everything, except what another file declares: that file manages it.
-        # Sorted, so an unchanged manager gives byte-identical files.
-        have = existing_keys(exclude=own)
-        skipped += sorted(f"group {g['id']}" for g in groups if g["id"] in have["groups"] and not is_system(g))
-        skipped += sorted(f"service {s['id']}" for s in services if s["id"] in have["services"] and not is_system(s))
-        skipped += sorted(f"policy {p['id']}" for p in policies if p["id"] in have["policies"] and not is_system(p))
-        groups = sorted((g for g in groups if g["id"] not in have["groups"]), key=lambda g: g["id"])
-        services = sorted((s for s in services if is_system(s) or s["id"] not in have["services"]), key=lambda s: s["id"])
-        # A policy's file is data/policies/<id>.yaml; one that another file
-        # already occupies is that file's, whatever it declares.
-        taken = {p["id"] for p in policies if (DATA / "policies" / f"{p['id']}.yaml").exists()
-                 and DATA / "policies" / f"{p['id']}.yaml" not in own and p["id"] not in have["policies"]}
-        skipped += sorted(f"policy {i} (data/policies/{i}.yaml is another file)" for i in taken)
-        policies = sorted((p for p in policies if p["id"] not in have["policies"] and p["id"] not in taken),
-                          key=lambda p: p["id"])
-    if args.policy:
-        by_id = {p["id"]: p for p in all_policies}
-        missing = [i for i in args.policy if i not in by_id]
+    if wanted:
+        by_id = {p["id"]: p for p in e.policies}
+        missing = [i for i in wanted if i not in by_id]
         if missing:
-            sys.exit(f"error: no policy with id {', '.join(missing)} in what was read from {args.site}")
-        system = [i for i in args.policy if is_system(by_id[i])]
+            raise Refused(f"no policy with id {', '.join(missing)} in what was read from {site}")
+        system = [i for i in wanted if is_system(by_id[i])]
         if system:
-            sys.exit(f"error: {', '.join(system)} is system-owned; NSX manages it, not Terraform")
-        policies = [by_id[i] for i in dict.fromkeys(args.policy)]
-        need_groups, need_services = needed_by(policies, all_groups)
-        groups = [g for g in all_groups if g.get("path") in need_groups]
-        services = [s for s in all_services if s.get("path") in need_services]
+            raise Refused(f"{', '.join(system)} is system-owned; NSX manages it, not Terraform")
+        policies = [by_id[i] for i in dict.fromkeys(wanted)]
+        need_groups, need_services = needed_by(policies, e.groups)
+        groups = [g for g in e.groups if g.get("path") in need_groups]
+        services = [s for s in e.services if s.get("path") in need_services]
 
-        # Already in data/ means already managed: never adopt it twice.
-        have = existing_keys()
-        skipped += [f"group {g['id']}" for g in groups if g["id"] in have["groups"]]
-        skipped += [f"service {s['id']}" for s in services if s["id"] in have["services"] and not is_system(s)]
-        skipped += [f"policy {p['id']}" for p in policies if p["id"] in have["policies"]]
-        groups = [g for g in groups if g["id"] not in have["groups"]]
-        services = [s for s in services if is_system(s) or s["id"] not in have["services"]]
-        policies = [p for p in policies if p["id"] not in have["policies"]]
+    # In data/ already: managed, never adopted twice. Mirror files about to be
+    # rewritten do not count. Sorted, so an unchanged manager rewrites the same bytes.
+    have = model.existing_keys(exclude=e.own)
+    out.managed += sorted(f"group {g['id']}" for g in groups if g["id"] in have["groups"] and not is_system(g))
+    out.managed += sorted(f"service {s['id']}" for s in services if s["id"] in have["services"] and not is_system(s))
+    out.managed += sorted(f"policy {p['id']}" for p in policies if p["id"] in have["policies"] and not is_system(p))
+    groups = [g for g in groups if g["id"] not in have["groups"]]
+    services = [s for s in services if is_system(s) or s["id"] not in have["services"]]
+    policies = [p for p in policies if p["id"] not in have["policies"]]
+    if mirror:
+        # A policy's file is data/policies/<key>.yaml: one another file occupies is that file's.
+        taken = {p["id"] for p in policies if (model.DATA / "policies" / f"{p['id']}.yaml").exists()
+                 and model.DATA / "policies" / f"{p['id']}.yaml" not in e.own}
+        out.managed += sorted(f"policy {i} (data/policies/{i}.yaml is another file)" for i in taken)
+        groups = sorted(groups, key=lambda g: g["id"])
+        services = sorted(services, key=lambda s: s["id"])
+        policies = sorted((p for p in policies if p["id"] not in taken), key=lambda p: p["id"])
 
-    # Never adopt what cannot be represented exactly; report it instead.
-    bad = unsupported_objects(all_groups, all_services, federated, elsewhere)
-    kept_in_ui: list[str] = [f"{o.get('resource_type', 'object')} {o.get('id')}: belongs to the Global Manager ({o.get('path')})"
-                             for o in foreign]
-    owned_by_others = sorted(f"{kind} {o['id']}: {elsewhere[o['path']]}"
-                             for kind, objects in (("group", groups), ("service", services), ("policy", policies))
-                             for o in objects if o.get("path") in elsewhere)
-    groups = [g for g in groups if g.get("path") not in elsewhere]
-    services = [sv for sv in services if sv.get("path") not in elsewhere]
-    policies = [p for p in policies if p.get("path") not in elsewhere]
-    # A local object shadowed by another manager's id is reported here, not as MANAGED.
-    for kind, objects in (("group", all_groups), ("service", all_services)):
+    bad = unsupported_objects(e.groups, e.services, e.federated, e.elsewhere)
+    out.not_adopted = [f"{o.get('resource_type', 'object')} {o.get('id')}: belongs to the Global Manager ({o.get('path')})"
+                       for o in e.foreign]
+    out.owned_by_others = sorted(f"{kind} {o['id']}: {e.elsewhere[o['path']]}"
+                                 for kind, objects in (("group", groups), ("service", services), ("policy", policies))
+                                 for o in objects if o.get("path") in e.elsewhere)
+    groups = [g for g in groups if g.get("path") not in e.elsewhere]
+    services = [s for s in services if s.get("path") not in e.elsewhere]
+    policies = [p for p in policies if p.get("path") not in e.elsewhere]
+    # A local object shadowed by another manager's id is reported here, not as managed.
+    for kind, objects in (("group", e.groups), ("service", e.services)):
         for o in objects:
-            if o.get("path") in federated and "names would collide" in federated[o["path"]]:
-                kept_in_ui.append(f"{kind} {o['id']}: {federated[o['path']]}")
-                skipped = [x for x in skipped if x != f"{kind} {o['id']}"]
-    for g in groups:
-        if g.get("path") in bad:
-            kept_in_ui.append(f"group {g['id']}: {bad[g['path']]}")
-    for sv in services:
-        if sv.get("path") in bad:
-            kept_in_ui.append(f"service {sv['id']}: {bad[sv['path']]}")
-    groups = [g for g in groups if g.get("path") not in bad]
-    services = [sv for sv in services if sv.get("path") not in bad]
-    adoptable = []
+            if "names would collide" in e.federated.get(o.get("path"), ""):
+                out.not_adopted.append(f"{kind} {o['id']}: {e.federated[o['path']]}")
+                out.managed = [x for x in out.managed if x != f"{kind} {o['id']}"]
+    out.not_adopted += [f"group {g['id']}: {bad[g['path']]}" for g in groups if g.get("path") in bad]
+    out.not_adopted += [f"service {s['id']}: {bad[s['path']]}" for s in services if s.get("path") in bad]
+    out.groups = [g for g in groups if g.get("path") not in bad]
+    out.services = [s for s in services if s.get("path") not in bad]
+
     for policy in policies:
         if is_system(policy):
-            adoptable.append(policy)
+            out.policies.append(policy)
             continue
-        why = field_unsupported("policy", policy)
-        if why:
-            reason = f"policy {policy['id']}: {why}"
-            if policy["id"] in args.policy:
-                sys.exit(f"error: {reason}. Nothing was written.")
-            kept_in_ui.append(reason)
+        why = policy_unsupported(policy, bad)
+        blocked = {r["id"]: w for r in policy.get("rules", []) if (w := rule_unsupported(r, bad))}
+        rules = [r for r in policy.get("rules", []) if r["id"] not in blocked]
+        notes = [f"rule {policy['id']}/{rid}: {w}" for rid, w in blocked.items()]
+        if why is None and policy.get("rules") and not rules:
+            # None of its rules can be adopted: it stays whole in the UI. One NSX holds empty is taken.
+            why = f"none of its {len(blocked)} rule(s) can be adopted"
+            out.not_adopted += notes
+        elif why is None:
+            out.not_adopted += [f"{n}; stays in the UI, the rest of the policy is adopted" for n in notes]
+            out.policies.append(dict(policy, rules=rules))
             continue
-        blocked = [p for p in policy.get("scope") or [] if p in bad]
-        if blocked:
-            reason = f"policy {policy['id']}: its Apply To uses {', '.join(b.rsplit('/', 1)[-1] for b in blocked)} (not adoptable)"
-            if policy["id"] in args.policy:
-                sys.exit(f"error: {reason}. Nothing was written.")
-            kept_in_ui.append(reason)
-            continue
-        rules = []
-        notes = []
-        for rule in policy.get("rules", []):
-            why = rule_unsupported(rule, bad)
-            if why:
-                notes.append(f"rule {policy['id']}/{rule['id']}: {why}; stays in the UI, the rest of the policy is adopted")
-            else:
-                rules.append(rule)
-        if not rules and policy.get("rules"):
-            # A policy none of whose rules can be adopted stays whole in the UI.
-            # One that NSX itself holds empty is taken as it is.
-            reason = f"policy {policy['id']}: none of its {len(policy.get('rules', []))} rule(s) can be adopted"
-            if policy["id"] in args.policy:
-                sys.exit(f"error: {reason}. Nothing was written.")
-            kept_in_ui += [n.replace("; stays in the UI, the rest of the policy is adopted", "") for n in notes] + [reason]
-            continue
-        kept_in_ui += notes
-        adoptable.append(dict(policy, rules=rules))
-    policies = adoptable
+        if policy["id"] in wanted:
+            raise Refused(f"policy {policy['id']}: {why}")
+        out.not_adopted.append(f"policy {policy['id']}: {why}")
 
-    # The DFW exclusion list: groups whose members bypass the firewall. Taken
-    # when the group is taken (or another tool owns it: then by reference).
-    adopted_group_paths = {g.get("path") for g in groups}
-    excluded: dict[str, str] = {}
-    if role != "gm" and not args.policy:
+    # The DFW exclusion list: taken with its group (or by reference, another tool's).
+    adopted = {g.get("path") for g in out.groups}
+    if role != "gm" and not wanted:
         for member in estate.get("exclude_list") or []:
-            if member in adopted_group_paths or member in elsewhere:
-                excluded[group_paths[member]] = member
-            elif member in group_paths and member in bad:
-                kept_in_ui.append(f"exclusion-list member {group_paths[member]}: its group is not adopted ({bad[member]})")
+            if member in adopted or member in e.elsewhere:
+                out.excluded[e.group_paths[member]] = member
+            elif member in e.group_paths and member in bad:
+                out.not_adopted.append(f"exclusion-list member {e.group_paths[member]}: its group is not adopted ({bad[member]})")
             else:
-                kept_in_ui.append(f"exclusion-list member {member}: not a group data/ holds (segments and ports are not taken)")
+                out.not_adopted.append(f"exclusion-list member {member}: not a group data/ holds "
+                                       "(segments and ports are not taken)")
 
-    # Groups another tool owns that what is adopted uses: named, never managed.
-    used: set[str] = set(excluded.values())
-    for policy in policies:
-        used.update(policy.get("scope") or [])
-        for rule in policy.get("rules", []):
-            for field in ("source_groups", "destination_groups", "scope"):
-                used.update(rule.get(field) or [])
-    for g in groups:
-        for expression in g.get("expression", []):
-            if expression.get("resource_type") == "PathExpression":
-                used.update(expression.get("paths", []))
-    references: dict = {}
-    for g in all_groups:
-        if g.get("path") in used and g.get("path") in elsewhere:
+    # Another tool's groups that what is adopted uses: named, never managed.
+    used = set(out.excluded.values()).union(*(used_groups(p) for p in out.policies), *(nested_paths(g) for g in out.groups))
+    owner = "gm" if role == "gm" else "lm"
+    for g in e.groups:
+        if g.get("path") in used and g.get("path") in e.elsewhere:
             entry: dict = {"display_name": g.get("display_name", g["id"]), "owner": owner}
             where = domain_of(g.get("path", ""), domain)
             if where != "default":
@@ -10168,288 +9352,1292 @@ def main() -> int:
             if g.get("_nsx_id"):
                 entry["nsx_id"] = g["_nsx_id"]
             if owner == "lm":
-                entry["sites"] = list(sites)
-            entry["why"] = f"owned by another tool ({elsewhere[g['path']]}); used by name, never managed here"
-            references[g["id"]] = entry
-    references = dict(sorted(references.items()))
+                entry["sites"] = [site]
+            entry["why"] = f"owned by another tool ({e.elsewhere[g['path']]}); used by name, never managed here"
+            out.references[g["id"]] = entry
+    out.references = dict(sorted(out.references.items()))
+    return out
 
-    writer = Writer(args.dry_run, overwrite=args.mirror)
-    security_stack = "global-security" if role == "gm" else "local-security"
-    import_path = REPO_ROOT / "stacks" / security_stack / f"import-{args.site}-{tranche}.tf"
-    mirror_header = (
-        f"{MIRROR_MARK}{args.site}\n"
-        f"# Mirror of {args.site}, regenerated from the live manager by scripts/mirror.sh.\n"
-        "# Do not edit: the next sync overwrites this file. Change the object in NSX, or\n"
-        "# move the manager to mode: managed (docs/IMPORT.md, \"Mirror mode\").\n\n"
-    )
-    if args.mirror and not args.dry_run:
-        # Start from nothing: what NSX no longer has must not survive here.
-        for f in own:
-            f.unlink()
-        import_path.unlink(missing_ok=True)
 
-    # --- groups ---------------------------------------------------------
-    converted_groups = {
-        g["id"]: convert_group(g, group_paths, owner, sites) for g in groups if not is_system(g)
-    }
-    if role == "gm":
-        # A group outside the global domain keeps its domain, where the GM stack
-        # creates it and Local Managers find it (local-security).
-        for g in groups:
-            where = domain_of(g.get("path", ""), domain)
-            if g["id"] in converted_groups and where != "default":
-                converted_groups[g["id"]]["domain"] = where
-    if converted_groups or references:
-        header = mirror_header if args.mirror else (
-            f"# Imported from {args.site} on {datetime.now(timezone.utc):%Y-%m-%d}. Adopted, not created.\n"
-            "#\n"
-            "# Review before the first apply: check every 'why_static' note, and confirm\n"
-            "# the tag scopes below are in data/schema/tag-scopes.yaml.\n\n"
-        )
-        document = {"groups": converted_groups}
-        if references:
-            document["references"] = references
-        writer.write(DATA / "groups" / f"imported-{args.site}-{tranche}.yaml", header + to_yaml(document))
-
-    # --- the exclusion list ----------------------------------------------
-    if excluded:
-        header = mirror_header if args.mirror else f"# Imported from {args.site} on {datetime.now(timezone.utc):%Y-%m-%d}.\n\n"
-        note = ("IMPORTED AS-IS: this group's members bypass the DFW entirely. Record why, with an exception "
-                "(owner, ticket, expires) naming the guardrail exclusion-list, or remove it.")
-        writer.write(DATA / "exclude-list" / f"{args.site}.yaml",
-                     header + to_yaml({"members": {k: {"why": note} for k in sorted(excluded)}}))
-
-    # --- services -------------------------------------------------------
-    custom = {s["id"]: convert_service(s) for s in services if not is_system(s)}
-    predefined = {
-        s["id"]: s.get("display_name", s["id"])
-        for s in services
-        if is_system(s) and _referenced(s, policies)
-    }
-    if custom or predefined:
-        document: dict = {}
-        if predefined:
-            # By id, never by display name: names are not unique (a federated
-            # Local Manager lists its own HTTPS and the Global Manager's).
-            document["predefined_ids"] = predefined
-        if custom:
-            for definition in custom.values():
-                definition["owner"] = owner
-                if owner == "lm":
-                    definition["sites"] = list(sites)
-            document["custom"] = custom
-        header = mirror_header if args.mirror else f"# Imported from {args.site} on {datetime.now(timezone.utc):%Y-%m-%d}.\n\n"
-        writer.write(DATA / "services" / f"imported-{args.site}-{tranche}.yaml", header + to_yaml(document))
-
-    # --- policies: one file each, so add-rule.py can find them ----------
-    for policy in policies:
+def survey(estate: dict, site: str, role: str) -> list[tuple]:
+    """(category, policy key, display name, rule count, status) for each policy."""
+    e = survey_estate(estate, site, role)
+    bad = unsupported_objects(e.groups, e.services, e.federated, e.elsewhere)
+    have = model.existing_keys()
+    rows = []
+    for policy in e.policies:
         if is_system(policy):
             continue
-        document = convert_policy(policy, group_paths, service_paths, owner, sites)
-        where = domain_of(policy.get("path", ""), domain)
-        if role == "gm" and where != "default":
-            document["policy"]["domain"] = where
-        header = mirror_header if args.mirror else (
-            f"# Imported from {args.site} on {datetime.now(timezone.utc):%Y-%m-%d}. Adopted, not created.\n"
-            "#\n"
-            "# A new rule for this policy belongs IN THIS FILE. Do not declare a second\n"
-            f"# policy: scripts/add-rule.py --policy {policy['id']} --rule <name> ...\n\n"
-        )
-        writer.write(DATA / "policies" / f"{policy['id']}.yaml", header + to_yaml(document))
+        rules = policy.get("rules", [])
+        row = (policy.get("category", ""), policy["id"], policy.get("display_name", ""), len(rules))
+        if policy.get("path") in e.elsewhere:
+            rows.append(row + (f"owned elsewhere: {e.elsewhere[policy['path']]}",))
+        elif why := field_unsupported("policy", policy):
+            rows.append(row + (f"not adoptable: {why}",))
+        elif policy["id"] in have["policies"]:
+            rows.append(row + ("managed already",))
+        elif why := policy_unsupported(policy, bad):
+            rows.append(row + (f"not adoptable: {why}",))
+        elif kept := [r for r in rules if rule_unsupported(r, bad)]:
+            rows.append(row + (f"adoptable; {len(kept)} of {len(rules)} rule(s) stay in the UI",))
+        else:
+            rows.append(row + ("adoptable",))
+    return sorted(rows)
+SCAFFOLD_EOF
 
-    # --- import blocks --------------------------------------------------
-    base: dict = {}
-    composite: dict = {}
-    for group_id, definition in converted_groups.items():
-        nested = any("member_groups" in c for c in definition.get("criteria", []))
-        path = next((g["path"] for g in groups if g["id"] == group_id), "")
-        nsx = next((g.get("_nsx_id", g["id"]) for g in groups if g["id"] == group_id), group_id)
-        (composite if nested else base)[group_id] = object_id("group", domain_of(path, domain), path, nsx, args.id_format)
-    service_ids = {
-        s["id"]: object_id("service", domain, s.get("path", ""), s["id"], args.id_format)
-        for s in services
-        if not is_system(s) and s["id"] in custom
-    }
-    policy_ids: dict = {}
-    rule_ids: dict = {}
-    for policy in policies:
-        if is_system(policy):
-            continue
-        key = policy["id"]
-        nsx = policy.get("_nsx_id", key)
-        policy_ids[key] = object_id("policy", domain_of(policy.get("path", ""), domain), policy.get("path", ""), nsx, args.id_format)
-        for rule in policy.get("rules", []):
-            rule_ids[f"{key}/{rule['id']}"] = {
-                "policy": key,
-                "rule": rule["id"],
-                "id": object_id("rule", domain_of(policy.get("path", ""), domain), rule.get("path", ""),
-                                f"{nsx}/{rule.get('_nsx_id', rule['id'])}", args.id_format),
-            }
+write_file scripts/nsxlib/schedules.py <<'SCAFFOLD_EOF'
+"""Rules that are on only at certain times: when each is on, and what that
+means for Terraform. The format is in docs/SCHEDULES.md; scripts/schedule.py
+is the command line.
 
-    kinds = [
-        ("base_groups", "module.base_groups.nsxt_policy_group.this[each.key]", base),
-        ("composite_groups", "module.composite_groups.nsxt_policy_group.this[each.key]", composite),
-        ("services", "module.services.nsxt_policy_service.this[each.key]", service_ids),
-        ("policies", "module.policies[each.key].nsxt_policy_parent_security_policy.this", policy_ids),
-        ("rules", "module.policies[each.value.policy].nsxt_policy_security_policy_rule.this[each.value.rule]", rule_ids),
-        ("exclude_list", "nsxt_policy_firewall_exclude_list_member.this[each.key]", dict(sorted(excluded.items()))),
-    ]
-    header = (
-        f"# Mirror of {args.site}: every object in the mirror files, imported into state.\n"
-        "# Regenerated by scripts/mirror.sh; do not edit.\n"
-        "#\n"
-        f"# While {args.site} is in mirror mode, its sync-state job applies these imports\n"
-        "# (and nothing else) with the read-only credential; an object already in state\n"
-        "# is left as it is. After cutover to managed, delete this file in its own merge\n"
-        "# request.\n"
-        f"#\n# id format: {args.id_format}.\n"
-    ) if args.mirror else (
-        f"# Generated by scripts/import-estate.py: tranche '{tranche}' for {args.site}.\n"
-        "# Adopts existing objects into state; creates nothing.\n"
-        "#\n"
-        f"#   scripts/tf.sh plan {security_stack} {args.site}\n"
-        "#\n"
-        "# scripts/plan-guard.py refuses the plan unless it only imports. A tranche is\n"
-        "# done when, after the apply, the plan reports no changes. Then delete this\n"
-        "# file in its own merge request: import blocks are one-shot.\n"
-        "#\n"
-        f"# id format: {args.id_format}. If every import fails with a not-found error,\n"
-        "# re-run import-estate.py with a different --id-format; nothing has been\n"
-        "# written to state at that point.\n"
-    )
-    if any(entries for _, _, entries in kinds):
-        writer.write(import_path, import_file(args.site, tranche, role, kinds, header))
+NSX holds no time window: outside its windows, before it starts and once it
+expires, a scheduled rule is disabled through Terraform, the same on a Global
+and a Local Manager.
+"""
 
-    # --- manifest -------------------------------------------------------
-    manifest = {"version": 1, "imported": [], "sources": []}
-    if MANIFEST.exists():
+from __future__ import annotations
+
+import os
+import re
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from nsxlib import model
+
+DAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+TIME = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$|^24:00$")
+
+
+def parse_now(text: str | None = None) -> datetime:
+    """text (ISO), else NSX_SCHEDULE_NOW (tests, and "what would be on at
+    22:00 on Saturday?"), else the time now."""
+    text = text or os.environ.get("NSX_SCHEDULE_NOW")
+    if not text:
+        return datetime.now(timezone.utc)
+    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def zone(name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(str(name))
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"unknown time zone {name!r} (an IANA name such as Asia/Kolkata)") from exc
+
+
+def minutes(text) -> int:
+    text = str(text)
+    if not TIME.match(text):
+        raise ValueError(f"{text!r} is not a time of day as HH:MM")
+    hours, mins = text.split(":")
+    return int(hours) * 60 + int(mins)
+
+
+def moment(value, tz) -> datetime:
+    """A date or date-and-time as data/ writes it (PyYAML reads some as date
+    or datetime, some as text), in the schedule's zone unless it names one."""
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=tz) if value.tzinfo is None else value
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day, tzinfo=tz)
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
         try:
-            manifest = json.loads(MANIFEST.read_text())
+            return datetime.strptime(text, fmt).replace(tzinfo=tz)
         except ValueError:
             pass
-    before = json.dumps(manifest, indent=2) + "\n"
-    if args.mirror:
-        # No dated history here: an unchanged manager must leave no diff. Files
-        # this mirror no longer writes (deleted in NSX) leave the list too.
-        gone = {str(f.relative_to(REPO_ROOT)) for f in own} - set(writer.written)
-        manifest["imported"] = [r for r in manifest.get("imported", []) if r not in gone]
-    for rel in writer.written:
-        if rel not in manifest["imported"]:
-            manifest["imported"].append(rel)
-    if args.mirror:
-        manifest.setdefault("mirrors", {})[args.site] = {"role": role, "domain": domain}
-    else:
-        manifest["sources"].append(
-            {
-                "site": args.site,
-                "role": role,
-                "domain": domain,
-                "tranche": tranche,
-                "policies": [p["id"] for p in policies if not is_system(p)],
-                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "counts": {
-                    "groups": len(converted_groups),
-                    "policies": len([p for p in policies if not is_system(p)]),
-                    "rules": sum(len(p.get("rules", [])) for p in policies if not is_system(p)),
-                    "services": len(custom),
-                },
-            }
-        )
-    if not args.dry_run and json.dumps(manifest, indent=2) + "\n" != before:
-        MANIFEST.write_text(json.dumps(manifest, indent=2) + "\n")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"{text!r} is not a date (YYYY-MM-DD) or a date and time (YYYY-MM-DD HH:MM)") from exc
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=tz)
 
-    # --- report ---------------------------------------------------------
-    print()
-    for rel in writer.written:
-        print(f"  wrote     {rel}")
-    for note in writer.deferred:
-        print(f"  EXISTS    {note}  (your file was not touched — diff and merge by hand)")
-    for note in skipped:
-        print(f"  MANAGED   {note}  (already in data/, so not adopted again)")
-    for note in owned_by_others:
-        print(f"  OWNED ELSEWHERE  {note}")
-    if owned_by_others:
-        print("  (another tool manages these: never adopted, never raised as drift. A rule here may")
-        print("   still use such a group, by name: data/groups lists it under references.)")
-    for note in kept_in_ui:
-        print(f"  NOT ADOPTED  {note}")
-    if kept_in_ui:
-        print("  (these cannot be represented exactly, so importing them would change them on")
-        print("   the first apply; they stay as they are, managed in the NSX UI)")
-    unknown = sorted({n.split("carries ", 1)[1].split("=", 1)[0] for n in kept_in_ui if "carries " in n})
+
+def problems(schedule) -> list[str]:
+    """What is wrong with one schedule, in words; empty when it is sound."""
+    if not isinstance(schedule, dict):
+        return ["schedule must be a mapping"]
+    out = []
+    try:
+        tz = zone(schedule.get("timezone", ""))
+    except ValueError as exc:
+        return [str(exc)]
+    if not str(schedule.get("owner") or "").strip():
+        out.append("owner is required: who answers for this rule being on")
+    for i, window in enumerate(schedule.get("windows") or []):
+        if not isinstance(window, dict):
+            out.append(f"windows[{i}] must be a mapping")
+            continue
+        bad = [d for d in window.get("days") or [] if d not in DAYS]
+        if bad:
+            out.append(f"windows[{i}].days: {', '.join(map(str, bad))} (days are {', '.join(DAYS)})")
+        for end in ("from", "to"):
+            try:
+                minutes(window.get(end, ""))
+            except ValueError as exc:
+                out.append(f"windows[{i}].{end}: {exc}")
+    edges = {}
+    for end in ("starts", "expires"):
+        if schedule.get(end) is not None:
+            try:
+                edges[end] = moment(schedule[end], tz)
+            except ValueError as exc:
+                out.append(f"{end}: {exc}")
+    if "starts" in edges and "expires" in edges and edges["expires"] <= edges["starts"]:
+        out.append("expires is not after starts: the rule would never be on")
+    return out
+
+
+def active(schedule: dict, now: datetime) -> bool:
+    """Whether the rule is on at now (any zone)."""
+    tz = zone(schedule["timezone"])
+    local = now.astimezone(tz)
+    if schedule.get("starts") is not None and local < moment(schedule["starts"], tz):
+        return False
+    if schedule.get("expires") is not None and local >= moment(schedule["expires"], tz):
+        return False
+    windows = schedule.get("windows") or []
+    if not windows:
+        return True
+    at = local.hour * 60 + local.minute
+    today, yesterday = DAYS[local.weekday()], DAYS[(local.weekday() - 1) % 7]
+    for window in windows:
+        days = set(window.get("days") or DAYS)
+        start, end = minutes(window["from"]), minutes(window["to"])
+        if start < end and today in days and start <= at < end:
+            return True
+        if start > end and ((today in days and at >= start) or (yesterday in days and at < end)):
+            return True  # past midnight: from the evening of a listed day to the next morning
+        if start == end and today in days:
+            return True  # all day
+    return False
+
+
+
+def scheduled_rules(stack: str | None = None, site: str | None = None) -> list[dict]:
+    """Every rule with a schedule; for a stack and manager, those that stack
+    plans there (the same filters as the stacks)."""
+    out = []
+    for f in model.data_files(("policies",)):
+        policy = f.doc.get("policy") or {}
+        owner, sites = policy.get("owner", "lm"), policy.get("sites") or []
+        if stack == "global-security" and owner != "gm":
+            continue
+        if stack == "local-security" and (owner != "lm" or not (site in sites or "*" in sites)):
+            continue
+        if stack not in (None, "global-security", "local-security"):
+            continue
+        for key, rule in (f.doc.get("rules") or {}).items():
+            if isinstance(rule, dict) and isinstance(rule.get("schedule"), dict):
+                out.append({"policy": f.path.stem, "rule": str(key), "schedule": rule["schedule"],
+                            "disabled": bool(rule.get("disabled", False)), "file": f.rel,
+                            "name": rule.get("name", key), "owner": owner, "sites": sites})
+    return out
+
+
+def address(policy: str, rule: str) -> str:
+    return f'module.policies["{policy}"].nsxt_policy_security_policy_rule.this["{rule}"]'
+
+
+def desired(stack: str, site: str, now: datetime) -> dict[str, bool]:
+    """address -> disabled, now: off when the data says disabled, or the schedule says off."""
+    return {address(r["policy"], r["rule"]): r["disabled"] or not active(r["schedule"], now)
+            for r in scheduled_rules(stack, site)}
+
+
+def in_state(state: dict) -> dict[str, bool]:
+    """address -> disabled, for every rule Terraform's state holds."""
+    out = {}
+    for resource in state.get("resources") or []:
+        if resource.get("type") != "nsxt_policy_security_policy_rule" or resource.get("mode") != "managed":
+            continue
+        for instance in resource.get("instances") or []:
+            base = f'{resource.get("module", "")}.' if resource.get("module") else ""
+            key = instance.get("index_key")
+            name = f'{base}{resource["type"]}.{resource["name"]}' + (f'["{key}"]' if key is not None else "")
+            out[name] = bool((instance.get("attributes") or {}).get("disabled", False))
+    return out
+
+
+
+def expiry(now: datetime, warn_days: int, grace_days: int) -> list[dict]:
+    """Rules expiring within warn_days, expired, or expired longer than grace_days."""
+    out = []
+    for r in scheduled_rules():
+        s = r["schedule"]
+        if s.get("expires") is None:
+            continue
+        ends = moment(s["expires"], zone(s["timezone"]))
+        if now >= ends + timedelta(days=grace_days):
+            state = "remove"
+        elif now >= ends:
+            state = "expired"
+        elif now >= ends - timedelta(days=warn_days):
+            state = "expiring"
+        else:
+            continue
+        out.append(dict(r, state=state, ends=ends.isoformat(timespec="minutes")))
+    return out
+
+
+# --- an NSX time window, as a schedule: -------------------------------------------
+# NSX keeps time windows on a Local Manager only. Each converts to a schedule:
+# exactly, or not at all, with the reason: nothing is guessed.
+
+NSX_DAYS = {"MONDAY": "MON", "TUESDAY": "TUE", "WEDNESDAY": "WED", "THURSDAY": "THU", "FRIDAY": "FRI",
+            "SATURDAY": "SAT", "SUNDAY": "SUN", **{d: d for d in DAYS}}
+WINDOW_FIELDS = {"start_date", "end_date", "start_time", "end_time", "recurring", "days", "time_zone", "id", "path",
+                 "relative_path", "parent_path", "resource_type", "display_name", "description", "tags", "unique_id",
+                 "realization_id", "marked_for_delete", "overridden", "children", "origin_site_id", "owner_id"}
+
+
+def from_time_window(window: dict, manager_zone: str | None) -> tuple[dict | None, str]:
+    """A schedule: block for one NSX time window, or None and why not."""
+    unknown = sorted(k for k in window if not k.startswith("_") and k not in WINDOW_FIELDS
+                     and window[k] not in (None, "", [], {}))
     if unknown:
-        print(f"  fields NSX returned that this tool does not represent yet: {', '.join(unknown)}")
-    print()
-    for line in creators:
-        print(line)
-    print()
-    print(f"{len(converted_groups)} group(s), {len([p for p in policies if not is_system(p)])} policy/policies, "
-          f"{sum(len(p.get('rules', [])) for p in policies if not is_system(p))} rule(s), {len(custom)} custom service(s)")
-    if args.dry_run:
-        print("dry run — nothing was written.")
+        return None, f"carries {', '.join(unknown)}, which this does not convert"
+    raw_zone = str(window.get("time_zone") or "UTC")
+    if raw_zone.upper() in ("LOCAL", "LOCAL_TIME"):
+        if not manager_zone:
+            return None, "is in the manager's local time: run again with --timezone <the manager's IANA zone>"
+        tz = manager_zone
+    else:
+        tz = "UTC" if raw_zone.upper() == "UTC" else raw_zone
+    out: dict = {"timezone": tz}
+    start_t, end_t = window.get("start_time"), window.get("end_time")
+    if window.get("recurring", True):
+        days = [NSX_DAYS.get(str(d).upper()) for d in window.get("days") or []]
+        if None in days:
+            return None, f"has days {window.get('days')}, which this does not read"
+        if not (start_t and end_t):
+            return None, "recurs, but has no start_time and end_time"
+        entry: dict = {"from": str(start_t)[:5], "to": str(end_t)[:5]}
+        out["windows"] = [{"days": days, **entry} if days and len(days) < 7 else entry]
+        if window.get("start_date"):
+            out["starts"] = str(window["start_date"])
+        if window.get("end_date"):
+            # The window recurs on its end date too: off from the next day.
+            out["expires"] = (date.fromisoformat(str(window["end_date"])) + timedelta(days=1)).isoformat()
+    else:
+        if not (window.get("start_date") and window.get("end_date")):
+            return None, "is one-off, but has no start_date and end_date"
+        out["starts"] = f"{window['start_date']} {str(start_t or '00:00')[:5]}"
+        out["expires"] = f"{window['end_date']} {str(end_t or '23:59')[:5]}"
+    out["owner"] = "TODO: who answers for this rule being on"
+    if window.get("display_name"):
+        out["ticket"] = f"was NSX time window {window['display_name']}"
+    return out, ""
+SCAFFOLD_EOF
+
+write_file scripts/nsxlib/gitlab.py <<'SCAFFOLD_EOF'
+"""GitLab, from a pipeline job: issues, merge requests, a branch pushed.
+
+    gl = GitLab()
+    if key not in gl.marks("nsx-drift,site:lon1", MARK):  # raised before?
+        gl.call("POST", "/issues", {...})
+
+The token is a project access token in a masked, protected CI/CD variable:
+NSX_BOT_TOKEN (scope api), or NSX_ADOPT_TOKEN (api, write_repository), which
+can also push a branch. Never from the environment of a person's shell.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+from nsxlib.model import REPO
+
+
+def digest(value) -> str:
+    """A short, stable fingerprint, for the markers that keep an issue from being raised twice."""
+    return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def die(message: str, code: int = 1) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+class GitLab:
+    def __init__(self) -> None:
+        self.api = os.environ.get("CI_API_V4_URL", "").rstrip("/")
+        self.project = os.environ.get("CI_PROJECT_ID", "")
+        self.token = os.environ.get("NSX_BOT_TOKEN") or os.environ.get("NSX_ADOPT_TOKEN") or ""
+        if not (self.api and self.project):
+            die("CI_API_V4_URL and CI_PROJECT_ID are not set: this runs in a GitLab job")
+        if not self.token:
+            die("NSX_BOT_TOKEN is not set (NSX_ADOPT_TOKEN serves too): a project access token, scope api, "
+                "masked and protected")
+        ca = os.environ.get("CI_SERVER_TLS_CA_FILE")
+        self.ctx = ssl.create_default_context(cafile=ca) if ca and Path(ca).is_file() else ssl.create_default_context()
+        # An internal CA without keyUsage is fine for GitLab's runner and git;
+        # Python 3.13's strict checks would refuse it. Chain and name still checked.
+        self.ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+
+    def call(self, method: str, path: str, body: dict | None = None, query: dict | None = None,
+             missing_ok: bool = False):
+        """(response, headers). missing_ok: a 404 is (None, headers), not an error."""
+        url = f"{self.api}/projects/{urllib.parse.quote(self.project, safe='')}{path}"
+        if query:
+            url += "?" + urllib.parse.urlencode(query, doseq=True)
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(url, data=data, method=method, headers={"PRIVATE-TOKEN": self.token})
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(request, context=self.ctx, timeout=60) as response:
+                return json.loads(response.read().decode() or "null"), response.headers
+        except urllib.error.HTTPError as exc:
+            if missing_ok and exc.code == 404:
+                return None, exc.headers
+            die(f"GitLab API {method} {path}: HTTP {exc.code} {exc.read().decode(errors='replace')[:300]}")
+        except urllib.error.URLError as exc:
+            die(f"GitLab API {method} {path}: {exc.reason}")
+        return None, {}
+
+    def get(self, path: str, query: dict | None = None, missing_ok: bool = False):
+        return self.call("GET", path, query=query, missing_ok=missing_ok)[0]
+
+    def get_all(self, path: str, query: dict | None = None, pages: int = 0) -> list:
+        """Every page (or the first pages, newest first where GitLab sorts so)."""
+        out: list = []
+        page, read = "1", 0
+        while page and (not pages or read < pages):
+            data, headers = self.call("GET", path, query=dict(query or {}, per_page=100, page=page))
+            out.extend(data or [])
+            page, read = (headers.get("X-Next-Page") or "").strip(), read + 1
+        return out
+
+    def marks(self, labels: str, mark: re.Pattern) -> set:
+        """Every match of mark in the issues with these labels, open or closed:
+        what was raised already. The issues are the record; nothing else is kept."""
+        issues = self.get_all("/issues", {"labels": labels, "state": "all", "order_by": "created_at", "sort": "desc"},
+                              pages=10)
+        return {m for issue in issues for m in mark.findall(issue.get("description") or "")}
+
+    def open_issue(self, title: str, description: str, labels: str) -> str:
+        issue, _ = self.call("POST", "/issues", {"title": title, "description": description, "labels": labels})
+        return (issue or {}).get("web_url", "issue raised")
+
+    def propose(self, branch: str, message: str, paths: list[str], title: str, description: str) -> str:
+        """Commit paths to a new branch, push it, open a merge request: its URL."""
+        git = ["git", "-c", f"user.name={os.environ.get('GITLAB_USER_NAME', 'nsx-bot')}",
+               "-c", f"user.email={os.environ.get('GITLAB_USER_EMAIL', 'nsx-bot@localhost')}", "-c", "commit.gpgsign=false"]
+        subprocess.run(["git", "checkout", "-q", "-B", branch], cwd=REPO, check=True)
+        subprocess.run(["git", "add", "-A", *paths], cwd=REPO, check=True)
+        subprocess.run(git + ["commit", "-q", "-m", message], cwd=REPO, check=True)
+        remote, push, env = os.environ.get("NSX_ADOPT_REMOTE"), ["git"], dict(os.environ)
+        if not remote:
+            token = os.environ.get("NSX_ADOPT_TOKEN") or die("NSX_ADOPT_TOKEN is not set (api, write_repository)")
+            remote = f"{os.environ['CI_SERVER_URL'].rstrip('/')}/{os.environ['CI_PROJECT_PATH']}.git"
+            push += ["-c", "http.extraHeader=Authorization: Basic " + base64.b64encode(f"oauth2:{token}".encode()).decode()]
+            if os.environ.get("CI_SERVER_TLS_CA_FILE"):
+                env["GIT_SSL_CAINFO"] = os.environ["CI_SERVER_TLS_CA_FILE"]
+        subprocess.run(push + ["push", "-q", remote, f"HEAD:refs/heads/{branch}"], cwd=REPO, check=True, env=env)
+        mr, _ = self.call("POST", "/merge_requests", {
+            "source_branch": branch, "target_branch": os.environ.get("CI_DEFAULT_BRANCH", "main"),
+            "title": title, "description": description, "remove_source_branch": True})
+        return (mr or {}).get("web_url", "merge request opened")
+SCAFFOLD_EOF
+
+write_file scripts/nsxlib/drift.py <<'SCAFFOLD_EOF'
+"""Drift: a change made in NSX, not through this repository.
+
+Found two ways, raised the same way (one nsx-drift issue per run that finds
+something new; each object once per version):
+
+  compare(site, role, objects)      a managed manager: what NSX holds against
+                                    what data/ says, both converted alike
+  mirror_changes(site, ref, dump)   a mirrored manager: its mirror files now
+                                    against the copy on ref
+
+Not drift: another tool's objects (inventory/ownership.yaml), NSX's own, a
+change a pipeline account made (NSX_PIPELINE_USERS), and a data/ file
+committed after NSX last changed the object (its apply is pending).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+from nsxlib import adopt, convert, model, schedules
+from nsxlib.gitlab import GitLab, digest
+from nsxlib.nsx import domain_of
+from nsxlib.yamlio import load_yaml
+
+LABEL = "nsx-drift"
+MARK = re.compile(r"<!-- nsx-drift object=([0-9a-f]{16}) version=([0-9a-f]{16}) -->")
+MAX_ROWS = 300
+SYNC_MARGIN = 3600  # seconds: a sync reads the manager this long, at most, before its commit
+EXCLUDE_LIST = "/infra/settings/firewall/security/exclude-list"
+
+
+def item(kind: str, label: str, change: str, detail: str = "", who: str = "", at: str = "",
+         version: str = "0" * 16, severity: str = "") -> dict:
+    """One row of a drift issue."""
+    return {"key": f"{kind} {label}", "kind": kind, "id": label, "change": change, "detail": detail,
+            "who": who, "at": at, "version": version, "severity": severity}
+
+
+def when(obj: dict | None) -> tuple[str, str, float | None]:
+    """Who last changed an NSX object, when (text, UTC), and when (epoch seconds)."""
+    if not obj:
+        return "", "", None
+    stamp = obj.get("_last_modified_time") or obj.get("_create_time")
+    seconds = stamp / 1000 if isinstance(stamp, (int, float)) else None
+    text = datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%d %H:%M") if seconds else ""
+    return str(obj.get("_last_modified_user") or obj.get("_create_user") or ""), text, seconds
+
+
+def describe(before, after) -> str:
+    """What differs between two versions of one object, briefly."""
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return "changed"
+    parts = []
+    for key in sorted(set(before) | set(after)):
+        old, new = before.get(key), after.get(key)
+        if old == new:
+            continue
+        if isinstance(old, list) or isinstance(new, list):
+            o, n = _texts(old), _texts(new)
+            plus, minus = [x for x in n if x not in o], [x for x in o if x not in n]
+            if all(isinstance(x, str) for x in (old or []) + (new or [])) and (plus or minus):
+                parts.append(f"{key} " + " ".join([f"+{x}" for x in plus] + [f"-{x}" for x in minus]))
+            else:
+                parts.append(f"{key} changed")
+        elif isinstance(old, dict) or isinstance(new, dict):
+            parts.append(f"{key} changed")
+        elif old is None:
+            parts.append(f"{key} set to {new}")
+        elif new is None:
+            parts.append(f"{key} removed (was {old})")
+        else:
+            parts.append(f"{key} {old} → {new}")
+    text = "; ".join(parts) or "changed"
+    return text if len(text) <= 240 else text[:237] + "..."
+
+
+def _texts(values) -> list[str]:
+    return [v if isinstance(v, str) else json.dumps(v, sort_keys=True) for v in values or []]
+
+
+# --- one comparable form for both sides, the modules' defaults filled in -------
+
+def _set(values) -> list:
+    return sorted(_texts(v for v in values or [] if v != "ANY"))
+
+
+def rule_form(r: dict, off: bool | None = None) -> dict:
+    return {
+        "name": r.get("name"), "description": r.get("description"), "sequence_number": r.get("sequence_number"),
+        "action": r.get("action", "ALLOW"), "direction": r.get("direction", "IN_OUT"),
+        "ip_version": r.get("ip_version", "IPV4_IPV6"),
+        "source_groups": _set(r.get("source_groups")), "destination_groups": _set(r.get("destination_groups")),
+        "services": _set(r.get("services")), "service_entries": r.get("service_entries") or {},
+        "sources_excluded": bool(r.get("sources_excluded", False)),
+        "destinations_excluded": bool(r.get("destinations_excluded", False)),
+        "disabled": bool(r.get("disabled", False)) if off is None else off,
+        "logged": bool(r.get("logged", True)), "notes": r.get("notes"), "log_label": r.get("log_label"),
+        "profiles": _set(r.get("profiles")), "scope": _set(r.get("scope")), "tags": _set(r.get("tags")),
+    }
+
+
+def group_form(g: dict) -> dict:
+    criteria = []
+    for c in g.get("criteria") or []:
+        c = dict(c)
+        if "conditions" in c:
+            c["conditions"] = [{"key": x.get("key", "Tag"), "member_type": x.get("member_type", "VirtualMachine"),
+                                "operator": x.get("operator", "EQUALS"), "value": str(x.get("value", ""))}
+                               for x in c["conditions"]]
+        for k in ("ip_addresses", "mac_addresses", "external_ids", "member_groups"):
+            if k in c:
+                c[k] = sorted(str(v) for v in c[k])
+        criteria.append(c)
+    return {"display_name": g.get("display_name"), "description": g.get("description"),
+            "conjunction": g.get("conjunction") if len(criteria) > 1 else None,
+            "group_type": g.get("group_type"), "criteria": criteria, "tags": _set(g.get("tags")),
+            "identity_groups": _set(g.get("identity_groups"))}
+
+
+def policy_form(p: dict) -> dict:
+    return {"name": p.get("name"), "description": p.get("description"), "category": p.get("category"),
+            "sequence_number": p.get("sequence_number", 100), "stateful": p.get("stateful", True) is not False,
+            "locked": bool(p.get("locked", False)), "comments": p.get("comments"),
+            "scope": _set(p.get("scope")), "tags": _set(p.get("tags"))}
+
+
+def service_form(s: dict) -> dict:
+    return {k: v for k, v in s.items() if k not in ("owner", "sites")}
+
+
+# --- a managed manager: NSX against data/ -------------------------------------
+
+def objects_of(estate: dict, role: str = "lm") -> list[dict]:
+    """A full read (Client.read, or its dump) as the search API returns objects."""
+    def kind(o: dict, default: str) -> str:
+        return o.get("resource_type") or default
+    out = [dict(g, resource_type=kind(g, "Group")) for g in estate.get("groups", [])]
+    out += [dict(s, resource_type=kind(s, "Service")) for s in estate.get("services", [])]
+    out += [dict(p, resource_type="SecurityPolicy") for p in estate.get("policies", [])]
+    out += [dict(r, resource_type="Rule") for p in estate.get("policies", []) for r in p.get("rules", [])]
+    if role != "gm" and "exclude_list" in estate:
+        out.append({"resource_type": "PolicyExcludeList", "path": EXCLUDE_LIST, "members": estate["exclude_list"] or []})
+    return out
+
+
+def identity(o: dict) -> tuple | None:
+    """("group", domain, id), ("policy", domain, id), ("rule", domain, policy, id), ("service", id)."""
+    kind, path = o.get("resource_type"), str(o.get("path", ""))
+    where = domain_of(path)
+    if kind == "Group":
+        return ("group", where, str(o.get("id")))
+    if kind == "SecurityPolicy":
+        return ("policy", where, str(o.get("id")))
+    if kind == "Rule":
+        parts = path.split("/")
+        pid = parts[parts.index("security-policies") + 1] if "security-policies" in parts else ""
+        return ("rule", where, pid, str(o.get("id")))
+    if kind == "Service":
+        return ("service", str(o.get("id")))
+    return None
+
+
+def service_key(want: model.Desired, path: str) -> str:
+    return want.services.get(path) or path.rsplit("/", 1)[-1]
+
+
+def as_data(kind: str, o: dict, want: model.Desired) -> dict:
+    """An NSX object as data/ writes it, references by key."""
+    if kind == "rule":
+        out = convert.rule(o, want.paths, {})
+        out["services"] = [service_key(want, p) for p in o.get("services") or [] if p != "ANY"]
+        return out
+    if kind == "group":
+        return convert.group(o, want.paths, "", [])
+    if kind == "policy":
+        return convert.policy(dict(o, rules=[]), want.paths, {}, "", [])["policy"]
+    return convert.service(o)
+
+
+def _data_services(want: model.Desired, names) -> list[str]:
+    """A rule's services as data/ names them, resolved as the stacks resolve them."""
+    out = []
+    for name in names or []:
+        hit = next((k for k, v in want.services.items() if v == name), None)
+        out.append(name if hit is None else (hit[5:] if hit.startswith("name:") else want.services[hit]))
+    return out
+
+
+def _version(o: dict, detail: str) -> str:
+    """What makes a change new: NSX's revision of the object, and what differs."""
+    return digest([o.get("_revision"), o.get("_last_modified_time"), detail])
+
+
+def _committed(file: str) -> int:
+    found = subprocess.run(["git", "log", "-1", "--format=%ct", "--", file], cwd=model.REPO,
+                           capture_output=True, text=True).stdout.strip()
+    return int(found or 0)
+
+
+def compare(site: str, role: str, objects: list[dict], full: bool) -> list[dict]:
+    """Drift items for a managed manager. full: objects holds everything, so
+    what data/ has and NSX does not was deleted in NSX."""
+    want = model.desired(site, role)
+    tree = "/global-infra/" if role == "gm" else "/infra/"
+    owners = adopt.ownership_rules()
+    pipeline = {u.strip() for u in os.environ.get("NSX_PIPELINE_USERS", "").split(",") if u.strip()}
+    at_now = schedules.parse_now()
+    # A scheduled rule is compared with what its schedule says now.
+    off_now = {f"{r['policy']}/{r['rule']}": r["disabled"] or not schedules.active(r["schedule"], at_now)
+               for r in schedules.scheduled_rules("global-security" if role == "gm" else "local-security", site)}
+
+    items, seen = [], set()
+    for o in objects:
+        if not str(o.get("path", "")).startswith(tree) or convert.is_system(o) or adopt.owned_elsewhere(o, owners):
+            continue
+        ident = identity(o)
+        if ident is None or ident in want.mirrored:
+            continue
+        seen.add(ident)
+        who, at, seconds = when(o)
+        label = ident[-1] if ident[0] != "rule" else f"{ident[2]}/{ident[3]}"
+        if ident not in want.objects:
+            if ident[0] == "rule" and ("policy", ident[1], ident[2]) not in want.objects:
+                continue  # a rule of an unmanaged policy: reported with its policy
+            items.append(item(ident[0], label, "created outside Git", "not in data/", who, at,
+                              _version(o, "not in data/")))
+            continue
+        key, definition, file = want.objects[ident]
+        if o.get("_last_modified_user") in pipeline:
+            continue
+        kind = ident[0]
+        if kind == "rule":
+            nsx_side = rule_form(as_data("rule", o, want))
+            data_side = rule_form(dict(definition, name=definition.get("name", key.split("/", 1)[1]),
+                                       services=_data_services(want, definition.get("services"))), off_now.get(key))
+        else:
+            form = {"group": group_form, "policy": policy_form, "service": service_form}[kind]
+            nsx_side, data_side = form(as_data(kind, o, want)), form(definition)
+        if nsx_side == data_side:
+            continue
+        differs = {k for k in data_side if data_side.get(k) != nsx_side.get(k)}
+        on_schedule = kind == "rule" and key in off_now and differs == {"disabled"}
+        if seconds is not None and not on_schedule and _committed(file) > seconds:
+            continue  # data/ changed after NSX did: its apply is pending
+        detail = describe(data_side, nsx_side)
+        # Switched on outside its schedule: access the schedule does not grant.
+        high = kind == "rule" and data_side["disabled"] and not nsx_side["disabled"] and key in off_now
+        items.append(item(kind, key, "changed", detail, who, at, _version(o, detail), "high" if high else ""))
+    if full:
+        for ident, (key, _, _) in sorted(want.objects.items(), key=lambda kv: str(kv[0])):
+            if ident not in seen and not (ident[0] == "rule" and ("policy",) + ident[1:3] not in seen):
+                items.append(item(ident[0], key, "deleted"))
+    listed = next((o for o in objects if o.get("resource_type") == "PolicyExcludeList"), None)
+    if listed is not None and role != "gm":
+        items += _exclusions(site, want, listed)
+    return items
+
+
+def _exclusions(site: str, want: model.Desired, listed: dict) -> list[dict]:
+    """The DFW exclusion list: a group added outside Git bypasses the firewall."""
+    file = model.DATA / "exclude-list" / f"{site}.yaml"
+    members = set((load_yaml(file.read_text()) or {}).get("members") or {}) if file.exists() else set()
+    have = {want.paths.get(m, m) for m in listed.get("members") or []}
+    who, at, _ = when(listed)
+    added, removed = "now bypasses the DFW entirely", "no longer excluded"
+    return [item("exclusion", m, "created outside Git", added, who, at, _version(listed, added), "high")
+            for m in sorted(have - members)] + \
+           [item("exclusion", m, "deleted", removed, who, at, _version(listed, removed)) for m in sorted(members - have)]
+
+
+# --- accepting a change: data/ takes what NSX holds ------------------------------
+
+# What NSX does not hold, kept from the data/ entry when it is rewritten.
+KEEP = {"group": ("owner", "sites", "why_static", "why_empty", "domain", "nsx_id"),
+        "rule": ("schedule", "exception", "nsx_id"),
+        "policy": ("id", "owner", "sites", "domain", "rule_management", "allow_duplicate_sequence"),
+        "service": ("owner", "sites")}
+
+
+def nsx_path(ident: tuple, role: str) -> str:
+    tree = "/global-infra" if role == "gm" else "/infra"
+    kind = ident[0]
+    if kind == "group":
+        return f"{tree}/domains/{ident[1]}/groups/{ident[2]}"
+    if kind == "policy":
+        return f"{tree}/domains/{ident[1]}/security-policies/{ident[2]}"
+    if kind == "rule":
+        return f"{tree}/domains/{ident[1]}/security-policies/{ident[2]}/rules/{ident[3]}"
+    return f"{tree}/services/{ident[1]}"
+
+
+def accepted(kind: str, obj: dict, want: model.Desired, old: dict) -> dict:
+    """The data/ entry that says what NSX holds now, keeping what NSX does not hold."""
+    owner, sites = old.get("owner", "lm"), old.get("sites") or []
+    if kind == "group":
+        new = convert.group(obj, want.paths, owner, sites)
+        new.pop("why_static", None)
+        new.pop("why_empty", None)
+    elif kind == "policy":
+        new = convert.policy(dict(obj, rules=[]), want.paths, {}, owner, sites)["policy"]
+    else:
+        new = as_data(kind, obj, want)
+        if kind == "rule" and not new["services"]:
+            del new["services"]
+    new.update({k: old[k] for k in KEEP[kind] if k in old})
+    return new
+
+
+# --- a mirrored manager: its mirror files against the copy on a ref ------------
+
+def files_at(ref: str) -> dict[str, str]:
+    """The data files at ref, read in one git process."""
+    names = subprocess.run(["git", "ls-tree", "-r", "--name-only", ref, "--", *(f"data/{k}" for k in model.KINDS)],
+                           cwd=model.REPO, capture_output=True, text=True, check=True).stdout.splitlines()
+    names = [n for n in names if n.endswith(".yaml")]
+    if not names:
+        return {}
+    batch = subprocess.run(["git", "cat-file", "--batch"], cwd=model.REPO, check=True, capture_output=True,
+                           input="".join(f"{ref}:{n}\n" for n in names).encode()).stdout
+    out, at = {}, 0
+    for name in names:
+        header_end = batch.index(b"\n", at)
+        size = int(batch[at:header_end].split()[2])
+        out[name] = batch[header_end + 1:header_end + 1 + size].decode()
+        at = header_end + 1 + size + 1
+    return out
+
+
+def files_now() -> dict[str, str]:
+    return {f.rel: f.path.read_text() for f in model.data_files()}
+
+
+def mirror_objects(files: dict[str, str], site: str, idents: dict) -> dict[tuple[str, str], dict]:
+    """(kind, key) -> definition, from this site's mirror files; idents gets
+    (kind, key) -> the object's identity in NSX. references: are another
+    tool's groups, never drift."""
+    out: dict[tuple[str, str], dict] = {}
+    for path, text in files.items():
+        if model.mirror_of(text) != site:
+            continue
+        doc = load_yaml(text) or {}
+        if path.startswith("data/groups/"):
+            for key, value in (doc.get("groups") or {}).items():
+                out[("group", str(key))] = value
+                value = value if isinstance(value, dict) else {}
+                idents[("group", str(key))] = ("group", value.get("domain") or "default", str(value.get("nsx_id", key)))
+        elif path.startswith("data/services/"):
+            for key, value in (doc.get("custom") or {}).items():
+                out[("service", str(key))] = value
+                idents[("service", str(key))] = ("service", str(key))
+        elif path.startswith("data/exclude-list/"):
+            for key in doc.get("members") or {}:
+                out[("exclusion", str(key))] = {"member": str(key)}
+        elif path.startswith("data/policies/"):
+            pid, header = Path(path).stem, doc.get("policy") or {}
+            out[("policy", pid)] = header
+            where, nsx = header.get("domain") or "default", str(header.get("id") or pid)
+            idents[("policy", pid)] = ("policy", where, nsx)
+            for key, value in (doc.get("rules") or {}).items():
+                out[("rule", f"{pid}/{key}")] = value
+                value = value if isinstance(value, dict) else {}
+                idents[("rule", f"{pid}/{key}")] = ("rule", where, nsx, str(value.get("nsx_id", key)))
+    return out
+
+
+def nsx_index(dump: dict) -> dict[tuple, dict]:
+    """Identity -> the object as NSX returned it: who changed it, and when."""
+    out: dict[tuple, dict] = {}
+    for o in objects_of(dump):
+        if (ident := identity(o)) is not None:
+            out.setdefault(ident, o)
+    return out
+
+
+def _order_only(before, after) -> bool:
+    """A rule that changed in its sequence number and nothing else."""
+    return isinstance(before, dict) and isinstance(after, dict) and \
+        {k for k in set(before) | set(after) if before.get(k) != after.get(k)} == {"sequence_number"}
+
+
+def _rule_order(objects: dict, pid: str, keep: set[str]) -> list[str]:
+    """The rules of one policy, of those in keep, in the order NSX evaluates them."""
+    rows = [((v or {}).get("sequence_number", 0), k[1].split("/", 1)[1]) for k, v in objects.items()
+            if k[0] == "rule" and k[1].split("/", 1)[0] == pid and k[1].split("/", 1)[1] in keep]
+    return [name for _, name in sorted(rows)]
+
+
+def mirror_changes(site: str, ref: str, dump: dict) -> list[dict] | None:
+    """The changes to report; None when ref holds no copy of the site yet (the baseline)."""
+    before_files, idents = files_at(ref), {}
+    old = mirror_objects(before_files, site, idents)
+    if not old:
+        return None
+    new = mirror_objects(files_now(), site, idents)
+    mine = [p for p, t in before_files.items() if model.mirror_of(t) == site]
+    copied = int(subprocess.run(["git", "log", "-1", "--format=%ct", ref, "--", *mine], cwd=model.REPO,
+                                capture_output=True, text=True, check=True).stdout.strip() or 0)
+    since = copied - SYNC_MARGIN
+    live = nsx_index(dump)
+    gone_policies = {k[1] for k in old if k[0] == "policy" and k not in new}
+    items, renumbered = [], {}
+    for key in sorted(set(old) | set(new)):
+        kind, label = key
+        before, after = old.get(key), new.get(key)
+        if before == after:
+            continue
+        if kind == "rule" and after is None and label.split("/", 1)[0] in gone_policies:
+            continue  # reported with its policy
+        if kind == "rule" and _order_only(before, after):
+            # The UI renumbers neighbours when one rule is dragged: only a change
+            # in ORDER changes what is allowed. Decided per policy below.
+            renumbered.setdefault(label.split("/", 1)[0], []).append(label.split("/", 1)[1])
+            continue
+        who, at, seconds = when(live.get(idents.get(key)))
+        if after is not None and seconds is not None and seconds < since:
+            continue  # nobody changed it in NSX since the copy: the repository side moved
+        if before is None:
+            items.append(item(kind, label, "added", "now bypasses the DFW entirely" if kind == "exclusion" else "",
+                              who, at, digest(after), "high" if kind == "exclusion" else ""))
+        elif after is None:
+            rules = sum(1 for k in old if k[0] == "rule" and k[1].startswith(label + "/"))
+            items.append(item(kind, label, "deleted", f"with its {rules} rule(s)" if kind == "policy" else ""))
+        else:
+            items.append(item(kind, label, "changed", describe(before, after), who, at, digest(after)))
+    for pid, moved in sorted(renumbered.items()):
+        both = {k[1].split("/", 1)[1] for k in old if k[0] == "rule" and k[1].split("/", 1)[0] == pid} & \
+               {k[1].split("/", 1)[1] for k in new if k[0] == "rule" and k[1].split("/", 1)[0] == pid}
+        before_order, after_order = _rule_order(old, pid, both), _rule_order(new, pid, both)
+        if before_order == after_order:
+            continue  # renumbered, same order: nothing to look at
+        who, at, seconds = max((when(live.get(idents.get(("rule", f"{pid}/{r}")))) for r in moved), key=lambda w: w[2] or 0)
+        if seconds is not None and seconds < since:
+            continue
+        shifted = [r for i, r in enumerate(after_order) if before_order.index(r) != i]
+        detail = "rule order changed: now " + " > ".join(after_order)
+        if len(detail) > 240:
+            detail = f"rule order changed: {len(shifted)} rule(s) moved, including " + ", ".join(shifted[:5])
+        row = item("policy", pid, "reordered", detail, who, at, digest(after_order))
+        items.append(dict(row, key=f"policy {pid} order"))
+    return items
+
+
+# --- the issue -----------------------------------------------------------------
+
+def _cell(text: str) -> str:
+    return str(text).replace("|", "\\|").replace("\n", " ")
+
+
+def issue_body(site: str, items: list[dict], source: str, link: str) -> str:
+    rows = [f"| {i['change']} | `{_cell(i['key'])}` | {_cell(i['detail'])} | {_cell(i['who']) or '?'} | {i['at'] or '?'} |"
+            for i in items[:MAX_ROWS]]
+    if len(items) > MAX_ROWS:
+        rows.append(f"| | ... and {len(items) - MAX_ROWS} more | see the job's log | | |")
+    if source == "mirror":
+        found_by = "The mirror sync"
+        keep = ("Intended: nothing to do here, the mirror merge request brings it into the repository "
+                "(and Terraform's state follows).")
+        undo = "Not intended: revert it in NSX; the next sync takes it out of the repository again."
+        after = ("After cutover to `mode: managed` a change like this must come through a merge request: "
+                 "the change watch raises it the same way, and no apply undoes it until it is accepted or the revert approved.")
+    else:
+        found_by = "The change watch (scripts/drift.py)"
+        keep = ("Intended: accept it: Run pipeline with `ACCEPT_SITE` and `ACCEPT_KEYS` (kind=key, e.g. `rule=app/r1`) "
+                "opens a merge request writing it into `data/` (scripts/drift.py accept).")
+        undo = ("Not intended: revert it: list the object in `allow-revert.txt` in a merge request; its apply puts back what "
+                "`data/` says. Until one or the other, every plan of this manager refuses to undo it silently.")
+        after = "This manager is in `mode: managed`: changes are made through merge requests, not the UI."
+    return "\n".join([
+        f"{found_by} of **{site}** found {len(items)} change(s) made in NSX, not through this repository.",
+        "",
+        f"Found by: {link}" if link else "",
+        "",
+        "| change | object | what changed | last changed by | when (UTC) |",
+        "|---|---|---|---|---|",
+        *rows,
+        "",
+        "\"Last changed by\" and \"when\" are what NSX records on the object. NSX keeps nothing on a deleted object: "
+        "its audit log (System > Audit) has who deleted it.",
+        "",
+        "### Investigation",
+        "- [ ] Who made each change, and why: the incident or change ticket.",
+        f"- [ ] {keep}",
+        f"- [ ] {undo}",
+        "- [ ] Should it have gone through a merge request? Agree what to do differently, if so.",
+        "",
+        after,
+        "",
+        "Close this issue once every change in it is explained.",
+        "",
+        *[f"<!-- nsx-drift object={digest(i['key'])} version={i['version']} -->" for i in items],
+    ])
+
+
+def raise_issue(site: str, items: list[dict], source: str, link: str) -> list[dict]:
+    """One issue for what no nsx-drift issue holds yet: the new items."""
+    gitlab = GitLab()
+    seen = gitlab.marks(f"{LABEL},site:{site}", MARK)
+    new = [i for i in items if (digest(i["key"]), i["version"]) not in seen]
+    if not new:
+        print(f"drift: each of the {len(items)} change(s) on {site} is already in an nsx-drift issue.")
+        return []
+    high = any(i.get("severity") == "high" for i in new)
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    url = gitlab.open_issue(
+        ("[HIGH] " if high else "") + f"NSX drift on {site}: {len(new)} change(s) made outside the repository, {stamp}",
+        issue_body(site, new, source, link), f"{LABEL},site:{site}" + (",severity::high" if high else ""))
+    print(f"drift: {len(new)} change(s) on {site} to investigate: {url}")
+    return new
+SCAFFOLD_EOF
+
+write_file scripts/import-estate.py <<'SCAFFOLD_EOF'
+#!/usr/bin/env python3
+"""Adopt an existing NSX estate into this repository: data files plus Terraform
+import blocks, so Terraform takes over the objects already running instead of
+building a second set beside them. Reads NSX; never writes to it.
+
+  scripts/with-credentials.sh lon1 -- scripts/import-estate.py --site lon1        # live
+  scripts/with-credentials.sh lon1 -- scripts/import-estate.py --site lon1 \\
+      --dump-only reports/lon1-raw.json                                          # capture once
+  scripts/import-estate.py --site lon1 --from-dump reports/lon1-raw.json          # convert offline
+
+  --list               a survey: each policy and whether it can be adopted
+  --policy ID          only this policy and what it needs (repeat for more)
+  --tranche NAME       the name in the file names (default: the first --policy, or "all")
+  --mirror             every adoptable object, into files this tool owns and
+                       rewrites on every run (scripts/mirror.sh)
+
+What it writes, <tranche> being --tranche, or "mirror":
+
+  data/groups/imported-<site>-<tranche>.yaml     groups, and references to another tool's
+  data/services/imported-<site>-<tranche>.yaml   custom services
+  data/policies/<policy key>.yaml                one file per policy
+  data/exclude-list/<site>.yaml                  the DFW exclusion list (whole manager only)
+  stacks/<stack>/import-<site>-<tranche>.tf      import blocks, inert for every other site
+  data/.import-manifest.json                     what was imported, and from where
+
+A file that exists already is written beside it as <name>.new: your data is
+never overwritten. Mirror files (first line "# nsx-mirror: <site>") are the
+exception: they are this tool's, regenerated byte for byte from the manager.
+
+What can and cannot be adopted, and why: scripts/nsxlib/adopt.py.
+
+--id-format: the nsxt provider has imported policy objects by path and by
+"domain/id". A wrong format fails at plan time with "not found", before
+anything reaches state.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from nsxlib import adopt, convert, inventory  # noqa: E402
+from nsxlib.adopt import Choice  # noqa: E402
+from nsxlib.convert import is_system  # noqa: E402
+from nsxlib.model import DATA, MIRROR_MARK, REPO, mirror_files  # noqa: E402
+from nsxlib.nsx import GM_BASE, LM_BASE, Client, domain_of  # noqa: E402
+from nsxlib.yamlio import to_yaml  # noqa: E402
+
+MANIFEST = DATA / ".import-manifest.json"
+TODAY = f"{datetime.now(timezone.utc):%Y-%m-%d}"
+
+
+def main() -> int:
+    args = parse_args()
+    tranche = "mirror" if args.mirror else (args.tranche or (args.policy[0] if args.policy else "all"))
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", tranche):
+        sys.exit(f"error: --tranche '{tranche}' must be letters, digits, '.', '_' or '-'")
+    manager = inventory.manager(args.site)
+    role = args.role or manager.get("role", "lm")
+    # On a Global Manager too, global objects live in domain "default".
+    domain = args.domain or manager.get("domain") or "default"
+
+    if args.from_dump:
+        estate = json.loads(Path(args.from_dump).read_text())
+        domain = estate.get("domain", domain)
+    else:
+        estate = Client.from_env(args.site, manager.get("host")).read(GM_BASE if role == "gm" else LM_BASE, domain)
+    if args.dump_only:
+        out = Path(args.dump_only)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(estate, indent=2))
+        print(f"wrote {out}")
         return 0
-    if args.mirror:
-        print(f"mirror of {args.site} regenerated. While it is in mode: mirror, its plans must only import;")
-        print("only its state is updated, by import and refresh. Cutover: docs/IMPORT.md, \"Mirror mode\".")
-        return 0
-    print()
-    print("next:")
-    print("  1. make validate")
-    print(f"  2. scripts/tf.sh plan {security_stack} {args.site}")
-    print("  3. the plan must only import: scripts/plan-guard.py refuses anything else")
-    print("  4. apply, then confirm the next plan reports no changes")
-    print(f"  5. delete stacks/{security_stack}/import-{args.site}-{tranche}.tf in its own merge request")
+    if args.list:
+        return print_survey(args.site, adopt.survey(estate, args.site, role))
+
+    try:
+        choice = adopt.select(estate, args.site, role, domain, args.policy, args.mirror)
+    except adopt.Refused as exc:
+        sys.exit(f"error: {exc}. Nothing was written.")
+    files = Files(args.site, tranche, role, domain, args.mirror, args.dry_run)
+    counts = files.write(choice, args.id_format)
+    if not args.dry_run:
+        update_manifest(args.site, role, domain, tranche, args.mirror, files, choice)
+    report(args.site, role, tranche, args.mirror, args.dry_run, files, choice, counts)
     return 0
 
 
-def survey(site: str, groups: list, services: list, policies: list, federated: dict | None = None,
-           elsewhere: dict | None = None) -> int:
-    """What could be adopted from this manager, policy by policy. Writes nothing."""
-    elsewhere = elsewhere or {}
-    bad = unsupported_objects(groups, services, federated, elsewhere)
-    have = existing_keys()
-    rows = []
-    for policy in policies:
-        if is_system(policy):
-            continue
-        if policy.get("path") in elsewhere:
-            rows.append((policy.get("category", ""), policy["id"], policy.get("display_name", ""),
-                         len(policy.get("rules", [])), f"owned elsewhere: {elsewhere[policy['path']]}"))
-            continue
-        if why := field_unsupported("policy", policy):
-            rows.append((policy.get("category", ""), policy["id"], policy.get("display_name", ""),
-                         len(policy.get("rules", [])), f"not adoptable: {why}"))
-            continue
-        rules = policy.get("rules", [])
-        kept = [r for r in rules if rule_unsupported(r, bad)]
-        blocked = [p.rsplit("/", 1)[-1] for p in policy.get("scope") or [] if p in bad]
-        if policy["id"] in have["policies"]:
-            status = "managed already"
-        elif blocked:
-            status = f"not adoptable: Apply To uses {', '.join(blocked)}"
-        elif kept:
-            status = f"adoptable; {len(kept)} of {len(rules)} rule(s) stay in the UI"
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--site", required=True, help="manager name in inventory/managers.yaml")
+    ap.add_argument("--domain", help="NSX domain (default: the inventory's, or 'default')")
+    ap.add_argument("--role", choices=["gm", "lm"], help="override the role from the inventory")
+    ap.add_argument("--from-dump", metavar="FILE", help="convert a capture instead of reading NSX")
+    ap.add_argument("--dump-only", metavar="FILE", help="capture what NSX holds and stop")
+    ap.add_argument("--id-format", choices=["path", "domain-id", "id"], default="path")
+    ap.add_argument("--dry-run", action="store_true", help="report what would be written")
+    ap.add_argument("--policy", action="append", default=[], metavar="ID", help="adopt this policy and what it needs")
+    ap.add_argument("--list", action="store_true", help="survey the policies; write nothing")
+    ap.add_argument("--tranche", metavar="NAME", help="the name of this piece of work, in the file names")
+    ap.add_argument("--mirror", action="store_true", help="every adoptable object, into files rewritten each run")
+    args = ap.parse_args()
+    if args.mirror and (args.policy or args.tranche or args.list or args.dump_only):
+        sys.exit("error: --mirror takes the whole manager: not with --policy, --tranche, --list or --dump-only")
+    if not args.mirror and args.tranche == "mirror":
+        sys.exit("error: the tranche name 'mirror' belongs to --mirror")
+    return args
+
+
+# --- writing ---------------------------------------------------------------------
+
+class Files:
+    """The files of one run. A file that exists is written beside it as .new,
+    except in mirror mode, where this tool owns its files and starts from none."""
+
+    def __init__(self, site: str, tranche: str, role: str, domain: str, mirror: bool, dry_run: bool) -> None:
+        self.site, self.tranche, self.role, self.domain = site, tranche, role, domain
+        self.mirror, self.dry_run = mirror, dry_run
+        self.owner = "gm" if role == "gm" else "lm"
+        self.stack = "global-security" if role == "gm" else "local-security"
+        self.import_path = REPO / "stacks" / self.stack / f"import-{site}-{tranche}.tf"
+        self.written: list[str] = []
+        self.deferred: list[str] = []
+        self.removed: set[str] = set()
+
+    def header(self, kind: str) -> str:
+        if self.mirror:
+            return (f"{MIRROR_MARK}{self.site}\n"
+                    f"# Mirror of {self.site}, regenerated from the live manager by scripts/mirror.sh.\n"
+                    "# Do not edit: the next sync overwrites this file. Change the object in NSX, or\n"
+                    "# move the manager to mode: managed (docs/IMPORT.md, \"Mirror mode\").\n\n")
+        if kind == "groups":
+            return (f"# Imported from {self.site} on {TODAY}. Adopted, not created.\n#\n"
+                    "# Review before the first apply: check every 'why_static' note, and confirm\n"
+                    "# the tag scopes below are in data/schema/tag-scopes.yaml.\n\n")
+        if kind.startswith("policy "):
+            return (f"# Imported from {self.site} on {TODAY}. Adopted, not created.\n#\n"
+                    "# A new rule for this policy belongs IN THIS FILE. Do not declare a second\n"
+                    f"# policy: scripts/add-rule.py --policy {kind[7:]} --rule <name> ...\n\n")
+        return f"# Imported from {self.site} on {TODAY}.\n\n"
+
+    def put(self, path: Path, text: str) -> None:
+        rel = str(path.relative_to(REPO))
+        target = path
+        if path.exists() and not self.mirror:
+            target = path.with_suffix(path.suffix + ".new")
+            self.deferred.append(f"{rel} -> {target.name}")
         else:
-            status = "adoptable"
-        rows.append((policy.get("category", ""), policy["id"], policy.get("display_name", ""), len(rules), status))
+            self.written.append(rel)
+        if not self.dry_run:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text)
+
+    def write(self, c: Choice, id_format: str) -> dict[str, int]:
+        sites = [self.site]
+        if self.mirror:
+            # Start from nothing: what NSX no longer has must not survive here.
+            own = mirror_files(self.site)
+            self.removed = {str(f.relative_to(REPO)) for f in own}
+            if not self.dry_run:
+                for f in own:
+                    f.unlink()
+                self.import_path.unlink(missing_ok=True)
+
+        groups = {g["id"]: convert.group(g, c.group_paths, self.owner, sites) for g in c.groups if not is_system(g)}
+        if self.role == "gm":
+            # A group outside the global domain keeps it: the GM stack creates it there.
+            for g in c.groups:
+                if g["id"] in groups and (where := domain_of(g.get("path", ""), self.domain)) != "default":
+                    groups[g["id"]]["domain"] = where
+        if groups or c.references:
+            doc = {"groups": groups, **({"references": c.references} if c.references else {})}
+            self.put(DATA / "groups" / f"imported-{self.site}-{self.tranche}.yaml", self.header("groups") + to_yaml(doc))
+
+        if c.excluded:
+            note = ("IMPORTED AS-IS: this group's members bypass the DFW entirely. Record why, with an exception "
+                    "(owner, ticket, expires) naming the guardrail exclusion-list, or remove it.")
+            self.put(DATA / "exclude-list" / f"{self.site}.yaml",
+                     self.header("exclude-list") + to_yaml({"members": {k: {"why": note} for k in sorted(c.excluded)}}))
+
+        custom = {s["id"]: convert.service(s) for s in c.services if not is_system(s)}
+        for definition in custom.values():
+            definition["owner"] = self.owner
+            if self.owner == "lm":
+                definition["sites"] = sites
+        used = {p for pol in c.policies for r in pol.get("rules", []) for p in r.get("services") or []}
+        # Predefined services by id, never by display name: names are not unique
+        # (a federated Local Manager lists its own HTTPS and the Global Manager's).
+        predefined = {s["id"]: s.get("display_name", s["id"]) for s in c.services if is_system(s) and s.get("path") in used}
+        if custom or predefined:
+            doc = {**({"predefined_ids": predefined} if predefined else {}), **({"custom": custom} if custom else {})}
+            self.put(DATA / "services" / f"imported-{self.site}-{self.tranche}.yaml", self.header("services") + to_yaml(doc))
+
+        policies = [p for p in c.policies if not is_system(p)]
+        for p in policies:
+            doc = convert.policy(p, c.group_paths, c.service_paths, self.owner, sites)
+            if self.role == "gm" and (where := domain_of(p.get("path", ""), self.domain)) != "default":
+                doc["policy"]["domain"] = where
+            self.put(DATA / "policies" / f"{p['id']}.yaml", self.header(f"policy {p['id']}") + to_yaml(doc))
+
+        self.write_imports(c, groups, custom, policies, id_format)
+        return {"groups": len(groups), "policies": len(policies),
+                "rules": sum(len(p.get("rules", [])) for p in policies), "services": len(custom)}
+
+    def write_imports(self, c: Choice, groups: dict, custom: dict, policies: list, id_format: str) -> None:
+        def nsx_id(kind: str, path: str, nsx: str, where: str = "") -> str:
+            if id_format == "path":
+                return path
+            return f"{where or domain_of(path, self.domain)}/{nsx}" if id_format == "domain-id" and kind != "service" else nsx
+
+        base, composite = {}, {}
+        for g in c.groups:
+            if g["id"] in groups:
+                nested = any("member_groups" in x for x in groups[g["id"]].get("criteria", []))
+                (composite if nested else base)[g["id"]] = nsx_id("group", g.get("path", ""), g.get("_nsx_id", g["id"]))
+        services = {s["id"]: nsx_id("service", s.get("path", ""), s["id"]) for s in c.services if s["id"] in custom}
+        policy_ids, rule_ids = {}, {}
+        for p in policies:
+            nsx = p.get("_nsx_id", p["id"])
+            policy_ids[p["id"]] = nsx_id("policy", p.get("path", ""), nsx)
+            for r in p.get("rules", []):
+                rule_ids[f"{p['id']}/{r['id']}"] = {
+                    "policy": p["id"], "rule": r["id"],
+                    "id": nsx_id("rule", r.get("path", ""), f"{nsx}/{r.get('_nsx_id', r['id'])}",
+                                 domain_of(p.get("path", ""), self.domain))}
+        kinds = [
+            ("base_groups", "module.base_groups.nsxt_policy_group.this[each.key]", base),
+            ("composite_groups", "module.composite_groups.nsxt_policy_group.this[each.key]", composite),
+            ("services", "module.services.nsxt_policy_service.this[each.key]", services),
+            ("policies", "module.policies[each.key].nsxt_policy_parent_security_policy.this", policy_ids),
+            ("rules", "module.policies[each.value.policy].nsxt_policy_security_policy_rule.this[each.value.rule]", rule_ids),
+            ("exclude_list", "nsxt_policy_firewall_exclude_list_member.this[each.key]", dict(sorted(c.excluded.items()))),
+        ]
+        if any(entries for _, _, entries in kinds):
+            self.put(self.import_path, import_file(self.site, self.tranche, self.role, kinds, self.import_header(id_format)))
+
+    def import_header(self, id_format: str) -> str:
+        if self.mirror:
+            return (f"# Mirror of {self.site}: every object in the mirror files, imported into state.\n"
+                    "# Regenerated by scripts/mirror.sh; do not edit.\n#\n"
+                    f"# While {self.site} is in mirror mode, its sync-state job applies these imports\n"
+                    "# (and nothing else) with the read-only credential; an object already in state\n"
+                    "# is left as it is. After cutover to managed, delete this file in its own merge\n"
+                    f"# request.\n#\n# id format: {id_format}.\n")
+        return (f"# Generated by scripts/import-estate.py: tranche '{self.tranche}' for {self.site}.\n"
+                "# Adopts existing objects into state; creates nothing.\n#\n"
+                f"#   scripts/tf.sh plan {self.stack} {self.site}\n#\n"
+                "# scripts/plan-guard.py refuses the plan unless it only imports. A tranche is\n"
+                "# done when, after the apply, the plan reports no changes. Then delete this\n"
+                "# file in its own merge request: import blocks are one-shot.\n#\n"
+                f"# id format: {id_format}. If every import fails with a not-found error,\n"
+                "# re-run import-estate.py with a different --id-format; nothing has been\n"
+                "# written to state at that point.\n")
+
+
+def hcl_string(value: str) -> str:
+    """A Terraform string literal: JSON escaping, plus HCL's own template markers."""
+    return json.dumps(value).replace("${", "$${").replace("%{", "%%{")
+
+
+def import_file(site: str, tranche: str, role: str, kinds: list[tuple[str, str, dict]], header: str) -> str:
+    """One import block per resource kind, each a for_each over a map. On a Local
+    Manager the map is empty unless var.site is this site: the file is inert in
+    every other manager's plan of the same stack."""
+    name = "import_" + re.sub(r"[^a-z0-9_]", "_", f"{site}_{tranche}".lower())
+    lines = [header, "locals {"]
+    for kind, _, entries in kinds:
+        lines.append(f"  {name}_{kind} = {{")
+        width = max((len(hcl_string(k)) for k in entries), default=0)  # aligned as terraform fmt aligns
+        for k, v in entries.items():
+            value = "{ " + ", ".join(f"{a} = {hcl_string(b)}" for a, b in v.items()) + " }" if isinstance(v, dict) else hcl_string(v)
+            lines.append(f"    {hcl_string(k).ljust(width)} = {value}")
+        lines.append("  }")
+    lines += ["}", ""]
+    for kind, to, entries in kinds:
+        if entries:
+            source = f"local.{name}_{kind}" if role == "gm" else f"var.site == {hcl_string(site)} ? local.{name}_{kind} : {{}}"
+            value = "each.value.id" if "each.value.policy" in to else "each.value"
+            lines += ["import {", f"  for_each = {source}", f"  to       = {to}", f"  id       = {value}", "}", ""]
+    return "\n".join(lines) + "\n"
+
+
+def update_manifest(site: str, role: str, domain: str, tranche: str, mirror: bool, files: Files, c: Choice) -> None:
+    try:
+        manifest = json.loads(MANIFEST.read_text()) if MANIFEST.exists() else {}
+    except ValueError:
+        manifest = {}
+    manifest = {"version": 1, "imported": [], "sources": [], **manifest}
+    before = json.dumps(manifest, indent=2) + "\n"
+    if mirror:
+        # No dated history: an unchanged manager leaves no diff. Files this mirror
+        # no longer writes (deleted in NSX) leave the list too.
+        gone = files.removed - set(files.written)
+        manifest["imported"] = [r for r in manifest["imported"] if r not in gone]
+        manifest.setdefault("mirrors", {})[site] = {"role": role, "domain": domain}
+    manifest["imported"] += [r for r in files.written if r not in manifest["imported"]]
+    if not mirror:
+        policies = [p for p in c.policies if not is_system(p)]
+        manifest["sources"].append({
+            "site": site, "role": role, "domain": domain, "tranche": tranche, "policies": [p["id"] for p in policies],
+            "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "counts": {"groups": len([g for g in c.groups if not is_system(g)]), "policies": len(policies),
+                       "rules": sum(len(p.get("rules", [])) for p in policies),
+                       "services": len([s for s in c.services if not is_system(s)])}})
+    if json.dumps(manifest, indent=2) + "\n" != before:
+        MANIFEST.write_text(json.dumps(manifest, indent=2) + "\n")
+
+
+# --- reporting -------------------------------------------------------------------
+
+def report(site: str, role: str, tranche: str, mirror: bool, dry_run: bool, files: Files, c: Choice,
+           counts: dict[str, int]) -> None:
+    print()
+    for rel in files.written:
+        print(f"  wrote     {rel}")
+    for note in files.deferred:
+        print(f"  EXISTS    {note}  (your file was not touched — diff and merge by hand)")
+    for note in c.managed:
+        print(f"  MANAGED   {note}  (already in data/, so not adopted again)")
+    for note in c.owned_by_others:
+        print(f"  OWNED ELSEWHERE  {note}")
+    if c.owned_by_others:
+        print("  (another tool manages these: never adopted, never raised as drift. A rule here may")
+        print("   still use such a group, by name: data/groups lists it under references.)")
+    for note in c.not_adopted:
+        print(f"  NOT ADOPTED  {note}")
+    if c.not_adopted:
+        print("  (these cannot be represented exactly, so importing them would change them on")
+        print("   the first apply; they stay as they are, managed in the NSX UI)")
+    unknown = sorted({n.split("carries ", 1)[1].split("=", 1)[0] for n in c.not_adopted if "carries " in n})
+    if unknown:
+        print(f"  fields NSX returned that this tool does not represent yet: {', '.join(unknown)}")
+    print()
+    for line in c.creators:
+        print(line)
+    print()
+    print(f"{counts['groups']} group(s), {counts['policies']} policy/policies, {counts['rules']} rule(s), "
+          f"{counts['services']} custom service(s)")
+    stack = "global-security" if role == "gm" else "local-security"
+    if dry_run:
+        print("dry run — nothing was written.")
+    elif mirror:
+        print(f"mirror of {site} regenerated. While it is in mode: mirror, its plans must only import;")
+        print("only its state is updated, by import and refresh. Cutover: docs/IMPORT.md, \"Mirror mode\".")
+    else:
+        print()
+        print("next:")
+        print("  1. make validate")
+        print(f"  2. scripts/tf.sh plan {stack} {site}")
+        print("  3. the plan must only import: scripts/plan-guard.py refuses anything else")
+        print("  4. apply, then confirm the next plan reports no changes")
+        print(f"  5. delete stacks/{stack}/import-{site}-{tranche}.tf in its own merge request")
+
+
+def print_survey(site: str, rows: list[tuple]) -> int:
     print(f"{len(rows)} policy/policies on {site}:")
     print()
     print(f"  {'CATEGORY':<14} {'POLICY ID':<36} {'RULES':>5}  STATUS")
-    for category, pid, name, count, status in sorted(rows):
+    for category, pid, name, count, status in rows:
         label = pid if name in ("", pid) else f"{pid} ({name})"
         print(f"  {category:<14} {label:<36} {count:>5}  {status}")
     print()
     print("Adopt one with: --policy <POLICY ID> (in the pipeline: ADOPT_POLICY).")
     return 0
-
-
-def _referenced(service: dict, policies: list) -> bool:
-    path = service.get("path")
-    for policy in policies:
-        for rule in policy.get("rules", []):
-            if path in (rule.get("services") or []):
-                return True
-    return False
 
 
 if __name__ == "__main__":
@@ -10500,15 +10688,17 @@ Exit status: 0 the plan is allowed, 2 it is refused, 1 usage or input error.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-ALLOW_FILE = REPO_ROOT / "allow-destroy.txt"
-REVERT_FILE = REPO_ROOT / "allow-revert.txt"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from nsxlib import schedules  # noqa: E402
+from nsxlib.model import REPO, mirror_addresses  # noqa: E402
+
+ALLOW_FILE = REPO / "allow-destroy.txt"
+REVERT_FILE = REPO / "allow-revert.txt"
 
 
 def load_allowed(site: str, stack: str, file: Path = ALLOW_FILE) -> set[str]:
@@ -10552,44 +10742,6 @@ def reverts(plan: dict, scheduled: set[str]) -> dict[str, list[str]]:
     return out
 
 
-def scheduled_addresses(site: str, stack: str) -> set[str]:
-    try:
-        spec = importlib.util.spec_from_file_location("nsx_schedule", Path(__file__).resolve().parent / "schedule.py")
-        module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-        return set(module.desired(stack, site, module.parse_now(None)))
-    except Exception:  # noqa: BLE001 - no schedules is no exemption
-        return set()
-
-
-def mirror_addresses(site: str) -> tuple[set[str], tuple[str, ...]]:
-    """What a hybrid manager still mirrors from the UI: the addresses (exact,
-    and prefixes for a policy's resources) of every object in a file carrying
-    the mirror mark. Those are only ever imported or refreshed, never changed."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from yamlcompat import load_yaml  # noqa: PLC0415
-
-    mark = f"# nsx-mirror: {site}"
-    exact: set[str] = set()
-    prefixes: list[str] = []
-    for kind in ("groups", "services", "policies", "exclude-list"):
-        for f in sorted((REPO_ROOT / "data" / kind).glob("*.yaml")):
-            text = f.read_text()
-            if text.split("\n", 1)[0].strip() != mark:
-                continue
-            doc = load_yaml(text) or {}
-            if kind == "groups":
-                for k in doc.get("groups") or {}:
-                    exact |= {f'module.base_groups.nsxt_policy_group.this["{k}"]', f'module.composite_groups.nsxt_policy_group.this["{k}"]'}
-            elif kind == "services":
-                exact |= {f'module.services.nsxt_policy_service.this["{k}"]' for k in doc.get("custom") or {}}
-            elif kind == "policies":
-                prefixes.append(f'module.policies["{f.stem}"].')
-            else:
-                exact |= {f'nsxt_policy_firewall_exclude_list_member.this["{k}"]' for k in doc.get("members") or {}}
-    return exact, tuple(prefixes)
-
-
 def changed_fields(change: dict) -> set[str]:
     """Top-level attributes an update changes (a computed value left unknown aside)."""
     before, after = change.get("before") or {}, change.get("after") or {}
@@ -10624,7 +10776,7 @@ def main() -> int:
 
     changes = [c for c in plan.get("resource_changes") or [] if c.get("mode", "managed") == "managed"]
     allowed = load_allowed(args.site, args.stack)
-    leftover = import_files(REPO_ROOT / "stacks" / args.stack, args.site)
+    leftover = import_files(REPO / "stacks" / args.stack, args.site)
     # hybrid: what is still mirrored is held to observe; what was cut over is
     # managed, and its mirror's import file is not a tranche to it.
     hybrid = os.environ.get("NSX_MODE") == "hybrid"
@@ -10689,7 +10841,8 @@ def main() -> int:
     revert_used: set[str] = set()
     revert_lines: list[str] = []
     if not (args.observe or args.schedule):
-        for address, fields in reverts(plan, scheduled_addresses(args.site, args.stack)).items():
+        scheduled = set(schedules.desired(args.stack, args.site, schedules.parse_now()))
+        for address, fields in reverts(plan, scheduled).items():
             if address in revert_ok:
                 revert_used.add(address)
                 continue
@@ -10731,7 +10884,7 @@ def main() -> int:
     if revert_lines:
         print()
         print("Someone changed these in NSX, and this plan would undo it, though data/ does not ask for that.")
-        print("Keep the change: bring it into data/ (scripts/accept-drift.py, or the 'accept' job). Undo it on")
+        print("Keep the change: bring it into data/ (scripts/drift.py accept, or the 'accept' job). Undo it on")
         print("purpose: approve each one in allow-revert.txt, in this merge request:")
         for line in revert_lines:
             print(f"  {line}")
@@ -11023,7 +11176,7 @@ write_file scripts/mirror.sh <<'SCAFFOLD_EOF'
 # Terraform's state, with the read-only credential, until mode: managed.
 #
 # Changes engineers made in the UI since the copy on the default branch are
-# also raised as a GitLab issue, labelled nsx-drift (scripts/drift-issue.py):
+# also raised as a GitLab issue, labelled nsx-drift (scripts/drift.py mirror):
 # who changed what and when, to investigate during the observation period.
 #
 # Needs NSX_ADOPT_TOKEN, as the adopt job: a project access token with the api
@@ -11051,7 +11204,7 @@ base="$(git rev-parse HEAD)"
 inventory="$(python3 - <<'PY'
 import sys
 sys.path.insert(0, "scripts")
-from ci_matrix_lib import managers, mode_of
+from nsxlib.inventory import managers, mode_of
 for name, m in sorted(managers().items()):
     if m.get("enabled") is not False:
         print(name, mode_of(name, m))
@@ -11131,8 +11284,8 @@ for site in $sites; do
 	last="$(git log -1 --format=%ct -- "data/groups/imported-$site-mirror.yaml" "data/services/imported-$site-mirror.yaml" "stacks/*/import-$site-mirror.tf" 2>/dev/null || true)"
 	tool="$(git log -1 --format=%ct -- scripts/import-estate.py inventory/ownership.yaml 2>/dev/null || true)"
 	pending="$(gitlab GET "/merge_requests?state=opened&source_branch=$branch&target_branch=$target" | json_field iid 2>/dev/null || true)"
-	if [ "${MIRROR_FULL:-}" != 1 ] && [ -n "$last" ] && [ "$last" -gt "${tool:-0}" ] && [ -z "$pending" ] && [ -x scripts/nsx-watch.py ]; then
-		NSX_CRED_SCOPE=plan scripts/with-credentials.sh "$site" -- python3 scripts/nsx-watch.py --site "$site" --changed-since "$((last - 3600))"
+	if [ "${MIRROR_FULL:-}" != 1 ] && [ -n "$last" ] && [ "$last" -gt "${tool:-0}" ] && [ -z "$pending" ]; then
+		NSX_CRED_SCOPE=plan scripts/with-credentials.sh "$site" -- python3 scripts/drift.py changed --site "$site" --since "$((last - 3600))"
 		if [ $? -eq 3 ]; then
 			echo "$site: nothing modified in NSX since its last copy; not read in full (MIRROR_FULL=1 forces it)."
 			continue
@@ -11231,7 +11384,7 @@ PY
 	# What engineers changed in the UI since the copy on the default branch,
 	# raised as an issue to investigate. A failure here is reported, not fatal:
 	# the merge request already carries the changes.
-	if ! python3 scripts/drift-issue.py mirror --site "$site" --base "$base" --dump "$dump" \
+	if ! python3 scripts/drift.py mirror --site "$site" --base "$base" --dump "$dump" \
 		--link "$(json_field web_url <<<"$response")"; then
 		echo "warning: the drift issue for $site could not be raised (above)" >&2
 	fi
@@ -11293,530 +11446,12 @@ exec scripts/tf.sh apply "$stack" "$site"
 SCAFFOLD_EOF
 mark_executable scripts/sync-state.sh
 
-write_file scripts/drift-issue.py <<'SCAFFOLD_EOF'
-#!/usr/bin/env python3
-"""Raise a GitLab issue for changes made in NSX outside this repository, so
-each one is investigated: who made it, why, and whether it stays.
-
-  scripts/drift-issue.py mirror --site S --base REF --dump FILE [--link URL]
-      Run by scripts/mirror.sh after it rewrote a manager's mirror files:
-      compares them, object by object, with REF (the default branch).
-  scripts/drift-issue.py plan --site S --stack STACK --plan-json FILE [--link URL]
-      Run by scripts/drift-job.sh for a manager in mode: managed: the drift
-      a refresh-only plan found (NSX no longer matches Terraform's state).
-
-One issue per run that found something new, labelled nsx-drift and
-site:<site>. It lists each object, what changed, and who last changed it and
-when, as NSX records them on every object it still has. That is the tracker
-for the observation period: close an issue once every change in it is
-explained.
-
-Each object is reported once per version. The next run seeing the same change
-does not report it again (the issues themselves are the record, nothing else
-is kept); a further change to the same object is reported. In mirror mode:
-
-  * The first copy of a manager is its baseline, not drift.
-  * A difference whose object NSX says nobody modified since the copy on REF
-    (less an hour, the time a sync may take) is not drift either: it comes from
-    the repository side, typically an object a newer importer can take over
-    for the first time.
-
-Needs NSX_BOT_TOKEN or NSX_ADOPT_TOKEN (scope api). Exit status: 0 done
-(issue raised, or nothing new), 1 error.
-"""
-
-from __future__ import annotations
-
-import argparse
-import hashlib
-import importlib.util
-import json
-import os
-import re
-import ssl
-import subprocess
-import sys
-import urllib.error
-import urllib.parse
-import urllib.request
-from datetime import datetime, timezone
-from pathlib import Path
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from yamlcompat import load_all  # noqa: E402
-
-LABEL = "nsx-drift"
-MIRROR_MARK = "# nsx-mirror: "
-MARK = re.compile(r"<!-- nsx-drift object=([0-9a-f]{16}) version=([0-9a-f]{16}) -->")
-MAX_ROWS = 300
-SYNC_MARGIN = 3600  # seconds: a sync reads the manager this long, at most, before its commit
-
-
-def die(message: str) -> None:
-    print(f"error: {message}", file=sys.stderr)
-    raise SystemExit(1)
-
-
-def digest(value) -> str:
-    return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()[:16]
-
-
-class GitLab:
-    def __init__(self) -> None:
-        self.api = os.environ.get("CI_API_V4_URL", "").rstrip("/")
-        self.project = os.environ.get("CI_PROJECT_ID", "")
-        self.token = os.environ.get("NSX_BOT_TOKEN") or os.environ.get("NSX_ADOPT_TOKEN") or ""
-        if not (self.api and self.project):
-            die("CI_API_V4_URL and CI_PROJECT_ID are not set: this runs in a GitLab job")
-        if not self.token:
-            die("NSX_BOT_TOKEN (or NSX_ADOPT_TOKEN) is not set: a project access token with the api scope")
-        ca = os.environ.get("CI_SERVER_TLS_CA_FILE")
-        self.ctx = ssl.create_default_context(cafile=ca) if ca and Path(ca).is_file() else ssl.create_default_context()
-        self.ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
-
-    def call(self, method: str, path: str, body: dict | None = None, query: dict | None = None):
-        url = f"{self.api}/projects/{urllib.parse.quote(self.project, safe='')}{path}"
-        if query:
-            url += "?" + urllib.parse.urlencode(query)
-        data = json.dumps(body).encode() if body is not None else None
-        request = urllib.request.Request(url, data=data, method=method)
-        request.add_header("PRIVATE-TOKEN", self.token)
-        if data is not None:
-            request.add_header("Content-Type", "application/json")
-        try:
-            with urllib.request.urlopen(request, context=self.ctx, timeout=60) as response:
-                return json.loads(response.read().decode() or "null"), response.headers
-        except urllib.error.HTTPError as exc:
-            die(f"GitLab API {method} {path}: HTTP {exc.code} {exc.read().decode(errors='replace')[:300]}")
-        except urllib.error.URLError as exc:
-            die(f"GitLab API {method} {path}: {exc.reason}")
-
-    def reported(self, site: str) -> set[tuple[str, str]]:
-        """(object, version) pairs already in an nsx-drift issue for this site, open or closed."""
-        seen: set[tuple[str, str]] = set()
-        page = "1"
-        for _ in range(10):  # the 1000 most recent issues
-            issues, headers = self.call("GET", "/issues", query={
-                "labels": f"{LABEL},site:{site}", "state": "all", "order_by": "created_at",
-                "sort": "desc", "per_page": 100, "page": page})
-            for issue in issues or []:
-                seen.update(MARK.findall(issue.get("description") or ""))
-            page = (headers.get("X-Next-Page") or "").strip()
-            if not page:
-                break
-        return seen
-
-
-# --------------------------------------------------------------------------
-# What changed
-# --------------------------------------------------------------------------
-
-def mirror_objects(files: dict[str, str], site: str, identity: dict | None = None) -> dict[tuple[str, str], dict]:
-    """(kind, key) -> definition, from this site's mirror files. identity, when
-    given, receives (kind, key) -> the object's identity in NSX (nsx_ident())."""
-    out: dict[tuple[str, str], dict] = {}
-    ident = identity if identity is not None else {}
-    mine = {path: text for path, text in files.items() if text.split("\n", 1)[0].strip() == f"{MIRROR_MARK}{site}"}
-    # In one go: without PyYAML that is one terraform call, not one per file.
-    for (path, text), doc in zip(mine.items(), load_all(list(mine.values()))):
-        doc = doc or {}
-        if path.startswith("data/groups/"):
-            # references: are groups another tool owns; never drift.
-            for key, value in (doc.get("groups") or {}).items():
-                out[("group", str(key))] = value
-                value = value if isinstance(value, dict) else {}
-                ident[("group", str(key))] = ("group", value.get("domain") or "default", str(value.get("nsx_id", key)))
-        elif path.startswith("data/services/"):
-            for key, value in (doc.get("custom") or {}).items():
-                out[("service", str(key))] = value
-                ident[("service", str(key))] = ("service", str(key))
-        elif path.startswith("data/exclude-list/"):
-            for key in (doc.get("members") or {}):
-                out[("exclusion", str(key))] = {"member": str(key)}
-        elif path.startswith("data/policies/"):
-            pid = Path(path).stem  # the key: the file's name
-            header = doc.get("policy") or {}
-            out[("policy", pid)] = header
-            where = header.get("domain") or "default"
-            nsx = str(header.get("id") or pid)
-            ident[("policy", pid)] = ("policy", where, nsx)
-            for key, value in (doc.get("rules") or {}).items():
-                out[("rule", f"{pid}/{key}")] = value
-                value = value if isinstance(value, dict) else {}
-                ident[("rule", f"{pid}/{key}")] = ("rule", where, nsx, str(value.get("nsx_id", key)))
-    return out
-
-
-def files_at(ref: str) -> dict[str, str]:
-    """The data files at ref, read in one git process."""
-    names = subprocess.run(["git", "ls-tree", "-r", "--name-only", ref, "--", "data/groups", "data/services", "data/policies",
-                            "data/exclude-list"],
-                           cwd=REPO_ROOT, capture_output=True, text=True, check=True).stdout.splitlines()
-    names = [n for n in names if n.endswith(".yaml")]
-    if not names:
-        return {}
-    batch = subprocess.run(["git", "cat-file", "--batch"], cwd=REPO_ROOT, check=True, capture_output=True,
-                           input="".join(f"{ref}:{n}\n" for n in names).encode()).stdout
-    out: dict[str, str] = {}
-    at = 0
-    for name in names:
-        header_end = batch.index(b"\n", at)
-        size = int(batch[at:header_end].split()[2])
-        out[name] = batch[header_end + 1:header_end + 1 + size].decode()
-        at = header_end + 1 + size + 1
-    return out
-
-
-def files_now() -> dict[str, str]:
-    out: dict[str, str] = {}
-    for kind in ("groups", "services", "policies", "exclude-list"):
-        for f in sorted((REPO_ROOT / "data" / kind).glob("*.yaml")):
-            out[str(f.relative_to(REPO_ROOT))] = f.read_text()
-    return out
-
-
-def describe(before, after) -> str:
-    """What differs between two versions of one object, briefly."""
-    if not isinstance(before, dict) or not isinstance(after, dict):
-        return "changed"
-    parts = []
-    for key in sorted(set(before) | set(after)):
-        old, new = before.get(key), after.get(key)
-        if old == new:
-            continue
-        if isinstance(old, list) or isinstance(new, list):
-            o = [json.dumps(x, sort_keys=True) if not isinstance(x, str) else x for x in old or []]
-            n = [json.dumps(x, sort_keys=True) if not isinstance(x, str) else x for x in new or []]
-            plus = [x for x in n if x not in o]
-            minus = [x for x in o if x not in n]
-            if all(isinstance(x, str) for x in (old or []) + (new or [])) and (plus or minus):
-                parts.append(f"{key} " + " ".join([f"+{x}" for x in plus] + [f"-{x}" for x in minus]))
-            else:
-                parts.append(f"{key} changed")
-        elif isinstance(old, dict) or isinstance(new, dict):
-            parts.append(f"{key} changed")
-        elif old is None:
-            parts.append(f"{key} set to {new}")
-        elif new is None:
-            parts.append(f"{key} removed (was {old})")
-        else:
-            parts.append(f"{key} {old} → {new}")
-    text = "; ".join(parts) or "changed"
-    return text if len(text) <= 240 else text[:237] + "..."
-
-
-def nsx_index(dump: dict) -> dict[tuple, dict]:
-    """The object's identity in NSX -> the object as NSX returned it, for who
-    changed it and when. Identities are what mirror_objects() records, so a
-    key data/ chose (a display name, <id>@<domain>) finds its object."""
-    out: dict[tuple, dict] = {}
-
-    def where(obj: dict) -> str:
-        found = re.match(r"^/(?:global-)?infra/domains/([^/]+)/", obj.get("path") or "")
-        return found.group(1) if found else "default"
-
-    for g in dump.get("groups", []):
-        out.setdefault(("group", where(g), str(g.get("id", ""))), g)
-    for s in dump.get("services", []):
-        out.setdefault(("service", str(s.get("id", ""))), s)
-    for p in dump.get("policies", []):
-        out.setdefault(("policy", where(p), str(p.get("id", ""))), p)
-        for r in p.get("rules", []):
-            out.setdefault(("rule", where(p), str(p.get("id", "")), str(r.get("id", ""))), r)
-    return out
-
-
-def order_only(before, after) -> bool:
-    """True when a rule changed in its sequence number and nothing else."""
-    if not (isinstance(before, dict) and isinstance(after, dict)):
-        return False
-    return {k for k in set(before) | set(after) if before.get(k) != after.get(k)} == {"sequence_number"}
-
-
-def rule_order(objects: dict, pid: str, keep: set[str]) -> list[str]:
-    """The rules of one policy, of those in keep, in the order NSX evaluates them."""
-    rows = [(v.get("sequence_number", 0) if isinstance(v, dict) else 0, k[1].split("/", 1)[1])
-            for k, v in objects.items() if k[0] == "rule" and k[1].split("/", 1)[0] == pid and k[1].split("/", 1)[1] in keep]
-    return [name for _, name in sorted(rows)]
-
-
-def when(obj: dict | None) -> tuple[str, str, float | None]:
-    """Who last changed an NSX object, when (text), and when (epoch seconds)."""
-    if not obj:
-        return "", "", None
-    stamp = obj.get("_last_modified_time") or obj.get("_create_time")
-    seconds = stamp / 1000 if isinstance(stamp, (int, float)) else None
-    text = datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%d %H:%M") if seconds else ""
-    return str(obj.get("_last_modified_user") or obj.get("_create_user") or ""), text, seconds
-
-
-def mirror_changes(site: str, base: str, dump: dict) -> list[dict] | None:
-    """The changes to report; None when REF holds no copy of the site yet (baseline)."""
-    old_files = files_at(base)
-    identity: dict = {}
-    old = mirror_objects(old_files, site, identity)
-    if not old:
-        return None
-    new = mirror_objects(files_now(), site, identity)
-    mine = [p for p, t in old_files.items() if t.split("\n", 1)[0].strip() == f"{MIRROR_MARK}{site}"]
-    copied = int(subprocess.run(["git", "log", "-1", "--format=%ct", base, "--", *mine], cwd=REPO_ROOT,
-                                capture_output=True, text=True, check=True).stdout.strip() or 0)
-    since = copied - SYNC_MARGIN
-    live = nsx_index(dump)
-    gone_policies = {k[1] for k in old if k[0] == "policy" and k not in new}
-    items = []
-    renumbered: dict[str, list[str]] = {}
-    for key in sorted(set(old) | set(new)):
-        kind, ident = key
-        before, after = old.get(key), new.get(key)
-        if before == after:
-            continue
-        if kind == "rule" and before is not None and after is None and ident.split("/", 1)[0] in gone_policies:
-            continue  # reported with its policy
-        if kind == "rule" and order_only(before, after):
-            # The UI renumbers neighbours when one rule is dragged: only a change
-            # in ORDER changes what traffic is allowed. Decided per policy below.
-            renumbered.setdefault(ident.split("/", 1)[0], []).append(ident.split("/", 1)[1])
-            continue
-        who, at, seconds = when(live.get(identity.get(key)))
-        if after is not None and seconds is not None and seconds < since:
-            continue  # nobody changed it in NSX since the copy: the repository side moved
-        if before is None:
-            change, detail = "added", ""
-            if kind == "exclusion":
-                detail = "now bypasses the DFW entirely"
-        elif after is None:
-            change = "deleted"
-            detail = f"with its {sum(1 for k in old if k[0] == 'rule' and k[1].startswith(ident + '/'))} rule(s)" if kind == "policy" else ""
-            who, at = "", ""
-        else:
-            change, detail = "changed", describe(before, after)
-        items.append({"key": f"{kind} {ident}", "kind": kind, "id": ident, "change": change, "detail": detail,
-                      "who": who, "at": at, "version": digest(after) if after is not None else "0" * 16,
-                      "severity": "high" if kind == "exclusion" and before is None else ""})
-    for pid, moved in sorted(renumbered.items()):
-        both = {k[1].split("/", 1)[1] for k in old if k[0] == "rule" and k[1].split("/", 1)[0] == pid} & \
-               {k[1].split("/", 1)[1] for k in new if k[0] == "rule" and k[1].split("/", 1)[0] == pid}
-        before_order, after_order = rule_order(old, pid, both), rule_order(new, pid, both)
-        if before_order == after_order:
-            continue  # renumbered, same order: nothing an engineer needs to look at
-        stamps = [when(live.get(identity.get(("rule", f"{pid}/{r}")))) for r in moved]
-        who, at, seconds = max(stamps, key=lambda w: w[2] or 0) if stamps else ("", "", None)
-        if seconds is not None and seconds < since:
-            continue
-        shifted = [r for i, r in enumerate(after_order) if before_order.index(r) != i]
-        detail = "rule order changed: now " + " > ".join(after_order)
-        if len(detail) > 240:
-            detail = f"rule order changed: {len(shifted)} rule(s) moved, including " + ", ".join(shifted[:5])
-        items.append({"key": f"policy {pid} order", "kind": "policy", "id": pid, "change": "reordered",
-                      "detail": detail, "who": who, "at": at, "version": digest(after_order)})
-    return items
-
-
-def plan_changes(plan: dict) -> list[dict]:
-    """Drift a refresh-only plan found, with who and when from NSX when it can be read."""
-    items = []
-    for drift in plan.get("resource_drift") or []:
-        change = drift.get("change") or {}
-        actions = change.get("actions") or []
-        before, after = change.get("before"), change.get("after")
-        if actions == ["no-op"]:
-            continue
-        address = drift.get("address", "")
-        item = {"key": address, "kind": drift.get("type", "resource"), "id": address,
-                "change": "deleted" if after is None else "changed",
-                "detail": "" if after is None else describe(
-                    {k: v for k, v in (before or {}).items() if k != "revision"},
-                    {k: v for k, v in after.items() if k != "revision"}),
-                "who": "", "at": "", "version": digest(after) if after is not None else "0" * 16,
-                "path": (after or before or {}).get("path", "")}
-        items.append(item)
-    return items
-
-
-def plan_resources(module: dict):
-    """Every resource in a plan's module tree (prior_state / planned_values)."""
-    yield from module.get("resources") or []
-    for child in module.get("child_modules") or []:
-        yield from plan_resources(child)
-
-
-def schedule_items(site: str, stack: str, plan: dict, items: list[dict]) -> None:
-    """Scheduled rules NSX holds in the wrong state now: switched on outside
-    their schedule (high severity: access the schedule does not grant), or left
-    off inside it. A switch the follower missed shows here too."""
-    import importlib.util  # noqa: PLC0415
-
-    spec = importlib.util.spec_from_file_location("nsx_schedule", Path(__file__).resolve().parent / "schedule.py")
-    if spec is None or spec.loader is None:
-        return
-    schedule = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(schedule)
-    want = schedule.desired(stack, site, schedule.parse_now(None))
-    if not want:
-        return
-    live = {r["address"]: bool((r.get("values") or {}).get("disabled", False))
-            for r in plan_resources(((plan.get("prior_state") or {}).get("values") or {}).get("root_module") or {})
-            if r.get("type") == "nsxt_policy_security_policy_rule"}
-    by_address = {i["key"]: i for i in items}
-    for address, off in sorted(want.items()):
-        if address not in live or live[address] == off:
-            continue
-        high = not live[address] and off
-        what = "ON outside its schedule: access the schedule does not grant" if high else "OFF inside its schedule"
-        item = by_address.get(address)
-        if item is None:
-            item = {"key": address, "kind": "nsxt_policy_security_policy_rule", "id": address, "change": "schedule",
-                    "detail": "", "who": "", "at": "", "version": digest([address, live[address]]), "path": ""}
-            items.append(item)
-        item["detail"] = what + (f"; {item['detail']}" if item["detail"] else "")
-        item["severity"] = "high" if high else item.get("severity", "")
-
-
-def lookup_owners(site: str, items: list[dict]) -> None:
-    """Who last changed each drifted object, from NSX (read-only credential)."""
-    import importlib.util  # noqa: PLC0415
-    spec = importlib.util.spec_from_file_location("import_estate", REPO_ROOT / "scripts" / "import-estate.py")
-    estate = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(estate)
-    estate.CA_SITE = site  # this manager's CA, as for its plans
-    host, user, password = (os.environ.get(k, "") for k in ("NSXT_MANAGER_HOST", "NSXT_USERNAME", "NSXT_PASSWORD"))
-    insecure = os.environ.get("NSXT_ALLOW_UNVERIFIED_SSL", "").strip().lower() in ("true", "1", "yes")
-    for item in items:
-        path = item.get("path") or ""
-        if item["change"] == "deleted" or not path:
-            continue
-        prefix = "/global-manager/api/v1" if path.startswith("/global-infra/") else "/policy/api/v1"
-        try:
-            obj = estate.api_get(host, prefix + urllib.parse.quote(path), user, password, insecure)
-        except SystemExit:
-            continue
-        item["who"], item["at"], _ = when(obj)
-
-
-# --------------------------------------------------------------------------
-# The issue
-# --------------------------------------------------------------------------
-
-def cell(text: str) -> str:
-    return str(text).replace("|", "\\|").replace("\n", " ")
-
-
-def issue_body(site: str, items: list[dict], mode: str, link: str) -> str:
-    source = {"mirror": "the mirror sync", "watch": "the change watch (scripts/nsx-watch.py)"}.get(mode, "a drift check (refresh-only plan)")
-    rows = [f"| {i['change']} | `{cell(i['key'])}` | {cell(i['detail'])} | {cell(i['who']) or '?'} | {i['at'] or '?'} |"
-            for i in items[:MAX_ROWS]]
-    if len(items) > MAX_ROWS:
-        rows.append(f"| | ... and {len(items) - MAX_ROWS} more | see the job's log | | |")
-    if mode == "mirror":
-        keep = ("Intended: nothing to do here, the mirror merge request brings it into the repository "
-                "(and Terraform's state follows).")
-        undo = "Not intended: revert it in NSX; the next sync takes it out of the repository again."
-        after = ("After cutover to `mode: managed` a change like this must come through a merge request: "
-                 "the drift check raises it the same way, and no apply undoes it until it is accepted or the revert approved.")
-    else:
-        keep = ("Intended: accept it: Run pipeline with `ACCEPT_SITE` and `ACCEPT_KEYS` (kind=key, e.g. `rule=app/r1`) "
-                "opens a merge request writing it into `data/` (scripts/accept-drift.py).")
-        undo = ("Not intended: revert it: list the object in `allow-revert.txt` in a merge request; its apply puts back what "
-                "`data/` says. Until one or the other, every plan of this manager refuses to undo it silently.")
-        after = "This manager is in `mode: managed`: changes are made through merge requests, not the UI."
-    lines = [
-        f"{source.capitalize()} of **{site}** found {len(items)} change(s) made in NSX, not through this repository.",
-        "",
-        f"Found by: {link}" if link else "",
-        "",
-        "| change | object | what changed | last changed by | when (UTC) |",
-        "|---|---|---|---|---|",
-        *rows,
-        "",
-        "\"Last changed by\" and \"when\" are what NSX records on the object. NSX keeps nothing on a deleted object: "
-        "its audit log (System > Audit) has who deleted it.",
-        "",
-        "### Investigation",
-        "- [ ] Who made each change, and why: the incident or change ticket.",
-        f"- [ ] {keep}",
-        f"- [ ] {undo}",
-        "- [ ] Should it have gone through a merge request? Agree what to do differently, if so.",
-        "",
-        after,
-        "",
-        "Close this issue once every change in it is explained.",
-        "",
-        *[f"<!-- nsx-drift object={digest(i['key'])} version={i['version']} -->" for i in items],
-    ]
-    return "\n".join(lines)
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("mode", choices=["mirror", "plan"])
-    ap.add_argument("--site", required=True)
-    ap.add_argument("--base", help="mirror: the ref the copy is compared with (the default branch)")
-    ap.add_argument("--dump", help="mirror: the capture the sync read")
-    ap.add_argument("--stack", help="plan: the stack the plan is for")
-    ap.add_argument("--plan-json", help="plan: terraform show -json of the refresh-only plan")
-    ap.add_argument("--link", default="", help="where it was found (a merge request or job URL)")
-    args = ap.parse_args()
-
-    if args.mode == "mirror":
-        if not (args.base and args.dump):
-            die("mirror needs --base and --dump")
-        items = mirror_changes(args.site, args.base, json.loads(Path(args.dump).read_text()))
-        if items is None:
-            print(f"drift: first copy of {args.site}, the baseline: no drift issue.")
-            return 0
-    else:
-        if not (args.stack and args.plan_json):
-            die("plan needs --stack and --plan-json")
-        plan = json.loads(Path(args.plan_json).read_text())
-        items = plan_changes(plan)
-        schedule_items(args.site, args.stack, plan, items)
-        # hybrid: what is still mirrored is the mirror job's to raise.
-        from ci_matrix_lib import managers, mode_of  # noqa: PLC0415
-        if mode_of(args.site, managers().get(args.site) or {}) == "hybrid":
-            spec = importlib.util.spec_from_file_location("plan_guard", Path(__file__).resolve().parent / "plan-guard.py")
-            guard = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-            spec.loader.exec_module(guard)  # type: ignore[union-attr]
-            exact, prefixes = guard.mirror_addresses(args.site)
-            items = [i for i in items if not (i["key"] in exact or i["key"].startswith(prefixes))]
-        if items and os.environ.get("NSXT_MANAGER_HOST"):
-            lookup_owners(args.site, items)
-    if not items:
-        print(f"drift: no change made in NSX on {args.site} to report.")
-        return 0
-
-    gitlab = GitLab()
-    seen = gitlab.reported(args.site)
-    new = [i for i in items if (digest(i["key"]), i["version"]) not in seen]
-    if not new:
-        print(f"drift: {len(items)} change(s) on {args.site}, each already in an nsx-drift issue.")
-        return 0
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    where = f" ({args.stack})" if args.stack else ""
-    high = any(i.get("severity") == "high" for i in new)
-    issue, _ = gitlab.call("POST", "/issues", {
-        "title": ("[HIGH] " if high else "") + f"NSX drift on {args.site}{where}: {len(new)} change(s) made outside the repository, {stamp}",
-        "description": issue_body(args.site, new, args.mode, args.link),
-        "labels": f"{LABEL},site:{args.site}" + (",severity::high" if high else ""),
-    })
-    print(f"drift: {len(new)} change(s) on {args.site} to investigate: {(issue or {}).get('web_url', 'issue raised')}")
-    for i in new[:20]:
-        print(f"  {i['change']:8} {i['key']}  {i['who']} {i['at']}".rstrip())
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-SCAFFOLD_EOF
-mark_executable scripts/drift-issue.py
-
 write_file scripts/schedule.py <<'SCAFFOLD_EOF'
 #!/usr/bin/env python3
 """Rules that are on only at certain times. data/ says when; the pipeline makes
 it so, the same way on a Global Manager and a Local Manager.
 
-A rule's schedule, in its policy file:
+A rule's schedule, in its policy file (docs/SCHEDULES.md):
 
   rules:
     vendor-maintenance:
@@ -11837,289 +11472,41 @@ A rule's schedule, in its policy file:
         ticket: CHG0012345            # optional: the change behind it
 
 Outside its windows, before it starts and once it expires, the rule is
-disabled: for an ALLOW rule, closed. NSX holds no time window; Terraform sets
-the rule's 'disabled', so enforcement is identical wherever the rule lives.
+disabled: NSX holds no time window, Terraform sets the rule's 'disabled'.
 
-  scripts/schedule.py tfvars  --stack S --site X [--now T]
-      the scheduled rules that are off now, as Terraform input (scheduled_off)
-  scripts/schedule.py desired --stack S --site X [--now T]
-      address -> disabled, for every scheduled rule of that stack and manager
-  scripts/schedule.py switch  --stack S --site X --state FILE [--now T]
-      the scheduled rules whose state (terraform state pull) differs from now,
-      one address a line: what the follower applies, and nothing else
-  scripts/schedule.py report  [--now T] [--warn-days 7] [--grace-days 14] [--json]
-      rules expiring soon, expired, and expired longer than the grace period
-  scripts/schedule.py notify  [--now T] [--warn-days 7] [--grace-days 14]
-      raises a GitLab issue for each of those, once (needs NSX_BOT_TOKEN)
+  schedule.py tfvars  --stack S --site X   the rules off now, as Terraform input (scheduled_off)
+  schedule.py desired --stack S --site X   address -> disabled, for every scheduled rule
+  schedule.py switch  --stack S --site X --state FILE
+                                           the rules whose state (terraform state pull)
+                                           differs from now: what the follower applies
+  schedule.py report  [--json]             rules expiring soon, expired, and past the grace period
+  schedule.py notify                       an issue for each of those, once (NSX_BOT_TOKEN)
+  schedule.py convert --site X             a Local Manager's NSX time windows, as schedule:
+                                           blocks to review: reports/time-windows-<site>.md.
+                                           Reads NSX (two calls); writes nothing in data/.
 
-T is an ISO time (2026-11-03T20:15:00Z); now by default. Exit status: 0 done,
-1 error.
+--now T evaluates at an ISO time (2026-11-03T20:15:00Z) instead of now.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
-import ssl
 import sys
-import urllib.error
-import urllib.parse
-import urllib.request
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-POLICIES = REPO_ROOT / "data" / "policies"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from yamlcompat import load_all  # noqa: E402
+from nsxlib import adopt, schedules  # noqa: E402
+from nsxlib.gitlab import GitLab, die, digest  # noqa: E402
+from nsxlib.model import REPO  # noqa: E402
+from nsxlib.nsx import LM_BASE, Client  # noqa: E402
+from nsxlib.yamlio import to_yaml  # noqa: E402
 
-try:
-    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-except ImportError:  # pragma: no cover - Python < 3.9
-    ZoneInfo = None  # type: ignore[assignment]
-    ZoneInfoNotFoundError = KeyError  # type: ignore[assignment,misc]
-
-DAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
-TIME = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$|^24:00$")
 LABEL = "nsx-schedule"
 MARK = re.compile(r"<!-- nsx-schedule rule=([0-9a-f]{16}) state=([a-z]+) -->")
-
-
-def die(message: str) -> None:
-    print(f"error: {message}", file=sys.stderr)
-    raise SystemExit(1)
-
-
-# --------------------------------------------------------------------------
-# The schedule itself
-# --------------------------------------------------------------------------
-
-def zone(name: str):
-    if ZoneInfo is None:
-        raise ValueError("this Python has no zoneinfo (3.9 or later is needed)")
-    try:
-        return ZoneInfo(str(name))
-    except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise ValueError(f"unknown time zone {name!r} (an IANA name such as Asia/Kolkata)") from exc
-
-
-def minutes(text) -> int:
-    text = str(text)
-    if not TIME.match(text):
-        raise ValueError(f"{text!r} is not a time of day as HH:MM")
-    hours, mins = text.split(":")
-    return int(hours) * 60 + int(mins)
-
-
-def moment(value, tz) -> datetime:
-    """A date or date-and-time as data/ writes it, in the schedule's zone.
-    Readers differ: PyYAML returns date and datetime, Terraform's an RFC 3339
-    string, the built-in reader the text."""
-    if isinstance(value, datetime):
-        return value.replace(tzinfo=tz) if value.tzinfo is None else value
-    if isinstance(value, date):
-        return datetime(value.year, value.month, value.day, tzinfo=tz)
-    text = str(value).strip()
-    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(text, fmt).replace(tzinfo=tz)
-        except ValueError:
-            pass
-    if re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?Z$", text):
-        # A bare date or local time decoded by Terraform comes back as UTC
-        # midnight or time; it meant the schedule's own zone.
-        return datetime.fromisoformat(text.replace("Z", "")).replace(tzinfo=tz)
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError as exc:
-        raise ValueError(f"{text!r} is not a date (YYYY-MM-DD) or a date and time (YYYY-MM-DD HH:MM)") from exc
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=tz)
-
-
-def problems(schedule) -> list[str]:
-    """What is wrong with one schedule, in words; empty when it is sound."""
-    if not isinstance(schedule, dict):
-        return ["schedule must be a mapping"]
-    out = []
-    try:
-        tz = zone(schedule.get("timezone", ""))
-    except ValueError as exc:
-        return [str(exc)]
-    if not str(schedule.get("owner") or "").strip():
-        out.append("owner is required: who answers for this rule being on")
-    for i, window in enumerate(schedule.get("windows") or []):
-        if not isinstance(window, dict):
-            out.append(f"windows[{i}] must be a mapping")
-            continue
-        bad = [d for d in window.get("days") or [] if d not in DAYS]
-        if bad:
-            out.append(f"windows[{i}].days: {', '.join(map(str, bad))} (days are {', '.join(DAYS)})")
-        for end in ("from", "to"):
-            try:
-                minutes(window.get(end, ""))
-            except ValueError as exc:
-                out.append(f"windows[{i}].{end}: {exc}")
-    edges = {}
-    for end in ("starts", "expires"):
-        if schedule.get(end) is not None:
-            try:
-                edges[end] = moment(schedule[end], tz)
-            except ValueError as exc:
-                out.append(f"{end}: {exc}")
-    if "starts" in edges and "expires" in edges and edges["expires"] <= edges["starts"]:
-        out.append("expires is not after starts: the rule would never be on")
-    return out
-
-
-def active(schedule: dict, now: datetime) -> bool:
-    """Whether the rule is on at now (any zone)."""
-    tz = zone(schedule["timezone"])
-    local = now.astimezone(tz)
-    if schedule.get("starts") is not None and local < moment(schedule["starts"], tz):
-        return False
-    if schedule.get("expires") is not None and local >= moment(schedule["expires"], tz):
-        return False
-    windows = schedule.get("windows") or []
-    if not windows:
-        return True
-    at = local.hour * 60 + local.minute
-    today, yesterday = DAYS[local.weekday()], DAYS[(local.weekday() - 1) % 7]
-    for window in windows:
-        days = set(window.get("days") or DAYS)
-        start, end = minutes(window["from"]), minutes(window["to"])
-        if start < end and today in days and start <= at < end:
-            return True
-        if start > end and ((today in days and at >= start) or (yesterday in days and at < end)):
-            return True  # past midnight: from the evening of a listed day to the next morning
-        if start == end and today in days:
-            return True  # all day
-    return False
-
-
-# --------------------------------------------------------------------------
-# Which rules, where
-# --------------------------------------------------------------------------
-
-def scheduled_rules(stack: str | None = None, site: str | None = None) -> list[dict]:
-    """Every rule with a schedule; for a stack and manager, those that stack
-    plans there (the same filters as the stacks)."""
-    files = sorted(POLICIES.glob("*.yaml"))
-    out = []
-    for f, doc in zip(files, load_all([f.read_text() for f in files]) if files else []):
-        doc = doc or {}
-        policy = doc.get("policy") or {}
-        owner = policy.get("owner", "lm")
-        sites = policy.get("sites") or []
-        if stack == "global-security" and owner != "gm":
-            continue
-        if stack == "local-security" and (owner != "lm" or not (site in sites or "*" in sites)):
-            continue
-        if stack not in (None, "global-security", "local-security"):
-            continue
-        for key, rule in (doc.get("rules") or {}).items():
-            if isinstance(rule, dict) and isinstance(rule.get("schedule"), dict):
-                out.append({"policy": f.stem, "rule": str(key), "schedule": rule["schedule"],
-                            "disabled": bool(rule.get("disabled", False)), "file": f"data/policies/{f.name}",
-                            "name": rule.get("name", key), "owner": owner, "sites": sites})
-    return out
-
-
-def address(policy: str, rule: str) -> str:
-    return f'module.policies["{policy}"].nsxt_policy_security_policy_rule.this["{rule}"]'
-
-
-def desired(stack: str, site: str, now: datetime) -> dict[str, bool]:
-    """address -> disabled, now: off when the data says disabled, or the schedule says off."""
-    return {address(r["policy"], r["rule"]): r["disabled"] or not active(r["schedule"], now)
-            for r in scheduled_rules(stack, site)}
-
-
-def in_state(state: dict) -> dict[str, bool]:
-    """address -> disabled, for every rule Terraform's state holds."""
-    out = {}
-    for resource in state.get("resources") or []:
-        if resource.get("type") != "nsxt_policy_security_policy_rule" or resource.get("mode") != "managed":
-            continue
-        for instance in resource.get("instances") or []:
-            base = f'{resource.get("module", "")}.' if resource.get("module") else ""
-            key = instance.get("index_key")
-            name = f'{base}{resource["type"]}.{resource["name"]}' + (f'["{key}"]' if key is not None else "")
-            out[name] = bool((instance.get("attributes") or {}).get("disabled", False))
-    return out
-
-
-# --------------------------------------------------------------------------
-# Expiry
-# --------------------------------------------------------------------------
-
-def expiry(now: datetime, warn_days: int, grace_days: int) -> list[dict]:
-    """Rules expiring within warn_days, expired, or expired longer than grace_days."""
-    out = []
-    for r in scheduled_rules():
-        s = r["schedule"]
-        if s.get("expires") is None:
-            continue
-        ends = moment(s["expires"], zone(s["timezone"]))
-        if now >= ends + timedelta(days=grace_days):
-            state = "remove"
-        elif now >= ends:
-            state = "expired"
-        elif now >= ends - timedelta(days=warn_days):
-            state = "expiring"
-        else:
-            continue
-        out.append(dict(r, state=state, ends=ends.isoformat(timespec="minutes")))
-    return out
-
-
-class GitLab:
-    def __init__(self) -> None:
-        self.api = os.environ.get("CI_API_V4_URL", "").rstrip("/")
-        self.project = os.environ.get("CI_PROJECT_ID", "")
-        self.token = os.environ.get("NSX_BOT_TOKEN") or os.environ.get("NSX_ADOPT_TOKEN") or ""
-        if not (self.api and self.project and self.token):
-            die("CI_API_V4_URL, CI_PROJECT_ID and NSX_BOT_TOKEN (or NSX_ADOPT_TOKEN) are needed to raise issues")
-        ca = os.environ.get("CI_SERVER_TLS_CA_FILE")
-        self.ctx = ssl.create_default_context(cafile=ca) if ca and Path(ca).is_file() else ssl.create_default_context()
-        self.ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
-
-    def call(self, method: str, path: str, body: dict | None = None, query: dict | None = None):
-        url = f"{self.api}/projects/{urllib.parse.quote(self.project, safe='')}{path}"
-        if query:
-            url += "?" + urllib.parse.urlencode(query)
-        data = json.dumps(body).encode() if body is not None else None
-        request = urllib.request.Request(url, data=data, method=method)
-        request.add_header("PRIVATE-TOKEN", self.token)
-        if data is not None:
-            request.add_header("Content-Type", "application/json")
-        try:
-            with urllib.request.urlopen(request, context=self.ctx, timeout=60) as response:
-                return json.loads(response.read().decode() or "null"), response.headers
-        except urllib.error.HTTPError as exc:
-            die(f"GitLab API {method} {path}: HTTP {exc.code} {exc.read().decode(errors='replace')[:300]}")
-        except urllib.error.URLError as exc:
-            die(f"GitLab API {method} {path}: {exc.reason}")
-
-    def raised(self) -> set[tuple[str, str]]:
-        seen: set[tuple[str, str]] = set()
-        page = "1"
-        for _ in range(10):
-            issues, headers = self.call("GET", "/issues", query={"labels": LABEL, "state": "all", "per_page": 100, "page": page})
-            for issue in issues or []:
-                seen.update(MARK.findall(issue.get("description") or ""))
-            page = (headers.get("X-Next-Page") or "").strip()
-            if not page:
-                break
-        return seen
-
-
-def digest(value) -> str:
-    return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()[:16]
-
-
 WHAT = {
     "expiring": ("expires soon", "Renew it (a new `expires:` in a merge request) or let it lapse: at expiry it is disabled."),
     "expired": ("has expired and is disabled", "Nothing is open. Renew it in a merge request if it is still needed."),
@@ -12127,54 +11514,111 @@ WHAT = {
 }
 
 
-def notify(now: datetime, warn_days: int, grace_days: int, link: str) -> int:
-    items = expiry(now, warn_days, grace_days)
+def follow(args: argparse.Namespace, now: datetime) -> int:
+    """tfvars, desired and switch: what the time follower needs."""
+    if not (args.stack and args.site):
+        die(f"{args.command} needs --stack and --site")
+    want = schedules.desired(args.stack, args.site, now)
+    if args.command == "desired":
+        print(json.dumps(want, indent=2, sort_keys=True))
+    elif args.command == "tfvars":
+        off: dict[str, list[str]] = {}
+        for r in schedules.scheduled_rules(args.stack, args.site):
+            if not r["disabled"] and not schedules.active(r["schedule"], now):
+                off.setdefault(r["policy"], []).append(r["rule"])
+        print(json.dumps({"scheduled_off": {k: sorted(v) for k, v in sorted(off.items())}}, indent=2))
+    else:
+        if not args.state:
+            die("switch needs --state (terraform state pull)")
+        have = schedules.in_state(json.loads(Path(args.state).read_text() or "{}"))
+        for address in sorted(a for a in want if a in have and have[a] != want[a]):
+            print(address)
+    return 0
+
+
+def report(args: argparse.Namespace, now: datetime) -> int:
+    items = schedules.expiry(now, args.warn_days, args.grace_days)
+    if args.json:
+        print(json.dumps(items, indent=2, default=str))
+    for i in items:
+        print(f"{i['state']:9} {i['file']} {i['rule']}  {i['ends']}  owner {i['schedule'].get('owner', '?')}")
+    return 0
+
+
+def notify(args: argparse.Namespace, now: datetime) -> int:
+    items = schedules.expiry(now, args.warn_days, args.grace_days)
     if not items:
         print("schedule: no rule expiring, expired or due for removal.")
         return 0
     gitlab = GitLab()
-    seen = gitlab.raised()
+    seen = gitlab.marks(LABEL, MARK)
     raised = 0
-    for item in items:
-        mark = (digest([item["file"], item["rule"], str(item["schedule"].get("expires"))]), item["state"])
+    for i in items:
+        mark = (digest([i["file"], i["rule"], str(i["schedule"].get("expires"))]), i["state"])
         if mark in seen:
             continue
-        title, todo = WHAT[item["state"]]
+        title, todo = WHAT[i["state"]]
         body = "\n".join([
-            f"Rule **{item['name']}** (`{item['rule']}` in `{item['file']}`) {title}: {item['ends']}.",
-            "",
-            f"Owner: {item['schedule'].get('owner', '?')}. Ticket: {item['schedule'].get('ticket', '-')}.",
-            f"Found by: {link}" if link else "",
-            "",
-            f"- [ ] {todo}",
-            "",
-            f"<!-- nsx-schedule rule={mark[0]} state={mark[1]} -->",
-        ])
-        issue, _ = gitlab.call("POST", "/issues", {
-            "title": f"NSX rule {item['name']} {title} ({item['ends'][:10]})",
-            "description": body, "labels": LABEL})
+            f"Rule **{i['name']}** (`{i['rule']}` in `{i['file']}`) {title}: {i['ends']}.", "",
+            f"Owner: {i['schedule'].get('owner', '?')}. Ticket: {i['schedule'].get('ticket', '-')}.",
+            f"Found by: {args.link}" if args.link else "", "",
+            f"- [ ] {todo}", "",
+            f"<!-- nsx-schedule rule={mark[0]} state={mark[1]} -->"])
+        url = gitlab.open_issue(f"NSX rule {i['name']} {title} ({i['ends'][:10]})", body, LABEL)
         raised += 1
-        print(f"schedule: {item['rule']} {title}: {(issue or {}).get('web_url', 'issue raised')}")
+        print(f"schedule: {i['rule']} {title}: {url}")
     if not raised:
         print(f"schedule: {len(items)} rule(s) expiring or expired, each already in an issue.")
     return 0
 
 
-# --------------------------------------------------------------------------
+def convert(args: argparse.Namespace, _now: datetime) -> int:
+    if not args.site:
+        die("convert needs --site")
+    client = None if args.from_dump and args.schedulers else Client.from_env(args.site)
+    windows = (json.loads(Path(args.schedulers).read_text()) if args.schedulers
+               else client.get(f"{LM_BASE}/firewall-schedulers")).get("results", [])
+    estate = json.loads(Path(args.from_dump).read_text()) if args.from_dump else client.read(LM_BASE)
+    by_path = {w.get("path"): w for w in windows}
+    policies = [p for p in estate.get("policies", []) if str(p.get("path", "")).startswith("/infra/")]
+    adopt.assign_keys([g for g in estate.get("groups", []) if str(g.get("path", "")).startswith("/infra/")], policies)
 
-def parse_now(text: str | None) -> datetime:
-    # NSX_SCHEDULE_NOW: a fixed "now", for tests and for checking a schedule
-    # ahead of time ("what would be on at 22:00 on Saturday?").
-    text = text or os.environ.get("NSX_SCHEDULE_NOW")
-    if not text:
-        return datetime.now(timezone.utc)
-    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    done, refused = [], []
+    for policy in policies:
+        for rule in policy.get("rules", []):
+            path = rule.get("scheduler_path") or policy.get("scheduler_path")  # a policy's applies to each rule
+            if not path:
+                continue
+            where = f"data/policies/{policy['id']}.yaml, rule {rule['id']}"
+            if path not in by_path:
+                refused.append((where, f"uses {path}, which the manager did not list"))
+                continue
+            block, why = schedules.from_time_window(by_path[path], args.timezone)
+            if block is None:
+                refused.append((where, f"its time window {by_path[path].get('display_name', path)} {why}"))
+            else:
+                done.append((where, rule.get("display_name", rule["id"]), block))
+
+    lines = [f"# Time windows on {args.site}, converted", "",
+             f"{len(done)} rule(s) converted, {len(refused)} not. Paste each block under its rule, fill in `owner:`,",
+             "and merge it with the removal of the time window in NSX (docs/SCHEDULES.md).", ""]
+    for where, name, block in done:
+        lines += [f"## {where} ({name})", "", "```yaml",
+                  *("      " + line for line in to_yaml({"schedule": block}).splitlines()), "```", ""]
+    if refused:
+        lines += ["## Not converted", "", *(f"- {where}: {why}" for where, why in refused), ""]
+    out = Path(args.out or REPO / "reports" / f"time-windows-{args.site}.md")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(lines))
+    print(f"{len(done)} rule(s) converted, {len(refused)} not: {out.relative_to(REPO) if out.is_relative_to(REPO) else out}")
+    for where, why in refused:
+        print(f"  NOT CONVERTED  {where}: {why}")
+    return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["tfvars", "desired", "switch", "report", "notify"])
+    ap.add_argument("command", choices=["tfvars", "desired", "switch", "report", "notify", "convert"])
     ap.add_argument("--stack")
     ap.add_argument("--site")
     ap.add_argument("--state", help="switch: terraform state pull, as JSON")
@@ -12183,38 +11627,14 @@ def main() -> int:
     ap.add_argument("--grace-days", type=int, default=int(os.environ.get("NSX_SCHEDULE_GRACE_DAYS", "14")))
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--link", default=os.environ.get("CI_JOB_URL", ""))
+    ap.add_argument("--from-dump", help="convert: policies as import-estate.py --dump-only wrote them")
+    ap.add_argument("--schedulers", help="convert: GET /policy/api/v1/infra/firewall-schedulers, saved")
+    ap.add_argument("--timezone", help="convert: the manager's IANA zone, for windows NSX keeps in local time")
+    ap.add_argument("--out", help="convert: the report (default reports/time-windows-<site>.md)")
     args = ap.parse_args()
-    now = parse_now(args.now)
-
+    run = {"report": report, "notify": notify, "convert": convert}.get(args.command, follow)
     try:
-        if args.command in ("tfvars", "desired", "switch"):
-            if not (args.stack and args.site):
-                die(f"{args.command} needs --stack and --site")
-            want = desired(args.stack, args.site, now)
-            if args.command == "desired":
-                print(json.dumps(want, indent=2, sort_keys=True))
-            elif args.command == "tfvars":
-                off: dict[str, list[str]] = {}
-                for r in scheduled_rules(args.stack, args.site):
-                    if not r["disabled"] and not active(r["schedule"], now):
-                        off.setdefault(r["policy"], []).append(r["rule"])
-                print(json.dumps({"scheduled_off": {k: sorted(v) for k, v in sorted(off.items())}}, indent=2))
-            else:
-                if not args.state:
-                    die("switch needs --state (terraform state pull)")
-                have = in_state(json.loads(Path(args.state).read_text() or "{}"))
-                for addr in sorted(want):
-                    if addr in have and have[addr] != want[addr]:
-                        print(addr)
-            return 0
-        if args.command == "report":
-            items = expiry(now, args.warn_days, args.grace_days)
-            if args.json:
-                print(json.dumps(items, indent=2, default=str))
-            for item in items:
-                print(f"{item['state']:9} {item['file']} {item['rule']}  {item['ends']}  owner {item['schedule'].get('owner', '?')}")
-            return 0
-        return notify(now, args.warn_days, args.grace_days, args.link)
+        return run(args, schedules.parse_now(args.now))
     except ValueError as exc:
         die(f"{exc} (scripts/validate-data.py names the rule)")
     return 1
@@ -12224,884 +11644,6 @@ if __name__ == "__main__":
     sys.exit(main())
 SCAFFOLD_EOF
 mark_executable scripts/schedule.py
-
-write_file scripts/convert-time-windows.py <<'SCAFFOLD_EOF'
-#!/usr/bin/env python3
-"""Convert a Local Manager's NSX time windows into schedule: blocks for data/.
-
-Read-only: it changes nothing in NSX and writes nothing in data/. It reads the
-manager's time windows and the policies and rules that use one (a time window
-set on a policy applies to each of its rules), converts each into the
-schedule: format scripts/schedule.py enforces, and writes a review report:
-
-  scripts/with-credentials.sh lon1 -- scripts/convert-time-windows.py --site lon1
-  scripts/convert-time-windows.py --site lon1 --from-dump reports/lon1-raw.json \\
-      --schedulers reports/lon1-schedulers.json
-
-  reports/time-windows-<site>.md   one section per rule: the schedule: block to
-                                   paste under that rule in its policy file, or
-                                   why it cannot be converted
-
-Two reads at most: the time windows, and (without --from-dump) the policies.
-Nothing is guessed: a time window this cannot read exactly (an unknown time
-zone, a field it does not know) is reported, not converted. owner: is left for
-you to fill in; the validator refuses a schedule without one.
-
-NSX keeps a time window only on a Local Manager. In data/ a schedule is enforced
-by the pipeline through the rule's 'disabled', the same on a Global and a Local
-Manager. Move a rule over in one change: remove its time window in NSX and
-merge its schedule: block together, at cutover of that policy.
-"""
-
-from __future__ import annotations
-
-import argparse
-import importlib.util
-import json
-import os
-import sys
-from datetime import date, timedelta
-from pathlib import Path
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DAY = {"MONDAY": "MON", "TUESDAY": "TUE", "WEDNESDAY": "WED", "THURSDAY": "THU", "FRIDAY": "FRI",
-       "SATURDAY": "SAT", "SUNDAY": "SUN"}
-DAY.update({v: v for v in DAY.values()})
-KNOWN = {"start_date", "end_date", "start_time", "end_time", "recurring", "days", "time_zone", "id", "path",
-         "relative_path", "parent_path", "resource_type", "display_name", "description", "tags", "unique_id",
-         "realization_id", "marked_for_delete", "overridden", "children", "origin_site_id", "owner_id"}
-
-
-def importer():
-    spec = importlib.util.spec_from_file_location("import_estate", Path(__file__).resolve().parent / "import-estate.py")
-    module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-    spec.loader.exec_module(module)  # type: ignore[union-attr]
-    return module
-
-
-def convert(window: dict, manager_zone: str | None) -> tuple[dict | None, str]:
-    """A schedule: block for one NSX time window, or None and why not."""
-    unknown = sorted(k for k in window if not k.startswith("_") and k not in KNOWN and window[k] not in (None, "", [], {}))
-    if unknown:
-        return None, f"carries {', '.join(unknown)}, which this does not convert"
-    raw_zone = str(window.get("time_zone") or "UTC")
-    if raw_zone.upper() == "UTC":
-        tz = "UTC"
-    elif raw_zone.upper() in ("LOCAL", "LOCAL_TIME"):
-        if not manager_zone:
-            return None, "is in the manager's local time: run again with --timezone <the manager's IANA zone>"
-        tz = manager_zone
-    else:
-        tz = raw_zone
-    out: dict = {"timezone": tz}
-    start_t, end_t = window.get("start_time"), window.get("end_time")
-    if window.get("recurring", True):
-        days = [DAY.get(str(d).upper()) for d in window.get("days") or []]
-        if None in days:
-            return None, f"has days {window.get('days')}, which this does not read"
-        if not (start_t and end_t):
-            return None, "recurs, but has no start_time and end_time"
-        entry: dict = {"from": str(start_t)[:5], "to": str(end_t)[:5]}
-        if days and len(days) < 7:
-            entry = {"days": days, **entry}
-        out["windows"] = [entry]
-        if window.get("start_date"):
-            out["starts"] = str(window["start_date"])
-        if window.get("end_date"):
-            # The window recurs on its end date too: off from the next day.
-            ends = date.fromisoformat(str(window["end_date"])) + timedelta(days=1)
-            out["expires"] = ends.isoformat()
-    else:
-        if not (window.get("start_date") and window.get("end_date")):
-            return None, "is one-off, but has no start_date and end_date"
-        out["starts"] = f"{window['start_date']} {str(start_t or '00:00')[:5]}"
-        out["expires"] = f"{window['end_date']} {str(end_t or '23:59')[:5]}"
-    out["owner"] = "TODO: who answers for this rule being on"
-    if window.get("display_name"):
-        out["ticket"] = f"was NSX time window {window['display_name']}"
-    return out, ""
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--site", required=True)
-    ap.add_argument("--from-dump", help="policies as scripts/import-estate.py --dump-only wrote them")
-    ap.add_argument("--schedulers", help="the time windows, as GET /policy/api/v1/infra/firewall-schedulers returned them")
-    ap.add_argument("--timezone", help="the manager's IANA time zone, for windows NSX keeps in local time")
-    ap.add_argument("--out", help="where to write the report (default reports/time-windows-<site>.md)")
-    args = ap.parse_args()
-    ie = importer()
-    ie.CA_SITE = args.site
-
-    host = os.environ.get("NSXT_MANAGER_HOST")
-    user, password = os.environ.get("NSXT_USERNAME"), os.environ.get("NSXT_PASSWORD")
-    insecure = os.environ.get("NSXT_ALLOW_UNVERIFIED_SSL", "").strip().lower() in ("true", "1", "yes")
-    live = not (args.from_dump and args.schedulers)
-    if live and not (host and user and password):
-        sys.exit(f"error: no credentials. Wrap the call: scripts/with-credentials.sh {args.site} -- scripts/convert-time-windows.py --site {args.site}")
-    if args.schedulers:
-        windows = json.loads(Path(args.schedulers).read_text()).get("results", [])
-    else:
-        windows = ie.api_get(host, f"{ie.LM_BASE}/firewall-schedulers", user, password, insecure).get("results", [])
-    estate = json.loads(Path(args.from_dump).read_text()) if args.from_dump else \
-        ie.fetch_estate(host, user, password, ie.LM_BASE, "default", insecure)
-    by_path = {w.get("path"): w for w in windows}
-    policies = [p for p in estate.get("policies", []) if str(p.get("path", "")).startswith("/infra/")]
-    ie.assign_keys([g for g in estate.get("groups", []) if str(g.get("path", "")).startswith("/infra/")], policies)
-
-    done, refused = [], []
-    for policy in policies:
-        for rule in policy.get("rules", []):
-            path = rule.get("scheduler_path") or policy.get("scheduler_path")
-            if not path:
-                continue
-            where = f"data/policies/{policy['id']}.yaml, rule {rule['id']}"
-            window = by_path.get(path)
-            if window is None:
-                refused.append((where, f"uses {path}, which the manager did not list"))
-                continue
-            block, why = convert(window, args.timezone)
-            if block is None:
-                refused.append((where, f"its time window {window.get('display_name', path)} {why}"))
-            else:
-                done.append((where, rule.get("display_name", rule["id"]), block))
-
-    lines = [f"# Time windows on {args.site}, converted", "",
-             f"{len(done)} rule(s) converted, {len(refused)} not. Paste each block under its rule, fill in `owner:`,",
-             "and merge it with the removal of the time window in NSX (docs/SCHEDULES.md).", ""]
-    for where, name, block in done:
-        lines += [f"## {where} ({name})", "", "```yaml", *("      " + l for l in ie.to_yaml({"schedule": block}).splitlines()), "```", ""]
-    if refused:
-        lines += ["## Not converted", ""] + [f"- {where}: {why}" for where, why in refused] + [""]
-    out = Path(args.out or REPO_ROOT / "reports" / f"time-windows-{args.site}.md")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text("\n".join(lines))
-    print(f"{len(done)} rule(s) converted, {len(refused)} not: {out.relative_to(REPO_ROOT) if out.is_relative_to(REPO_ROOT) else out}")
-    for where, why in refused:
-        print(f"  NOT CONVERTED  {where}: {why}")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-SCAFFOLD_EOF
-mark_executable scripts/convert-time-windows.py
-
-write_file scripts/nsx-watch.py <<'SCAFFOLD_EOF'
-#!/usr/bin/env python3
-"""Find changes made in NSX outside this repository, at a cost of one API call.
-
-For a manager in mode: managed, every object NSX holds is compared with what
-data/ says it should be, converted the same way the importer converts, so a
-difference is a real one:
-
-  scripts/nsx-watch.py --site S                 incremental: objects modified in
-                                                NSX in the last --lookback minutes
-                                                (default 20), in ONE search call
-  scripts/nsx-watch.py --site S --full          everything, in ONE hierarchical
-                                                read: also objects deleted in NSX,
-                                                and objects created outside Git
-  scripts/nsx-watch.py --site S --changed-since EPOCH
-                                                exit 0 if anything was modified
-                                                since then, 3 if nothing (mirror.sh
-                                                skips a full read when nothing has)
-
-Raised as nsx-drift issues, as the drift check raises them (scripts/drift-issue.py):
-changed, deleted, created outside Git, each with who and when as NSX records
-them. Not drift: an object another tool owns (inventory/ownership.yaml), one a
-pipeline account last changed (NSX_PIPELINE_USERS), and one whose data/ file was
-committed after NSX last changed it (its apply is pending). A scheduled rule is
-compared with what its schedule says now.
-
-Run inside scripts/with-credentials.sh (read-only plan credential). Prints the
-number of NSX calls; above NSX_API_BUDGET (per run, default 10) it warns.
---report-only lists what it found and raises nothing. Exit status: 0 done, 1
-error, 3 (--changed-since) nothing changed.
-"""
-
-from __future__ import annotations
-
-import argparse
-import importlib.util
-import json
-import os
-import subprocess
-import sys
-import time
-import urllib.parse
-from pathlib import Path
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from yamlcompat import load_all, load_yaml  # noqa: E402
-
-KINDS = ("Group", "SecurityPolicy", "Rule", "Service", "PolicyExcludeList")
-
-
-def load(name: str, file: str):
-    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parent / file)
-    module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-    spec.loader.exec_module(module)  # type: ignore[union-attr]
-    return module
-
-
-ie = load("import_estate", "import-estate.py")
-schedule = load("nsx_schedule", "schedule.py")
-
-
-# --------------------------------------------------------------------------
-# What data/ says this manager holds
-# --------------------------------------------------------------------------
-
-def desired(site: str, role: str) -> dict:
-    """identity -> (data key, definition, data file), for every object this
-    manager's security stack manages; plus path -> key for references."""
-    tree = "/global-infra" if role == "gm" else "/infra"
-
-    def mine(d: dict) -> bool:
-        if role == "gm":
-            return d.get("owner") == "gm"
-        sites = d.get("sites") or []
-        return d.get("owner", "lm") == "lm" and (site in sites or "*" in sites)
-
-    out: dict = {"objects": {}, "paths": {}, "services": {}, "mirrored": set()}
-    mark = f"# nsx-mirror: {site}"
-    # A hybrid manager's objects still mirrored from the UI are the mirror job's
-    # to follow: never raised here, as changed or as created outside Git.
-    from ci_matrix_lib import managers as inventory, mode_of  # noqa: PLC0415
-    hybrid = mode_of(site, inventory().get(site) or {}) == "hybrid"
-    mirrored = lambda f: hybrid and f.read_text().split("\n", 1)[0].strip() == mark  # noqa: E731
-    files = sorted((REPO_ROOT / "data" / "groups").glob("*.yaml"))
-    for f, doc in zip(files, load_all([f.read_text() for f in files]) if files else []):
-        doc = doc or {}
-        if mirrored(f):
-            for key, g in (doc.get("groups") or {}).items():
-                g = g if isinstance(g, dict) else {}
-                out["mirrored"].add(("group", g.get("domain") or "default", str(g.get("nsx_id", key))))
-        for section in ("groups", "references"):
-            for key, g in (doc.get(section) or {}).items():
-                g = g if isinstance(g, dict) else {}
-                where, nsx = g.get("domain") or "default", str(g.get("nsx_id", key))
-                prefix = "/global-infra" if g.get("owner") == "gm" else "/infra"
-                out["paths"][f"{prefix}/domains/{where}/groups/{nsx}"] = str(key)
-                if section == "groups" and mine(g) and not mirrored(f):
-                    out["objects"][("group", where, nsx)] = (str(key), g, f"data/groups/{f.name}")
-    files = sorted((REPO_ROOT / "data" / "services").glob("*.yaml"))
-    for f, doc in zip(files, load_all([f.read_text() for f in files]) if files else []):
-        doc = doc or {}
-        for key in doc.get("predefined_ids") or {}:
-            out["services"][f"{tree}/services/{key}"] = str(key)
-        for key, name in (doc.get("predefined") or {}).items():
-            out["services"][f"name:{name}"] = str(key)
-        for key, sv in (doc.get("custom") or {}).items():
-            sv = sv if isinstance(sv, dict) else {}
-            prefix = "/global-infra" if sv.get("owner", "gm") == "gm" else "/infra"
-            out["services"][f"{prefix}/services/{key}"] = str(key)
-            if mirrored(f):
-                out["mirrored"].add(("service", str(key)))
-                continue
-            if (role == "gm" and sv.get("owner", "gm") == "gm") or (role != "gm" and sv.get("owner", "gm") == "lm" and (
-                    site in (sv.get("sites") or ["*"]) or "*" in (sv.get("sites") or ["*"]))):
-                out["objects"][("service", str(key))] = (str(key), sv, f"data/services/{f.name}")
-    files = sorted((REPO_ROOT / "data" / "policies").glob("*.yaml"))
-    for f, doc in zip(files, load_all([f.read_text() for f in files]) if files else []):
-        doc = doc or {}
-        header = doc.get("policy") or {}
-        if not mine(header) or header.get("rule_management", "standalone") != "standalone":
-            continue
-        where, pid = header.get("domain") or "default", str(header.get("id") or f.stem)
-        if mirrored(f):
-            out["mirrored"].add(("policy", where, pid))
-            out["mirrored"] |= {("rule", where, pid, str((r or {}).get("nsx_id", k))) for k, r in (doc.get("rules") or {}).items()}
-            continue
-        out["objects"][("policy", where, pid)] = (f.stem, header, f"data/policies/{f.name}")
-        for key, rule in (doc.get("rules") or {}).items():
-            rule = rule if isinstance(rule, dict) else {}
-            out["objects"][("rule", where, pid, str(rule.get("nsx_id", key)))] = (f"{f.stem}/{key}", rule, f"data/policies/{f.name}")
-    return out
-
-
-# --------------------------------------------------------------------------
-# One comparable form for both sides, with the modules' defaults filled in
-# --------------------------------------------------------------------------
-
-def norm_list(values) -> list:
-    return sorted(json.dumps(v, sort_keys=True) if not isinstance(v, str) else v for v in values or [] if v != "ANY")
-
-
-def rule_form(r: dict, off: bool | None = None) -> dict:
-    return {
-        "name": r.get("name"), "description": r.get("description"), "sequence_number": r.get("sequence_number"),
-        "action": r.get("action", "ALLOW"), "direction": r.get("direction", "IN_OUT"),
-        "ip_version": r.get("ip_version", "IPV4_IPV6"),
-        "source_groups": norm_list(r.get("source_groups")), "destination_groups": norm_list(r.get("destination_groups")),
-        "services": norm_list(r.get("services")), "service_entries": r.get("service_entries") or {},
-        "sources_excluded": bool(r.get("sources_excluded", False)), "destinations_excluded": bool(r.get("destinations_excluded", False)),
-        "disabled": bool(r.get("disabled", False)) if off is None else off,
-        "logged": bool(r.get("logged", True)), "notes": r.get("notes"), "log_label": r.get("log_label"),
-        "profiles": norm_list(r.get("profiles")), "scope": norm_list(r.get("scope")), "tags": norm_list(r.get("tags")),
-    }
-
-
-def group_form(g: dict) -> dict:
-    criteria = []
-    for c in g.get("criteria") or []:
-        c = dict(c)
-        if "conditions" in c:
-            c["conditions"] = [{"key": x.get("key", "Tag"), "member_type": x.get("member_type", "VirtualMachine"),
-                                "operator": x.get("operator", "EQUALS"), "value": str(x.get("value", ""))} for x in c["conditions"]]
-        for k in ("ip_addresses", "mac_addresses", "external_ids", "member_groups"):
-            if k in c:
-                c[k] = sorted(str(v) for v in c[k])
-        criteria.append(c)
-    return {"display_name": g.get("display_name"), "description": g.get("description"),
-            "conjunction": g.get("conjunction") if len(criteria) > 1 else None,
-            "group_type": g.get("group_type"), "criteria": criteria, "tags": norm_list(g.get("tags")),
-            "identity_groups": norm_list(g.get("identity_groups"))}
-
-
-def policy_form(p: dict) -> dict:
-    return {"name": p.get("name"), "description": p.get("description"), "category": p.get("category"),
-            "sequence_number": p.get("sequence_number", 100), "stateful": p.get("stateful", True) is not False,
-            "locked": bool(p.get("locked", False)), "comments": p.get("comments"),
-            "scope": norm_list(p.get("scope")), "tags": norm_list(p.get("tags"))}
-
-
-def service_form(s: dict) -> dict:
-    return {k: v for k, v in s.items() if k not in ("owner", "sites")}
-
-
-# --------------------------------------------------------------------------
-# Reading NSX: one call
-# --------------------------------------------------------------------------
-
-def search(host: str, user: str, password: str, insecure: bool, role: str, since_ms: int) -> list[dict]:
-    """Objects of the kinds data/ manages, modified since since_ms: one search
-    call (more only past a thousand results)."""
-    base = "/global-manager/api/v1" if role == "gm" else "/policy/api/v1"
-    query = f"resource_type:({' OR '.join(KINDS)}) AND _last_modified_time:[{since_ms} TO *]"
-    out, cursor = [], None
-    while True:
-        params = {"query": query, **({"cursor": cursor} if cursor else {})}
-        page = ie.api_get(host, f"{base}/search/query?{urllib.parse.urlencode(params)}", user, password, insecure)
-        out.extend(page.get("results") or [])
-        cursor = page.get("cursor")
-        if not cursor or not page.get("results"):
-            return out
-
-
-def identity(o: dict, policy_of: dict) -> tuple | None:
-    kind = o.get("resource_type")
-    path = str(o.get("path", ""))
-    where = ie.domain_of(path, "default")
-    if kind == "Group":
-        return ("group", where, str(o.get("id")))
-    if kind == "SecurityPolicy":
-        return ("policy", where, str(o.get("id")))
-    if kind == "Rule":
-        parts = path.split("/")
-        pid = parts[parts.index("security-policies") + 1] if "security-policies" in parts else policy_of.get(path, "")
-        return ("rule", where, pid, str(o.get("id")))
-    if kind == "Service":
-        return ("service", str(o.get("id")))
-    return None
-
-
-def compare(site: str, role: str, objects: list[dict], full: bool) -> list[dict]:
-    """Drift items, as scripts/drift-issue.py raises them."""
-    want = desired(site, role)
-    tree = "/global-infra/" if role == "gm" else "/infra/"
-    rules_ = ie.ownership_rules()
-    pipeline = {u.strip() for u in os.environ.get("NSX_PIPELINE_USERS", "").split(",") if u.strip()}
-    now = schedule.parse_now(None)
-    off_now = {}
-    for r in schedule.scheduled_rules("global-security" if role == "gm" else "local-security", site):
-        off_now[r["policy"] + "/" + r["rule"]] = r["disabled"] or not schedule.active(r["schedule"], now)
-
-    def svc_key(path: str) -> str:
-        return want["services"].get(path) or path.rsplit("/", 1)[-1]
-
-    def to_data_rule(r: dict) -> dict:
-        names = lambda paths, f: [p if p == "ANY" else f(p) for p in paths or []]  # noqa: E731
-        converted = ie.convert_rule(dict(r, id=r.get("id")), want["paths"], {})
-        converted["services"] = [svc_key(p) for p in r.get("services") or [] if p != "ANY"]
-        converted["source_groups"] = names(r.get("source_groups"), lambda p: want["paths"].get(p, p))
-        converted["destination_groups"] = names(r.get("destination_groups"), lambda p: want["paths"].get(p, p))
-        return converted
-
-    def data_services(r: dict) -> list[str]:
-        out = []
-        for name in r.get("services") or []:
-            hit = next((k for k, v in want["services"].items() if v == name), None)
-            out.append(name if hit is None else (hit[5:] if hit.startswith("name:") else want["services"][hit]))
-        return out
-
-    def committed(file: str) -> int:
-        found = subprocess.run(["git", "log", "-1", "--format=%ct", "--", file], cwd=REPO_ROOT,
-                               capture_output=True, text=True).stdout.strip()
-        return int(found or 0)
-
-    items, seen = [], set()
-    for o in objects:
-        if not str(o.get("path", "")).startswith(tree) or ie.is_system(o) or ie.owned_elsewhere(o, rules_):
-            continue
-        ident = identity(o, {})
-        if ident is None or ident in want["mirrored"]:
-            continue
-        seen.add(ident)
-        who, at, seconds = ie_when(o)
-        entry = want["objects"].get(ident)
-        if entry is None:
-            if ident[0] == "rule" and ("policy", ident[1], ident[2]) not in want["objects"]:
-                continue  # a rule of an unmanaged policy: reported with its policy
-            items.append(item(ident, "created outside Git", "not in data/", who, at, o))
-            continue
-        key, definition, file = entry
-        if o.get("_last_modified_user") in pipeline:
-            continue
-        if ident[0] == "rule":
-            nsx_side = rule_form(to_data_rule(o))
-            data_side = rule_form(dict(definition, name=definition.get("name", key.split("/", 1)[1]),
-                                       services=data_services(definition)), off_now.get(key))
-        elif ident[0] == "group":
-            nsx_side = group_form(ie.convert_group(o, want["paths"], "", []))
-            data_side = group_form(definition)
-        elif ident[0] == "policy":
-            header = ie.convert_policy(dict(o, rules=[]), want["paths"], {}, "", [])["policy"]
-            nsx_side, data_side = policy_form(header), policy_form(definition)
-        else:
-            nsx_side, data_side = service_form(ie.convert_service(o)), service_form(definition)
-        if nsx_side == data_side:
-            continue
-        differs = {k for k in data_side if data_side.get(k) != nsx_side.get(k)}
-        on_schedule = ident[0] == "rule" and key in off_now and differs == {"disabled"}
-        if seconds is not None and not on_schedule and committed(file) > seconds:
-            continue  # data/ changed after NSX did: its apply is pending
-        detail = describe_diff(data_side, nsx_side)
-        high = ident[0] == "rule" and data_side["disabled"] and not nsx_side["disabled"] and key in off_now
-        items.append(item(ident, "changed", detail, who, at, o, key, "high" if high else ""))
-    if full:
-        for ident, (key, _, _) in sorted(want["objects"].items(), key=lambda kv: str(kv[0])):
-            if ident not in seen and not (ident[0] == "rule" and ("policy",) + ident[1:3] not in seen):
-                items.append(item(ident, "deleted", "", "", "", {}, key))
-    # The exclusion list: a group added outside Git bypasses the firewall.
-    listed = next((o for o in objects if o.get("resource_type") == "PolicyExcludeList"), None)
-    if listed is not None and role != "gm":
-        file = REPO_ROOT / "data" / "exclude-list" / f"{site}.yaml"
-        members = set((load_yaml(file.read_text()) or {}).get("members") or {}) if file.exists() else set()
-        key_of = {path: key for path, key in want["paths"].items()}
-        have = {key_of.get(m, m) for m in listed.get("members") or []}
-        who, at, _ = ie_when(listed)
-        for m in sorted(have - members):
-            items.append(item(("exclusion", m), "created outside Git", "now bypasses the DFW entirely", who, at,
-                              listed, m, "high"))
-        for m in sorted(members - have):
-            items.append(item(("exclusion", m), "deleted", "no longer excluded", who, at, listed, m))
-    return items
-
-
-def ie_when(o: dict):
-    stamp = o.get("_last_modified_time") or o.get("_create_time")
-    seconds = stamp / 1000 if isinstance(stamp, (int, float)) else None
-    at = time.strftime("%Y-%m-%d %H:%M", time.gmtime(seconds)) if seconds else ""
-    return str(o.get("_last_modified_user") or o.get("_create_user") or ""), at, seconds
-
-
-def describe_diff(want: dict, have: dict) -> str:
-    parts = []
-    for k in sorted(set(want) | set(have)):
-        if want.get(k) == have.get(k):
-            continue
-        a, b = want.get(k), have.get(k)
-        if isinstance(a, list) and isinstance(b, list) and all(isinstance(x, str) for x in a + b):
-            parts.append(f"{k} " + " ".join([f"+{x}" for x in b if x not in a] + [f"-{x}" for x in a if x not in b]))
-        elif isinstance(a, (dict, list)) or isinstance(b, (dict, list)):
-            parts.append(f"{k} changed")
-        else:
-            parts.append(f"{k} {a} → {b}")
-    text = "; ".join(parts) or "changed"
-    return text if len(text) <= 240 else text[:237] + "..."
-
-
-def item(ident: tuple, change: str, detail: str, who: str, at: str, o: dict, key: str = "", severity: str = "") -> dict:
-    kind = ident[0]
-    label = key or (ident[-1] if kind != "rule" else f"{ident[2]}/{ident[3]}")
-    version = drift.digest([o.get("_revision"), o.get("_last_modified_time"), detail]) if o else "0" * 16
-    return {"key": f"{kind} {label}", "kind": kind, "id": label, "change": change, "detail": detail,
-            "who": who, "at": at, "version": version, "path": o.get("path", ""), "severity": severity}
-
-
-drift = load("drift_issue", "drift-issue.py")
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--site", required=True)
-    ap.add_argument("--full", action="store_true")
-    ap.add_argument("--lookback", type=int, default=int(os.environ.get("NSX_WATCH_LOOKBACK", "20")), help="minutes")
-    ap.add_argument("--changed-since", type=int, metavar="EPOCH")
-    ap.add_argument("--from-dump", help="compare a capture instead of reading NSX (tests, and a second look)")
-    ap.add_argument("--report-only", action="store_true")
-    ap.add_argument("--link", default=os.environ.get("CI_JOB_URL", ""))
-    args = ap.parse_args()
-    ie.CA_SITE = args.site
-    inventory = (load_yaml((REPO_ROOT / "inventory" / "managers.yaml").read_text()) or {}).get("managers") or {}
-    manager = inventory.get(args.site) or {}
-    role = manager.get("role", "lm")
-    host = os.environ.get("NSXT_MANAGER_HOST") or manager.get("host")
-    user, password = os.environ.get("NSXT_USERNAME"), os.environ.get("NSXT_PASSWORD")
-    insecure = os.environ.get("NSXT_ALLOW_UNVERIFIED_SSL", "").strip().lower() in ("true", "1", "yes")
-    if not args.from_dump and not (host and user and password):
-        sys.exit(f"error: no credentials. Wrap the call: scripts/with-credentials.sh {args.site} -- scripts/nsx-watch.py --site {args.site}")
-
-    if args.changed_since is not None:
-        found = search(host, user, password, insecure, role, args.changed_since * 1000)
-        tree = "/global-infra/" if role == "gm" else "/infra/"
-        found = [o for o in found if str(o.get("path", "")).startswith(tree) and not ie.is_system(o)]
-        print(f"watch: {len(found)} object(s) modified on {args.site} since {time.strftime('%Y-%m-%d %H:%M', time.gmtime(args.changed_since))} UTC"
-              f" ({ie.CALLS} NSX call(s))")
-        return 0 if found else 3
-
-    if args.from_dump:
-        estate = json.loads(Path(args.from_dump).read_text())
-        objects = estate.get("groups", []) + estate.get("services", []) + [
-            dict(p, resource_type="SecurityPolicy") for p in estate.get("policies", [])] + [
-            dict(r, resource_type="Rule") for p in estate.get("policies", []) for r in p.get("rules", [])]
-        objects = [dict(o, resource_type=o.get("resource_type") or ("Group" if "/groups/" in o.get("path", "") else "Service"))
-                   for o in objects]
-        if "exclude_list" in estate and role != "gm":
-            objects.append({"resource_type": "PolicyExcludeList", "path": "/infra/settings/firewall/security/exclude-list",
-                            "members": estate.get("exclude_list") or []})
-    elif args.full:
-        estate = ie.fetch_estate(host, user, password, ie.GM_BASE if role == "gm" else ie.LM_BASE,
-                                 manager.get("domain") or "default", insecure)
-        objects = [dict(g, resource_type="Group") for g in estate["groups"]] + \
-                  [dict(s, resource_type="Service") for s in estate["services"]] + \
-                  [dict(p, resource_type="SecurityPolicy") for p in estate["policies"]] + \
-                  [dict(r, resource_type="Rule") for p in estate["policies"] for r in p.get("rules", [])]
-        if role != "gm":
-            objects.append({"resource_type": "PolicyExcludeList", "path": "/infra/settings/firewall/security/exclude-list",
-                            "members": estate.get("exclude_list") or []})
-    else:
-        since = int((time.time() - args.lookback * 60) * 1000)
-        objects = search(host, user, password, insecure, role, since)
-    items = compare(args.site, role, objects, args.full or bool(args.from_dump))
-    budget = int(os.environ.get("NSX_API_BUDGET", "10"))
-    print(f"watch {'full' if args.full else 'incremental'} of {args.site}: {len(objects)} object(s) read, "
-          f"{len(items)} difference(s), {ie.CALLS} NSX call(s)")
-    if ie.CALLS > budget:
-        print(f"warning: {ie.CALLS} NSX calls is over this run's budget of {budget} (NSX_API_BUDGET)")
-    for i in items:
-        print(f"  {i['change']:20} {i['key']}  {i['detail']}  {i['who']} {i['at']}".rstrip())
-    if not items or args.report_only:
-        return 0
-    gitlab = drift.GitLab()
-    seen = gitlab.reported(args.site)
-    new = [i for i in items if (drift.digest(i["key"]), i["version"]) not in seen]
-    if not new:
-        print(f"watch: each of the {len(items)} difference(s) is already in an nsx-drift issue.")
-        return 0
-    high = any(i.get("severity") == "high" for i in new)
-    stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
-    issue, _ = gitlab.call("POST", "/issues", {
-        "title": ("[HIGH] " if high else "") + f"NSX drift on {args.site}: {len(new)} change(s) made outside the repository, {stamp}",
-        "description": drift.issue_body(args.site, new, "watch", args.link),
-        "labels": f"{drift.LABEL},site:{args.site}" + (",severity::high" if high else ""),
-    })
-    print(f"watch: {len(new)} change(s) to investigate: {(issue or {}).get('web_url', 'issue raised')}")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-SCAFFOLD_EOF
-mark_executable scripts/nsx-watch.py
-
-write_file scripts/revision-check.py <<'SCAFFOLD_EOF'
-#!/usr/bin/env python3
-"""Before an apply of a plan made without refresh (NSX_PLAN_REFRESH=changed):
-has anything the plan changes been changed in NSX since Terraform last read it?
-
-  terraform show -json tfplan | scripts/revision-check.py --site S
-
-For each object the plan updates or deletes, NSX's revision now is compared
-with the revision in Terraform's state: one read per such object, nothing for
-the rest of the manager. A difference means someone changed it after the plan's
-view of it: the apply is refused, with who and when, and a plan with refresh
-is needed. Exit status: 0 nothing moved, 2 something did, 1 error.
-"""
-
-from __future__ import annotations
-
-import argparse
-import importlib.util
-import json
-import os
-import sys
-import urllib.parse
-from pathlib import Path
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--site", required=True)
-    ap.add_argument("plan_json", nargs="?")
-    args = ap.parse_args()
-    plan = json.loads(Path(args.plan_json).read_text() if args.plan_json else sys.stdin.read())
-    spec = importlib.util.spec_from_file_location("import_estate", Path(__file__).resolve().parent / "import-estate.py")
-    ie = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-    spec.loader.exec_module(ie)  # type: ignore[union-attr]
-    ie.CA_SITE = args.site
-    host, user, password = (os.environ.get(k, "") for k in ("NSXT_MANAGER_HOST", "NSXT_USERNAME", "NSXT_PASSWORD"))
-    insecure = os.environ.get("NSXT_ALLOW_UNVERIFIED_SSL", "").strip().lower() in ("true", "1", "yes")
-    moved = []
-    checked = 0
-    for change in plan.get("resource_changes") or []:
-        actions = change.get("change", {}).get("actions") or []
-        before = change.get("change", {}).get("before") or {}
-        if not ({"update", "delete"} & set(actions)) or not before.get("path") or before.get("revision") is None:
-            continue
-        prefix = "/global-manager/api/v1" if str(before["path"]).startswith("/global-infra/") else "/policy/api/v1"
-        live = ie.api_get(host, prefix + urllib.parse.quote(before["path"]), user, password, insecure, True)
-        checked += 1
-        if not live:
-            moved.append((change["address"], "deleted in NSX", "", ""))
-        elif live.get("_revision") != before["revision"]:
-            who, at, _ = (str(live.get("_last_modified_user") or "?"), live.get("_last_modified_time"), None)
-            moved.append((change["address"], f"revision {before['revision']} -> {live.get('_revision')}", who, at))
-    print(f"revision check {args.site}: {checked} object(s) the plan changes, {len(moved)} changed in NSX since; {ie.CALLS} NSX call(s)")
-    for address, what, who, at in moved:
-        print(f"  x {address}: {what} {('by ' + who) if who else ''}".rstrip())
-    if moved:
-        print("refusing to apply over a change made in NSX after the plan's view of it. Plan again with refresh:")
-        print("  NSX_PLAN_REFRESH=full scripts/tf.sh plan <stack> <site>")
-        return 2
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-SCAFFOLD_EOF
-mark_executable scripts/revision-check.py
-
-write_file scripts/accept-drift.py <<'SCAFFOLD_EOF'
-#!/usr/bin/env python3
-"""Accept a change made in NSX: write it into data/, so the next apply keeps it.
-
-The other way out of a drift issue is to revert it, deliberately: list the
-object in allow-revert.txt and apply. Neither happens silently: plan-guard
-refuses a plan that would undo a change made in NSX without one or the other.
-
-  scripts/with-credentials.sh lon1 -- scripts/accept-drift.py --site lon1 \\
-      rule=app/r1 group=web policy=app service=app-8443
-
-One read per object named. Each is converted as the importer converts it and
-written over its entry in data/; what NSX does not hold is kept from the entry
-(owner, sites, why_static, schedule, exception, the key). An object deleted in
-NSX leaves data/. A file with comments inside it is not rewritten (they would
-be lost): the entry to paste is printed instead.
-
-  --mr   in the pipeline (the 'accept' job, ACCEPT_SITE and ACCEPT_KEYS): commit
-         to a branch accept/<site>-<time> and open a merge request. Its plan
-         must show no change to these objects. Needs NSX_ADOPT_TOKEN.
-
-An object created outside Git is adopted, not accepted: the adopt job.
-"""
-
-from __future__ import annotations
-
-import argparse
-import base64
-import importlib.util
-import json
-import os
-import ssl
-import subprocess
-import sys
-import time
-import urllib.parse
-import urllib.request
-from pathlib import Path
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from yamlcompat import load_yaml  # noqa: E402
-
-
-def load(name: str, file: str):
-    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parent / file)
-    module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-    spec.loader.exec_module(module)  # type: ignore[union-attr]
-    return module
-
-
-watch = load("nsx_watch", "nsx-watch.py")
-ie = watch.ie
-KEEP = {"group": ("owner", "sites", "why_static", "why_empty", "domain", "nsx_id"),
-        "rule": ("schedule", "exception", "nsx_id"),
-        "policy": ("id", "owner", "sites", "domain", "rule_management", "allow_duplicate_sequence"),
-        "service": ("owner", "sites")}
-
-
-def find(want: dict, kind: str, key: str):
-    for ident, (k, definition, file) in want["objects"].items():
-        if ident[0] == kind and k == key:
-            return ident, definition, file
-    return None
-
-
-def nsx_path(ident: tuple, role: str) -> str:
-    tree = "/global-infra" if role == "gm" else "/infra"
-    if ident[0] == "group":
-        return f"{tree}/domains/{ident[1]}/groups/{ident[2]}"
-    if ident[0] == "policy":
-        return f"{tree}/domains/{ident[1]}/security-policies/{ident[2]}"
-    if ident[0] == "rule":
-        return f"{tree}/domains/{ident[1]}/security-policies/{ident[2]}/rules/{ident[3]}"
-    return f"{tree}/services/{ident[1]}"
-
-
-def converted(kind: str, obj: dict, want: dict, old: dict) -> dict:
-    if kind == "group":
-        new = ie.convert_group(obj, want["paths"], old.get("owner", "lm"), old.get("sites") or [])
-        new.pop("why_static", None), new.pop("why_empty", None)
-    elif kind == "rule":
-        new = ie.convert_rule(obj, want["paths"], {})
-        new["services"] = [want["services"].get(p) or p.rsplit("/", 1)[-1] for p in obj.get("services") or [] if p != "ANY"]
-        if not new["services"]:
-            del new["services"]
-    elif kind == "policy":
-        new = ie.convert_policy(dict(obj, rules=[]), want["paths"], {}, old.get("owner", "lm"), old.get("sites") or [])["policy"]
-    else:
-        new = ie.convert_service(obj)
-    for field in KEEP[kind]:
-        if field in old:
-            new[field] = old[field]
-    return new
-
-
-def rewrite(file: Path, change) -> str | None:
-    """Apply change(doc) to a data file, keeping its leading comment block.
-    None when done; the entry to paste by hand when the file has comments inside."""
-    text = file.read_text()
-    lines = text.splitlines()
-    head = []
-    for line in lines:
-        if line.startswith("#") or not line.strip():
-            head.append(line)
-        else:
-            break
-    doc = load_yaml(text) or {}
-    snippet = change(doc)
-    if any(l.lstrip().startswith("#") for l in lines[len(head):]):
-        return snippet
-    file.write_text("\n".join(head).rstrip("\n") + ("\n\n" if head else "") + ie.to_yaml(doc))
-    return None
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--site", required=True)
-    ap.add_argument("keys", nargs="+", help="kind=key: rule=<policy>/<rule>, group=<key>, policy=<key>, service=<key>")
-    ap.add_argument("--mr", action="store_true")
-    args = ap.parse_args()
-    ie.CA_SITE = args.site
-    managers = (load_yaml((REPO_ROOT / "inventory" / "managers.yaml").read_text()) or {}).get("managers") or {}
-    role = (managers.get(args.site) or {}).get("role", "lm")
-    host, user, password = (os.environ.get(k, "") for k in ("NSXT_MANAGER_HOST", "NSXT_USERNAME", "NSXT_PASSWORD"))
-    insecure = os.environ.get("NSXT_ALLOW_UNVERIFIED_SSL", "").strip().lower() in ("true", "1", "yes")
-    if not (host and user and password):
-        sys.exit(f"error: no credentials. Wrap the call: scripts/with-credentials.sh {args.site} -- scripts/accept-drift.py ...")
-    want = watch.desired(args.site, role)
-    accepted, by_hand = [], []
-    for spec in args.keys:
-        kind, _, key = spec.partition("=")
-        found = find(want, kind, key)
-        if found is None:
-            sys.exit(f"error: no {kind} {key!r} in data/ for {args.site} (kind=key: rule=<policy>/<rule>, group, policy, service)")
-        ident, old, rel = found
-        prefix = "/global-manager/api/v1" if role == "gm" else "/policy/api/v1"
-        obj = ie.api_get(host, prefix + urllib.parse.quote(nsx_path(ident, role)), user, password, insecure, True)
-        file = REPO_ROOT / rel
-        if not obj:
-            def change(doc, kind=kind, key=key):
-                if kind == "rule":
-                    (doc.get("rules") or {}).pop(key.split("/", 1)[1], None)
-                elif kind == "group":
-                    (doc.get("groups") or {}).pop(key, None)
-                elif kind == "service":
-                    (doc.get("custom") or {}).pop(key, None)
-                else:
-                    sys.exit(f"error: policy {key} is gone from NSX: delete {rel} in a merge request")
-                return f"# delete {kind} {key} from {rel}"
-            what = f"{kind} {key}: deleted in NSX, removed from {rel}"
-        else:
-            new = converted(kind, obj, want, old)
-
-            def change(doc, kind=kind, key=key, new=new):
-                if kind == "rule":
-                    doc.setdefault("rules", {})[key.split("/", 1)[1]] = new
-                    return ie.to_yaml({"rules": {key.split("/", 1)[1]: new}})
-                if kind == "policy":
-                    doc["policy"] = new
-                    return ie.to_yaml({"policy": new})
-                section = "groups" if kind == "group" else "custom"
-                doc.setdefault(section, {})[key] = new
-                return ie.to_yaml({section: {key: new}})
-            who = obj.get("_last_modified_user") or "?"
-            what = f"{kind} {key}: as NSX holds it (last changed by {who}), into {rel}"
-        snippet = rewrite(file, change)
-        if snippet is None:
-            accepted.append(what)
-        else:
-            by_hand.append((rel, snippet))
-    for line in accepted:
-        print(f"  accepted  {line}")
-    for rel, snippet in by_hand:
-        print(f"  BY HAND   {rel} has comments inside, so it was not rewritten. Paste:\n{snippet}")
-    print(f"({ie.CALLS} NSX call(s))")
-    if args.mr and accepted:
-        return open_mr(args.site, accepted)
-    return 0 if not by_hand else 2
-
-
-def open_mr(site: str, accepted: list[str]) -> int:
-    branch = f"accept/{site}-{time.strftime('%Y%m%d%H%M%S', time.gmtime())}"
-    git = ["git", "-c", f"user.name={os.environ.get('GITLAB_USER_NAME', 'nsx-accept')}",
-           "-c", f"user.email={os.environ.get('GITLAB_USER_EMAIL', 'nsx-accept@localhost')}", "-c", "commit.gpgsign=false"]
-    subprocess.run(["git", "checkout", "-q", "-B", branch], cwd=REPO_ROOT, check=True)
-    subprocess.run(["git", "add", "-A", "data"], cwd=REPO_ROOT, check=True)
-    subprocess.run(git + ["commit", "-q", "-m", f"Accept changes made in NSX on {site}\n\n" + "\n".join(accepted)], cwd=REPO_ROOT, check=True)
-    remote = os.environ.get("NSX_ADOPT_REMOTE")
-    env = dict(os.environ)
-    push = ["git"]
-    if not remote:
-        token = os.environ.get("NSX_ADOPT_TOKEN") or sys.exit("error: NSX_ADOPT_TOKEN is not set (api, write_repository)")
-        remote = f"{os.environ['CI_SERVER_URL'].rstrip('/')}/{os.environ['CI_PROJECT_PATH']}.git"
-        push += ["-c", "http.extraHeader=Authorization: Basic " + base64.b64encode(f"oauth2:{token}".encode()).decode()]
-        if os.environ.get("CI_SERVER_TLS_CA_FILE"):
-            env["GIT_SSL_CAINFO"] = os.environ["CI_SERVER_TLS_CA_FILE"]
-    subprocess.run(push + ["push", "-q", remote, f"HEAD:refs/heads/{branch}"], cwd=REPO_ROOT, check=True, env=env)
-    body = {"source_branch": branch, "target_branch": os.environ.get("CI_DEFAULT_BRANCH", "main"),
-            "title": f"Accept changes made in NSX on {site}", "remove_source_branch": True,
-            "description": "\n".join([f"Writes into data/ what NSX holds now, for changes made outside the repository on **{site}**:", "",
-                                      *[f"- {a}" for a in accepted], "",
-                                      "The plan of this merge request must show **no change** to these objects: data/ now says what NSX has.",
-                                      "Merge it to keep the changes; close it to revert them instead (allow-revert.txt)."])}
-    request = urllib.request.Request(f"{os.environ['CI_API_V4_URL'].rstrip('/')}/projects/{urllib.parse.quote(os.environ['CI_PROJECT_ID'], safe='')}/merge_requests",
-                                     data=json.dumps(body).encode(), method="POST",
-                                     headers={"Content-Type": "application/json", "PRIVATE-TOKEN": os.environ.get("NSX_ADOPT_TOKEN", "")})
-    ca = os.environ.get("CI_SERVER_TLS_CA_FILE")
-    ctx = ssl.create_default_context(cafile=ca) if ca and Path(ca).is_file() else ssl.create_default_context()
-    with urllib.request.urlopen(request, context=ctx, timeout=60) as response:
-        print(f"merge request: {json.loads(response.read().decode()).get('web_url')}")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-SCAFFOLD_EOF
-mark_executable scripts/accept-drift.py
 
 write_file scripts/plan-summary.py <<'SCAFFOLD_EOF'
 #!/usr/bin/env python3
@@ -13282,6 +11824,184 @@ if __name__ == "__main__":
 SCAFFOLD_EOF
 mark_executable scripts/plan-summary.py
 
+write_file scripts/drift.py <<'SCAFFOLD_EOF'
+#!/usr/bin/env python3
+"""Changes made in NSX outside this repository: find them, raise them, accept them.
+
+  drift.py watch   --site S [--full]       a managed manager against data/. Incremental:
+                                           what NSX modified in the last --lookback minutes,
+                                           in ONE search call. --full: everything, in ONE
+                                           hierarchical read, so deletions and objects
+                                           created outside Git show too.
+  drift.py changed --site S --since EPOCH  exit 0 if NSX modified anything since then, 3 if
+                                           not (mirror.sh skips an unchanged manager)
+  drift.py mirror  --site S --base REF --dump FILE
+                                           a mirrored manager: its fresh mirror files
+                                           against the copy on REF (scripts/mirror.sh)
+  drift.py accept  --site S [--mr] kind=key ...
+                                           write what NSX holds into data/: rule=<policy>/<rule>,
+                                           group=<key>, policy=<key>, service=<key>. One read
+                                           each. --mr: on a branch, as a merge request.
+
+watch and mirror raise one nsx-drift issue per run that finds something new
+(NSX_BOT_TOKEN); --report-only lists and raises nothing. What is drift and what
+is not: scripts/nsxlib/drift.py. A drift issue is closed one of two ways:
+accept the change, or revert it on purpose (allow-revert.txt); plan-guard
+refuses to undo it silently.
+
+Reads NSX inside scripts/with-credentials.sh (the read-only plan credential).
+Each run prints its NSX calls; above NSX_API_BUDGET (default 10) it warns.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.parse
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from nsxlib import convert, drift, inventory, model  # noqa: E402
+from nsxlib.gitlab import GitLab  # noqa: E402
+from nsxlib.nsx import GM_BASE, LM_BASE, Client  # noqa: E402
+from nsxlib.yamlio import to_yaml  # noqa: E402
+
+
+def watch(args: argparse.Namespace) -> int:
+    role, manager = inventory.role(args.site), inventory.manager(args.site)
+    client = None
+    if args.from_dump:
+        objects = drift.objects_of(json.loads(Path(args.from_dump).read_text()), role)
+    else:
+        client = Client.from_env(args.site, manager.get("host"))
+        if args.full:
+            estate = client.read(GM_BASE if role == "gm" else LM_BASE, manager.get("domain") or "default")
+            objects = drift.objects_of(estate, role)
+        else:
+            objects = client.search(role, int((time.time() - args.lookback * 60) * 1000))
+    items = drift.compare(args.site, role, objects, full=args.full or bool(args.from_dump))
+    calls = client.calls if client else 0
+    print(f"watch {'full' if args.full else 'incremental'} of {args.site}: {len(objects)} object(s) read, "
+          f"{len(items)} difference(s), {calls} NSX call(s)")
+    budget = int(os.environ.get("NSX_API_BUDGET", "10"))
+    if calls > budget:
+        print(f"warning: {calls} NSX calls is over this run's budget of {budget} (NSX_API_BUDGET)")
+    for i in items:
+        high = "  HIGH" if i["severity"] == "high" else ""
+        print(f"  {i['change']:20} {i['key']}  {i['detail']}  {i['who']} {i['at']}{high}".rstrip())
+    if items and not args.report_only:
+        drift.raise_issue(args.site, items, "watch", args.link)
+    return 0
+
+
+def changed(args: argparse.Namespace) -> int:
+    role = inventory.role(args.site)
+    client = Client.from_env(args.site, inventory.manager(args.site).get("host"))
+    tree = "/global-infra/" if role == "gm" else "/infra/"
+    found = [o for o in client.search(role, args.since * 1000)
+             if str(o.get("path", "")).startswith(tree) and not convert.is_system(o)]
+    print(f"watch: {len(found)} object(s) modified on {args.site} since "
+          f"{time.strftime('%Y-%m-%d %H:%M', time.gmtime(args.since))} UTC ({client.calls} NSX call(s))")
+    return 0 if found else 3
+
+
+def mirror(args: argparse.Namespace) -> int:
+    items = drift.mirror_changes(args.site, args.base, json.loads(Path(args.dump).read_text()))
+    if items is None:
+        print(f"drift: first copy of {args.site}, the baseline: no drift issue.")
+    elif not items:
+        print(f"drift: no change made in NSX on {args.site} to report.")
+    else:
+        for i in drift.raise_issue(args.site, items, "mirror", args.link)[:20]:
+            print(f"  {i['change']:8} {i['key']}  {i['who']} {i['at']}".rstrip())
+    return 0
+
+
+def accept(args: argparse.Namespace) -> int:
+    role = inventory.role(args.site)
+    client = Client.from_env(args.site, inventory.manager(args.site).get("host"))
+    want = model.desired(args.site, role)
+    by_key = {(ident[0], key): (ident, old, rel) for ident, (key, old, rel) in want.objects.items()}
+    done, by_hand = [], []
+    for spec in args.keys:
+        kind, _, key = spec.partition("=")
+        if (kind, key) not in by_key:
+            sys.exit(f"error: no {kind} {key!r} in data/ for {args.site} (kind=key: rule=<policy>/<rule>, group, policy, service)")
+        ident, old, rel = by_key[(kind, key)]
+        base = "/global-manager/api/v1" if role == "gm" else "/policy/api/v1"
+        obj = client.get(base + urllib.parse.quote(drift.nsx_path(ident, role)), missing_ok=True)
+        entry = key.split("/", 1)[1] if kind == "rule" else key
+        section = {"rule": "rules", "group": "groups", "service": "custom", "policy": "policy"}[kind]
+        if not obj and kind == "policy":
+            sys.exit(f"error: policy {key} is gone from NSX: delete {rel} in a merge request")
+        new = drift.accepted(kind, obj, want, old) if obj else None
+
+        def change(doc: dict, section=section, entry=entry, new=new, spec=spec, rel=rel) -> str:
+            if section == "policy":
+                doc["policy"] = new
+                return to_yaml({"policy": new})
+            if new is None:
+                (doc.get(section) or {}).pop(entry, None)
+                return f"# delete {spec.replace('=', ' ')} from {rel}"
+            doc.setdefault(section, {})[entry] = new
+            return to_yaml({section: {entry: new}})
+
+        snippet = model.rewrite(model.REPO / rel, change)
+        what = (f"{kind} {key}: as NSX holds it (last changed by {obj.get('_last_modified_user') or '?'}), into {rel}"
+                if obj else f"{kind} {key}: deleted in NSX, removed from {rel}")
+        if snippet is None:
+            done.append(what)
+        else:
+            by_hand.append((rel, snippet))
+    for line in done:
+        print(f"  accepted  {line}")
+    for rel, snippet in by_hand:
+        print(f"  BY HAND   {rel} has comments inside, so it was not rewritten. Paste:\n{snippet}")
+    print(f"({client.calls} NSX call(s))")
+    if args.mr and done:
+        url = GitLab().propose(
+            f"accept/{args.site}-{time.strftime('%Y%m%d%H%M%S', time.gmtime())}",
+            f"Accept changes made in NSX on {args.site}\n\n" + "\n".join(done), ["data"],
+            f"Accept changes made in NSX on {args.site}",
+            "\n".join([f"Writes into data/ what NSX holds now, for changes made outside the repository on **{args.site}**:",
+                       "", *[f"- {a}" for a in done], "",
+                       "The plan of this merge request must show **no change** to these objects: data/ now says what NSX has.",
+                       "Merge it to keep the changes; close it to revert them instead (allow-revert.txt)."]))
+        print(f"merge request: {url}")
+    return 2 if by_hand else 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = ap.add_subparsers(dest="command", required=True)
+    w = commands.add_parser("watch")
+    w.add_argument("--full", action="store_true")
+    w.add_argument("--lookback", type=int, default=int(os.environ.get("NSX_WATCH_LOOKBACK", "20")), help="minutes")
+    w.add_argument("--from-dump", help="compare a capture instead of reading NSX")
+    w.add_argument("--report-only", action="store_true")
+    c = commands.add_parser("changed")
+    c.add_argument("--since", type=int, required=True, metavar="EPOCH")
+    m = commands.add_parser("mirror")
+    m.add_argument("--base", required=True, help="the ref holding the previous copy (the default branch)")
+    m.add_argument("--dump", required=True, help="the capture the sync read")
+    a = commands.add_parser("accept")
+    a.add_argument("keys", nargs="+", help="kind=key: rule=<policy>/<rule>, group=<key>, policy=<key>, service=<key>")
+    a.add_argument("--mr", action="store_true", help="commit to a branch and open a merge request")
+    for p in (w, c, m, a):
+        p.add_argument("--site", required=True)
+        p.add_argument("--link", default=os.environ.get("CI_JOB_URL", ""), help="where it was found")
+    args = ap.parse_args()
+    return {"watch": watch, "changed": changed, "mirror": mirror, "accept": accept}[args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+SCAFFOLD_EOF
+mark_executable scripts/drift.py
+
 write_file scripts/rule-hits.py <<'SCAFFOLD_EOF'
 #!/usr/bin/env python3
 """Which rules nothing uses, and what a would-deny rule would have blocked:
@@ -13307,25 +12027,15 @@ Security Intelligence, where licensed, adds flow detail; nothing here needs it.
 from __future__ import annotations
 
 import argparse
-import importlib.util
-import os
 import sys
 import time
 import urllib.parse
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-
-
-def load(name: str, file: str):
-    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parent / file)
-    module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-    spec.loader.exec_module(module)  # type: ignore[union-attr]
-    return module
-
-
-watch = load("nsx_watch", "nsx-watch.py")
-ie = watch.ie
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from nsxlib import inventory, model  # noqa: E402
+from nsxlib.gitlab import GitLab  # noqa: E402
+from nsxlib.nsx import GM_BASE, LM_BASE, Client, domain_of  # noqa: E402
 
 
 def counters(stats) -> dict[str, int]:
@@ -13353,131 +12063,58 @@ def main() -> int:
     ap.add_argument("--site", required=True)
     ap.add_argument("--issue", action="store_true")
     args = ap.parse_args()
-    ie.CA_SITE = args.site
-    managers = (watch.load_yaml((REPO_ROOT / "inventory" / "managers.yaml").read_text()) or {}).get("managers") or {}
-    manager = managers.get(args.site) or {}
-    role = manager.get("role", "lm")
-    host, user, password = (os.environ.get(k, "") for k in ("NSXT_MANAGER_HOST", "NSXT_USERNAME", "NSXT_PASSWORD"))
-    insecure = os.environ.get("NSXT_ALLOW_UNVERIFIED_SSL", "").strip().lower() in ("true", "1", "yes")
-    if not (host and user and password):
-        sys.exit(f"error: no credentials. Wrap the call: scripts/with-credentials.sh {args.site} -- scripts/rule-hits.py --site {args.site}")
-    base = ie.GM_BASE if role == "gm" else ie.LM_BASE
-    want = watch.desired(args.site, role)
-    estate = ie.fetch_estate(host, user, password, base, manager.get("domain") or "default", insecure)
+    manager, role = inventory.manager(args.site), inventory.role(args.site)
+    client = Client.from_env(args.site, manager.get("host"))
+    want = model.desired(args.site, role)
+    estate = client.read(GM_BASE if role == "gm" else LM_BASE, manager.get("domain") or "default")
+    prefix = "/global-manager/api/v1" if role == "gm" else "/policy/api/v1"
     unused, would = [], []
     for policy in estate["policies"]:
-        where = ie.domain_of(policy.get("path", ""), "default")
-        if ("policy", where, str(policy["id"])) not in want["objects"]:
+        where = domain_of(policy.get("path", ""))
+        if ("policy", where, str(policy["id"])) not in want.objects:
             continue
-        prefix = "/global-manager/api/v1" if role == "gm" else "/policy/api/v1"
-        stats = ie.api_get(host, prefix + urllib.parse.quote(policy["path"]) + "/statistics", user, password, insecure, True)
-        hits = counters(stats)
+        hits = counters(client.get(prefix + urllib.parse.quote(policy["path"]) + "/statistics", missing_ok=True))
         for rule in policy.get("rules") or []:
-            entry = want["objects"].get(("rule", where, str(policy["id"]), str(rule["id"])))
-            if entry is None:
-                continue
+            entry = want.objects.get(("rule", where, str(policy["id"]), str(rule["id"])))
             count = hits.get(str(rule.get("rule_id")), hits.get(str(rule["id"])))
-            if count is None:
-                continue  # no counter for it: never guessed as unused
+            if entry is None or count is None:
+                continue  # not managed here, or no counter for it: never guessed as unused
             if rule.get("tag") == "WOULD_DENY":
                 would.append((entry[0], count))
             elif count == 0:
                 unused.append(entry[0])
     print(f"hits on {args.site}: {len(unused)} rule(s) with no hit since NSX last reset its counters; "
-          f"{len(would)} would-deny rule(s); {ie.CALLS} NSX call(s)")
+          f"{len(would)} would-deny rule(s); {client.calls} NSX call(s)")
     for key in unused:
         print(f"  unused      {key}")
     for key, count in would:
         print(f"  would-deny  {key}: {count} hit(s){'  (nothing left to allow: ready to become a DROP)' if count == 0 else ''}")
     if args.issue and (unused or would):
-        drift = watch.drift
-        gitlab = drift.GitLab()
-        month = time.strftime("%Y-%m", time.gmtime())
-        mark = f"<!-- nsx-hits site={args.site} month={month} -->"
-        found, _ = gitlab.call("GET", "/issues", query={"labels": f"nsx-hits,site:{args.site}", "state": "all", "per_page": 20})
-        if any(mark in (i.get("description") or "") for i in found or []):
-            print("hits: this month's issue exists already.")
-            return 0
-        body = "\n".join([f"Rule hit counters on **{args.site}**, {month} (since NSX last reset them):", "",
-                          "### No hit: clean-up candidates", *([f"- `{k}`" for k in unused] or ["(none)"]), "",
-                          "### Would-deny rules: what a DROP there would block", *([f"- `{k}`: {c} hit(s)" for k, c in would] or ["(none)"]),
-                          "", "Remove a rule in a merge request (with allow-destroy.txt); nothing is removed automatically.", "", mark])
-        issue, _ = gitlab.call("POST", "/issues", {"title": f"NSX rule hits on {args.site}, {month}", "description": body,
-                                                   "labels": f"nsx-hits,site:{args.site}"})
-        print(f"hits: {(issue or {}).get('web_url', 'issue raised')}")
+        raise_monthly(args.site, unused, would)
     return 0
+
+
+def raise_monthly(site: str, unused: list[str], would: list[tuple[str, int]]) -> None:
+    gitlab = GitLab()
+    month = time.strftime("%Y-%m", time.gmtime())
+    mark = f"<!-- nsx-hits site={site} month={month} -->"
+    found = gitlab.get("/issues", {"labels": f"nsx-hits,site:{site}", "state": "all", "per_page": 20})
+    if any(mark in (i.get("description") or "") for i in found or []):
+        print("hits: this month's issue exists already.")
+        return
+    body = "\n".join([f"Rule hit counters on **{site}**, {month} (since NSX last reset them):", "",
+                      "### No hit: clean-up candidates", *([f"- `{k}`" for k in unused] or ["(none)"]), "",
+                      "### Would-deny rules: what a DROP there would block",
+                      *([f"- `{k}`: {c} hit(s)" for k, c in would] or ["(none)"]), "",
+                      "Remove a rule in a merge request (with allow-destroy.txt); nothing is removed automatically.", "",
+                      mark])
+    print(f"hits: {gitlab.open_issue(f'NSX rule hits on {site}, {month}', body, f'nsx-hits,site:{site}')}")
 
 
 if __name__ == "__main__":
     sys.exit(main())
 SCAFFOLD_EOF
 mark_executable scripts/rule-hits.py
-
-write_file scripts/drift.sh <<'SCAFFOLD_EOF'
-#!/usr/bin/env bash
-#
-# Detect drift. Report it. Change nothing.
-#
-#   scripts/with-credentials.sh lon1 -- scripts/drift.sh local-security lon1
-#
-# Administrators make UI changes, especially during an incident. This tells you
-# what diverged; it never reverts, and it never writes back into data/. An
-# auto-revert during an active incident undoes the fix someone applied to stop
-# an outage, and a tool that rewrites your data files on a drift signal would
-# quietly overwrite the estate you imported.
-#
-# Reports go to reports/, which is gitignored: a plan reveals the security
-# posture of the estate and is not a review attachment. With DRIFT_JSON set, the
-# plan is also written there as JSON (scripts/drift-job.sh raises an issue from it).
-#
-# Exit status: 0 no drift, 1 error, 2 drift detected.
-
-set -uo pipefail
-
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-[ $# -ge 2 ] || {
-	echo "usage: drift.sh <stack> <site>" >&2
-	exit 1
-}
-
-stack="$1"
-site="$2"
-stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-report_dir="$REPO_ROOT/reports"
-report="$report_dir/drift-${stack}-${site}-${stamp}.txt"
-
-mkdir -p "$report_dir"
-
-# -refresh-only compares state against the live manager without proposing any
-# configuration change, so nothing here can be mistaken for a fix. Through
-# tf.sh, so the plan has the manager's variables, state and trust.
-"$REPO_ROOT/scripts/tf.sh" drift "$stack" "$site" -no-color >"$report" 2>&1
-status=$?
-
-case "$status" in
-0)
-	echo "no drift: $stack @ $site"
-	rm -f "$report"
-	exit 0
-	;;
-2)
-	echo "DRIFT DETECTED: $stack @ $site"
-	echo "report: ${report#"$REPO_ROOT"/}"
-	echo
-	grep -E '^\s*[~+-]|will be updated|has changed|Objects have changed' "$report" | head -40
-	echo
-	echo "This is a ticket, not an auto-fix. Either bring the change into data/ or"
-	echo "revert it deliberately. Nothing in data/ has been modified."
-	exit 2
-	;;
-*)
-	echo "error running the refresh-only plan; see ${report#"$REPO_ROOT"/}" >&2
-	exit 1
-	;;
-esac
-SCAFFOLD_EOF
-mark_executable scripts/drift.sh
 
 write_file scripts/schedule-job.sh <<'SCAFFOLD_EOF'
 #!/usr/bin/env bash
@@ -13494,7 +12131,7 @@ write_file scripts/schedule-job.sh <<'SCAFFOLD_EOF'
 # to switch, applying that and nothing else (plan-guard --schedule). Managers
 # in mode: mirror are still run from the UI and are skipped. Exit status: 0
 # done; 1 a manager could not be switched (the job fails, so it is seen; the
-# next run retries, and the drift check reports a rule left in the wrong state).
+# next run retries).
 
 set -uo pipefail
 
@@ -13525,7 +12162,7 @@ write_file scripts/watch-job.sh <<'SCAFFOLD_EOF'
 #
 # The 'watch' job: find changes made in NSX outside this repository, for
 # managers in mode: managed, at the cost of one NSX API call each
-# (scripts/nsx-watch.py), and raise them as nsx-drift issues.
+# (scripts/drift.py watch), and raise them as nsx-drift issues.
 #
 #   WATCH_SITE   a manager, several separated by spaces, or 'all'
 #   WATCH_FULL   1: read everything (one hierarchical read): also deletions, and
@@ -13553,7 +12190,7 @@ for site in $(python3 scripts/ci-matrix.py --format lines --managed-only | awk '
 	fi
 	echo "=== $site"
 	checked=$((checked + 1))
-	NSX_CRED_SCOPE=plan scripts/with-credentials.sh "$site" -- python3 scripts/nsx-watch.py --site "$site" ${full[@]+"${full[@]}"} || failed+=("$site")
+	NSX_CRED_SCOPE=plan scripts/with-credentials.sh "$site" -- python3 scripts/drift.py watch --site "$site" ${full[@]+"${full[@]}"} || failed+=("$site")
 done
 [ "$checked" -gt 0 ] || echo "no manager in mode: managed matches WATCH_SITE='$WATCH_SITE' (managers in mirror mode: the mirror job)"
 if [ "${#failed[@]}" -gt 0 ]; then
@@ -13562,70 +12199,6 @@ if [ "${#failed[@]}" -gt 0 ]; then
 fi
 SCAFFOLD_EOF
 mark_executable scripts/watch-job.sh
-
-write_file scripts/drift-job.sh <<'SCAFFOLD_EOF'
-#!/usr/bin/env bash
-#
-# The 'drift' job: for managers in mode: managed, find changes made in NSX
-# outside this repository and raise each as a GitLab issue to investigate.
-#
-# Run from a pipeline schedule (or Run pipeline) on the default branch with
-#   DRIFT_SITE   a manager, several separated by spaces, or 'all'
-#
-# For each manager and stack: a refresh-only plan with the read-only plan
-# credential (scripts/drift.sh), then scripts/drift-issue.py. Nothing is
-# changed, in NSX or in the repository. Managers in mode: mirror are left to
-# the mirror job, which raises their drift itself. Exit status: 0 done, drift
-# or not (drift is an issue, not a failed job); 1 a manager could not be checked.
-#
-# Needs NSX_BOT_TOKEN or NSX_ADOPT_TOKEN (api scope), masked and protected.
-
-set -uo pipefail
-
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO_ROOT" || exit 1
-
-if [ "${1:-}" = --one ]; then # --one SITE STACK, inside with-credentials.sh
-	site="$2"
-	stack="$3"
-	json="$(mktemp)"
-	trap 'rm -f "$json"' EXIT
-	DRIFT_JSON="$json" scripts/drift.sh "$stack" "$site"
-	case $? in
-	0 | 2)
-		# With no drift too: a scheduled rule in the wrong state is still raised.
-		[ -s "$json" ] || exit 0
-		python3 scripts/drift-issue.py plan --site "$site" --stack "$stack" --plan-json "$json" --link "${CI_JOB_URL:-}"
-		;;
-	*) exit 1 ;;
-	esac
-	exit $?
-fi
-
-[ -n "${DRIFT_SITE:-}" ] || {
-	echo "error: DRIFT_SITE is not set: a manager in mode: managed, several, or 'all'" >&2
-	exit 1
-}
-failed=()
-checked=0
-while read -r site stack _; do
-	[ -n "$site" ] || continue
-	if [ "$DRIFT_SITE" != all ] && [[ " $DRIFT_SITE " != *" $site "* ]]; then
-		continue
-	fi
-	echo
-	echo "=== $site / $stack"
-	checked=$((checked + 1))
-	NSX_CRED_SCOPE=plan scripts/with-credentials.sh "$site" -- scripts/drift-job.sh --one "$site" "$stack" || failed+=("$site/$stack")
-done < <(python3 scripts/ci-matrix.py --format lines --managed-only)
-
-[ "$checked" -gt 0 ] || echo "no manager in mode: managed matches DRIFT_SITE='$DRIFT_SITE' (managers in mirror mode are checked by the mirror job)"
-if [ "${#failed[@]}" -gt 0 ]; then
-	echo "error: not checked: ${failed[*]} (above)" >&2
-	exit 1
-fi
-SCAFFOLD_EOF
-mark_executable scripts/drift-job.sh
 
 write_file scripts/cutover.sh <<'SCAFFOLD_EOF'
 #!/usr/bin/env bash
@@ -13655,7 +12228,7 @@ write_file scripts/cutover.sh <<'SCAFFOLD_EOF'
 #    and says what differs.
 # 4. Pushes the branch cutover/<site> and opens the merge request. Merging it is
 #    the cutover. From then on engineers edit those files, or add new ones, in
-#    merge requests; a change made in the UI is drift (scripts/drift-job.sh).
+#    merge requests; a change made in the UI is drift (the watch job).
 #
 # Needs NSX_ADOPT_TOKEN, as the mirror job.
 
@@ -13684,7 +12257,7 @@ branch="cutover/$site"
 mode="$(python3 - "$site" <<'PY'
 import sys
 sys.path.insert(0, "scripts")
-from ci_matrix_lib import managers, mode_of
+from nsxlib.inventory import managers, mode_of
 m = managers().get(sys.argv[1])
 print(mode_of(sys.argv[1], m) if m is not None else "")
 PY
@@ -13896,7 +12469,7 @@ description = "\n".join([
     "",
     "### After merging",
     "- Change these objects by editing their files, and add new objects in new files, in merge requests.",
-    "- A change made in the NSX UI is drift: the drift check raises an issue; no apply undoes it until it is accepted or the revert approved.",
+    "- A change made in the NSX UI is drift: the change watch raises an issue; no apply undoes it until it is accepted or the revert approved.",
     "- Placeholder `why_static` notes still say IMPORTED AS-IS: replace them as the groups are touched.",
 ])
 body = {"title": f"Cut {e['SITE']} over to managed", "description": description}
@@ -14360,7 +12933,7 @@ if [ -f "$REPO_ROOT/inventory/managers.yaml" ] && [ "$DRY" != 1 ]; then
 import sys
 sys.path.insert(0,'scripts')
 try:
-    from ci_matrix_lib import entries
+    from nsxlib.inventory import entries
 except Exception:
     sys.exit(0)
 for r in entries():
@@ -15159,9 +13732,9 @@ write_file scripts/ci-image.sh <<'SCAFFOLD_EOF'
 #
 # The Python packages pinned in deploy/ci-image/requirements.txt (PyYAML) are
 # fetched the same way, with pip in the Python base image: from PyPI through the
-# job proxy, or from NSX_PIP_INDEX_URL (your own PyPI mirror) when set. If that
-# fails the image is still built, validation falls back to its built-in YAML
-# reader, and this exits 2 and tries again next time.
+# job proxy, or from NSX_PIP_INDEX_URL (your own PyPI mirror) when set. Every
+# script that reads data/ needs it. If the fetch fails the image is still built,
+# and this exits 2, says how to fix it, and tries again next time.
 #
 # NSX_CI_IMAGE (default nsx-ci:1). A name that does not start with 'nsx-ci:' is
 # treated as an image from your own registry: it is pulled, not built.
@@ -15381,10 +13954,10 @@ if [ "$label" != "$want" ]; then
 	fi
 	if [[ "$label" == *-nopython* ]]; then
 		printf '%s\n' "${pip_failed:-(no error text)}" | sed 's/^/    /'
-		say "  PyYAML could not be fetched from this host the way jobs reach the internet, so validation"
-		say "  uses its built-in reader, which accepts only the YAML this repository writes. Let the proxy"
-		say "  reach pypi.org and files.pythonhosted.org, or set NSX_PIP_INDEX_URL to your own PyPI mirror,"
-		say "  then run scripts/converge.sh again."
+		say "  PyYAML could not be fetched from this host the way jobs reach the internet. Every job that"
+		say "  reads data/ needs it, and fails saying so until it is there. Let the proxy reach pypi.org and"
+		say "  files.pythonhosted.org, or set NSX_PIP_INDEX_URL to your own PyPI mirror, then run"
+		say "  scripts/converge.sh again."
 		say "CI image $IMAGE built and verified, WITHOUT PyYAML."
 	fi
 	exit 2
@@ -16033,8 +14606,16 @@ plant "credential in a data file" \
 # --------------------------------------------------------------------------
 phase "4. terraform"
 
+if command -v terraform >/dev/null 2>&1; then
+	if (cd "$A" && terraform -chdir=guardrails init -backend=false -input=false >/dev/null 2>&1 &&
+		terraform -chdir=guardrails plan -input=false -lock=false >/dev/null 2>&1); then
+		ok "the guardrails pass on the example data"
+	else
+		bad "the guardrails fail on the example data"
+	fi
+fi
 if ! command -v terraform >/dev/null 2>&1; then
-	skipped "terraform not installed — fmt and validate not run"
+	skipped "terraform not installed — guardrails, fmt and validate not run"
 elif [ "$QUICK" = 1 ]; then
 	if (cd "$A" && terraform fmt -recursive -check . >/dev/null 2>&1); then
 		ok "terraform fmt is clean"
@@ -16649,8 +15230,7 @@ write_file .gitlab-ci.yml <<'SCAFFOLD_EOF'
 #
 # Cutover: Run pipeline on the default branch with CUTOVER_SITE runs only the
 # 'cutover' job, which opens the merge request that takes a manager out of
-# mirror mode. Drift: a schedule with DRIFT_SITE runs only the 'drift' job,
-# which raises changes made in NSX as nsx-drift issues. docs/IMPORT.md.
+# mirror mode. docs/IMPORT.md.
 # Scheduled rules: a schedule with SCHEDULE_FOLLOW=1 runs only the 'schedule'
 # job, which switches them on and off. docs/SCHEDULES.md. Change watch: a
 # schedule or trigger with WATCH_SITE runs only the 'watch' job. docs/WATCH.md.
@@ -16753,23 +15333,6 @@ cutover:
   rules:
     - if: $CUTOVER_SITE && $CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
-# --- drift: changes made in NSX outside the repository -----------------------
-# A pipeline schedule with DRIFT_SITE (a manager in mode: managed, or 'all').
-# A refresh-only plan per manager and stack, read-only; each change found is
-# raised as an nsx-drift issue. Managers in mirror mode: the mirror job does it.
-
-drift:
-  stage: adopt
-  variables:
-    NSX_CRED_SCOPE: plan
-    VAULT_TOKEN: $VAULT_PLAN_TOKEN
-  script:
-    - scripts/drift-job.sh
-  resource_group: nsx-drift
-  interruptible: false
-  rules:
-    - if: $DRIFT_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-
 # --- watch: changes made in NSX, found for one API call ----------------------
 # A pipeline schedule every 5 minutes with WATCH_SITE (a manager in mode:
 # managed, several, or 'all'), and one nightly with WATCH_FULL=1 as well. Or a
@@ -16799,7 +15362,7 @@ accept:
     NSX_CRED_SCOPE: plan
     VAULT_TOKEN: $VAULT_PLAN_TOKEN
   script:
-    - NSX_CRED_SCOPE=plan scripts/with-credentials.sh "$ACCEPT_SITE" -- python3 scripts/accept-drift.py --site "$ACCEPT_SITE" --mr $ACCEPT_KEYS
+    - NSX_CRED_SCOPE=plan scripts/with-credentials.sh "$ACCEPT_SITE" -- python3 scripts/drift.py accept --site "$ACCEPT_SITE" --mr $ACCEPT_KEYS
   interruptible: false
   rules:
     - if: $ACCEPT_SITE && $ACCEPT_KEYS && $CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
@@ -16843,33 +15406,52 @@ schedule:
   rules:
     - if: $SCHEDULE_FOLLOW && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule") && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
+# --- review: what runs on a merge request and on the default branch ---------
+# A pipeline started for one task (ADOPT_SITE, MIRROR_SITE, CUTOVER_SITE,
+# SCHEDULE_FOLLOW, WATCH_SITE, ACCEPT_SITE, HITS_SITE, APPROVAL_SWEEP) runs that
+# task's job alone, so none of these. Defined once, used by each review job.
+.review_rules: &review
+  - if: $ADOPT_SITE && $CI_PIPELINE_SOURCE == "web"
+    when: never
+  - if: $MIRROR_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+    when: never
+  - if: $APPROVAL_SWEEP && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+    when: never
+  - if: $CUTOVER_SITE && $CI_PIPELINE_SOURCE == "web"
+    when: never
+  - if: $SCHEDULE_FOLLOW && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+    when: never
+  - if: $WATCH_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "trigger")
+    when: never
+  - if: $ACCEPT_SITE && $CI_PIPELINE_SOURCE == "web"
+    when: never
+  - if: $HITS_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+    when: never
+  - if: $DRIFT_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+    when: never
+  - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# Retired in 2.0.0: the watch job finds the same changes for one API call. A
+# schedule still setting DRIFT_SITE fails here, saying so, instead of planning
+# every manager.
+drift-retired:
+  stage: validate
+  script:
+    - echo "DRIFT_SITE: the drift check was retired in 2.0.0. Delete this pipeline schedule; the watch job (WATCH_SITE, docs/WATCH.md) covers it." >&2
+    - exit 1
+  rules:
+    - if: $DRIFT_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
+
 # --- validate: offline, no credentials, runs on everything ------------------
 
 data:
   stage: validate
   script:
     - python3 scripts/validate-data.py
-  rules:
-    - if: $ADOPT_SITE && $CI_PIPELINE_SOURCE == "web"
-      when: never
-    - if: $MIRROR_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $APPROVAL_SWEEP && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $CUTOVER_SITE && $CI_PIPELINE_SOURCE == "web"
-      when: never
-    - if: $DRIFT_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $SCHEDULE_FOLLOW && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $WATCH_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "trigger")
-      when: never
-    - if: $ACCEPT_SITE && $CI_PIPELINE_SOURCE == "web"
-      when: never
-    - if: $HITS_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - terraform -chdir=guardrails init -backend=false -input=false >/dev/null
+    - terraform -chdir=guardrails plan -input=false -lock=false
+  rules: *review
 
 terraform:
   stage: validate
@@ -16882,27 +15464,7 @@ terraform:
   # this network, so 'validate' did not run: shown as a warning, never silent.
   allow_failure:
     exit_codes: 42
-  rules:
-    - if: $ADOPT_SITE && $CI_PIPELINE_SOURCE == "web"
-      when: never
-    - if: $MIRROR_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $APPROVAL_SWEEP && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $CUTOVER_SITE && $CI_PIPELINE_SOURCE == "web"
-      when: never
-    - if: $DRIFT_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $SCHEDULE_FOLLOW && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $WATCH_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "trigger")
-      when: never
-    - if: $ACCEPT_SITE && $CI_PIPELINE_SOURCE == "web"
-      when: never
-    - if: $HITS_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *review
 
 # --- generate: turn the inventory into per-manager jobs ---------------------
 
@@ -16914,27 +15476,7 @@ matrix:
   artifacts:
     paths: [generated-pipeline.yml]
     expire_in: 1 week
-  rules:
-    - if: $ADOPT_SITE && $CI_PIPELINE_SOURCE == "web"
-      when: never
-    - if: $MIRROR_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $APPROVAL_SWEEP && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $CUTOVER_SITE && $CI_PIPELINE_SOURCE == "web"
-      when: never
-    - if: $DRIFT_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $SCHEDULE_FOLLOW && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $WATCH_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "trigger")
-      when: never
-    - if: $ACCEPT_SITE && $CI_PIPELINE_SOURCE == "web"
-      when: never
-    - if: $HITS_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *review
 
 # --- plan and apply: one job per manager, from the generated pipeline -------
 
@@ -16946,27 +15488,7 @@ managers:
       - artifact: generated-pipeline.yml
         job: matrix
     strategy: depend
-  rules:
-    - if: $ADOPT_SITE && $CI_PIPELINE_SOURCE == "web"
-      when: never
-    - if: $MIRROR_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $APPROVAL_SWEEP && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $CUTOVER_SITE && $CI_PIPELINE_SOURCE == "web"
-      when: never
-    - if: $DRIFT_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $SCHEDULE_FOLLOW && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $WATCH_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "trigger")
-      when: never
-    - if: $ACCEPT_SITE && $CI_PIPELINE_SOURCE == "web"
-      when: never
-    - if: $HITS_SITE && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "schedule")
-      when: never
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  rules: *review
 SCAFFOLD_EOF
 
 write_file scripts/gitlab-child-pipeline.py <<'SCAFFOLD_EOF'
@@ -16997,7 +15519,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ci_matrix_lib import entries  # noqa: E402
+from nsxlib.inventory import entries  # noqa: E402
 
 DEFAULT_BRANCH = os.environ.get("CI_DEFAULT_BRANCH", "main")
 IS_DEFAULT_BRANCH = os.environ.get("CI_COMMIT_BRANCH") == DEFAULT_BRANCH
@@ -17081,14 +15603,11 @@ def main() -> int:
         # A copy under the manager's name: a job that takes several plans (the
         # change control's) would otherwise get one stack's plan per stack.
         out.append('    - mkdir -p "plans/$SITE/$STACK" && cp "stacks/$STACK/tfplan" "stacks/$STACK/tfplan.site" "plans/$SITE/$STACK/"')
-        # A plan made without refresh carries its marker, so its apply checks revisions first.
-        out.append('    - if [ -f "stacks/$STACK/tfplan.refresh" ]; then cp "stacks/$STACK/tfplan.refresh" "plans/$SITE/$STACK/"; fi')
         out.append("  artifacts:")
         out.append("    name: \"plan-$STACK-$SITE\"")
         out.append("    paths:")
         out.append(f'      - stacks/{row["stack"]}/tfplan')
         out.append(f'      - stacks/{row["stack"]}/tfplan.site')
-        out.append(f'      - stacks/{row["stack"]}/tfplan.refresh')
         out.append(f'      - plans/{row["site"]}/{row["stack"]}/')
         out.append('      - "plan-$STACK-$SITE.txt"')
         out.append("    expire_in: 1 week")
@@ -17264,19 +15783,17 @@ import argparse
 import json
 import os
 import re
-import ssl
 import subprocess
 import sys
-import urllib.error
-import urllib.parse
-import urllib.request
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ci_matrix_lib import entries  # noqa: E402
-from yamlcompat import load_yaml  # noqa: E402
+import nsxlib.gitlab  # noqa: E402
+from nsxlib.gitlab import die  # noqa: E402
+from nsxlib.inventory import entries  # noqa: E402
+from nsxlib.yamlio import load_yaml  # noqa: E402
 
 LABEL = "nsx-change"
 AWAITING = "nsx-awaiting-approval"
@@ -17297,61 +15814,8 @@ STATE = REPO_ROOT / "change-approvals.json"
 PLAN_LINES = 300
 
 
-def die(message: str, code: int = 1) -> None:
-    print(f"error: {message}", file=sys.stderr)
-    raise SystemExit(code)
-
-
-class GitLab:
-    """The few calls this needs, with the token in a header and GitLab's CA."""
-
-    def __init__(self) -> None:
-        self.api = os.environ.get("CI_API_V4_URL", "").rstrip("/")
-        self.project = os.environ.get("CI_PROJECT_ID", "")
-        self.token = os.environ.get("NSX_BOT_TOKEN") or os.environ.get("NSX_ADOPT_TOKEN") or ""
-        if not (self.api and self.project):
-            die("CI_API_V4_URL and CI_PROJECT_ID are not set: this runs in a GitLab job")
-        if not self.token:
-            die("NSX_BOT_TOKEN is not set: a project access token, role Maintainer, scope api, masked and protected")
-        ca = os.environ.get("CI_SERVER_TLS_CA_FILE")
-        self.ctx = ssl.create_default_context(cafile=ca) if ca and Path(ca).is_file() else ssl.create_default_context()
-        # An internal CA without keyUsage is fine for GitLab's runner and git;
-        # Python 3.13's strict checks would refuse it. Chain and name still checked.
-        self.ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
-
-    def call(self, method: str, path: str, body: dict | None = None, query: dict | None = None,
-             missing_ok: bool = False):
-        url = f"{self.api}/projects/{urllib.parse.quote(self.project, safe='')}{path}"
-        if query:
-            url += "?" + urllib.parse.urlencode(query, doseq=True)
-        data = json.dumps(body).encode() if body is not None else None
-        request = urllib.request.Request(url, data=data, method=method)
-        request.add_header("PRIVATE-TOKEN", self.token)
-        if data is not None:
-            request.add_header("Content-Type", "application/json")
-        try:
-            with urllib.request.urlopen(request, context=self.ctx, timeout=60) as response:
-                text = response.read().decode() or "null"
-                return json.loads(text), response.headers
-        except urllib.error.HTTPError as exc:
-            if missing_ok and exc.code == 404:
-                return None, exc.headers
-            detail = exc.read().decode(errors="replace")[:300]
-            die(f"GitLab API {method} {path}: HTTP {exc.code} {detail}")
-        except urllib.error.URLError as exc:
-            die(f"GitLab API {method} {path}: {exc.reason}")
-
-    def get(self, path: str, query: dict | None = None, missing_ok: bool = False):
-        return self.call("GET", path, query=query, missing_ok=missing_ok)[0]
-
-    def get_all(self, path: str, query: dict | None = None) -> list:
-        out: list = []
-        page = "1"
-        while page:
-            data, headers = self.call("GET", path, query=dict(query or {}, per_page=100, page=page))
-            out.extend(data or [])
-            page = (headers.get("X-Next-Page") or "").strip()
-        return out
+class GitLab(nsxlib.gitlab.GitLab):
+    """The shared client, and the two things a change request issue needs."""
 
     def note(self, iid: int, body: str) -> None:
         self.call("POST", f"/issues/{iid}/notes", {"body": body})
@@ -17806,7 +16270,6 @@ while read -r site stack _; do
 		continue
 	fi
 	echo "== $site/$stack" | tee -a "$log"
-	[ ! -f "plans/$site/$stack/tfplan.refresh" ] || cp "plans/$site/$stack/tfplan.refresh" "stacks/$stack/" 2>>"$log"
 	if ! cp "plans/$site/$stack/tfplan" "plans/$site/$stack/tfplan.site" "stacks/$stack/" 2>>"$log"; then
 		echo "error: no saved plan for $site/$stack in this pipeline" | tee -a "$log"
 		status=failed
@@ -17970,8 +16433,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
       - name: Validate data/ and inventory/
         run: python3 scripts/validate-data.py
+      - name: Zero-trust guardrails
+        run: |
+          terraform -chdir=guardrails init -backend=false -input=false >/dev/null
+          terraform -chdir=guardrails plan -input=false -lock=false
 
   terraform:
     name: terraform fmt and validate
@@ -18074,7 +16544,6 @@ jobs:
           path: |
             stacks/${{ matrix.stack }}/tfplan
             stacks/${{ matrix.stack }}/tfplan.site
-            stacks/${{ matrix.stack }}/tfplan.refresh
           retention-days: 7
           if-no-files-found: error
 SCAFFOLD_EOF
@@ -18160,7 +16629,6 @@ jobs:
           path: |
             stacks/${{ matrix.stack }}/tfplan
             stacks/${{ matrix.stack }}/tfplan.site
-            stacks/${{ matrix.stack }}/tfplan.refresh
           retention-days: 7
           if-no-files-found: error
 
@@ -18282,10 +16750,307 @@ The importer prints, on every run, who created what on the manager. An account
 that is a tool, not a person, belongs here.
 SCAFFOLD_EOF
 
+write_file guardrails/main.tf <<'SCAFFOLD_EOF'
+# Zero-trust guardrails, checked by Terraform: offline, no provider, no state,
+# no credentials. The 'data' job runs it on every merge request:
+#
+#   terraform -chdir=guardrails init -backend=false && terraform -chdir=guardrails plan
+#
+# Each guardrail's level is in data/guardrails.yaml, estate-wide and per manager:
+#
+#   enforce   the plan fails, naming each rule, until the rule complies or
+#             carries an exception (owner, ticket, expires) naming the guardrail
+#   warn      a warning in the plan
+#   off       not checked
+#
+# A rule adopted from NSX (a file in data/.import-manifest.json) is a finding,
+# whatever the level: listed in the 'findings' output, a backlog to work down,
+# never a failed pipeline. What each guardrail means: docs/GUARDRAILS.md.
+#
+#   catalog.tf    the guardrails, their default level and NIST controls
+#   inputs.tf     what they are checked against: data/ and inventory/
+#   tests.tf      each guardrail's test, one list of candidates
+#   verdict.tf    levels and exceptions applied: fail, warn, or a finding
+
+terraform {
+  required_version = ">= 1.9"
+}
+SCAFFOLD_EOF
+
+write_file guardrails/catalog.tf <<'SCAFFOLD_EOF'
+locals {
+  # id = default level, NIST reference, what it catches
+  catalog = {
+    any-any-any       = { level = "enforce", nist = "SP 800-207 tenet 3; 800-53 AC-3, AC-6", means = "an ALLOW from any source to any destination on any service" }
+    any-service       = { level = "warn", nist = "800-53 AC-6", means = "an ALLOW on any service: name the ports" }
+    any-source        = { level = "warn", nist = "800-53 AC-6", means = "an ALLOW from any source" }
+    any-destination   = { level = "warn", nist = "800-53 AC-6", means = "an ALLOW to any destination" }
+    dfw-wide-allow    = { level = "warn", nist = "800-53 SC-7(5)", means = "an ALLOW applied to every workload (Apply To ANY, in rule and policy)" }
+    ip-literals       = { level = "warn", nist = "SP 800-207 tenet 4", means = "addresses in a rule: workloads are named by attributes (tags), not addresses" }
+    deny-not-logged   = { level = "warn", nist = "800-53 AU-2, AU-12", means = "a DROP or REJECT with logging off" }
+    allow-not-logged  = { level = "off", nist = "800-53 AU-2, AU-12", means = "an ALLOW with logging off" }
+    prod-nonprod      = { level = "enforce", nist = "800-53 SC-7, AC-4", means = "an ALLOW between production and non-production" }
+    no-default-deny   = { level = "warn", nist = "SP 800-207 tenet 6; 800-53 SC-7(5)", means = "an Application policy whose last rule is not a DROP or REJECT" }
+    static-membership = { level = "warn", nist = "SP 800-207 tenet 4", means = "a group of addresses or picked VMs, not attributes" }
+    exclusion-list    = { level = "enforce", nist = "800-53 SC-7, CM-7; SP 800-207 tenet 1", means = "a group in the DFW exclusion list: its members bypass the firewall entirely" }
+  }
+  rank = { off = 0, warn = 1, enforce = 2 }
+}
+SCAFFOLD_EOF
+
+write_file guardrails/inputs.tf <<'SCAFFOLD_EOF'
+locals {
+  root = "${path.module}/.."
+
+  # data/guardrails.yaml. A level is {level: x} or a bare x; YAML reads a bare off as false.
+  settings   = try(yamldecode(file("${local.root}/data/guardrails.yaml")), {})
+  env_scope  = try(local.settings.env_tag_scope, "env")
+  production = toset(try(local.settings.production, ["prod"]))
+  levels = {
+    for g, d in local.catalog : g => replace(tostring(try(local.settings.guardrails[g].level, local.settings.guardrails[g], d.level)), "false", "off")
+  }
+  site_levels = {
+    for site, overrides in try(local.settings.sites, {}) : site => {
+      for g, s in overrides : g => replace(tostring(try(s.level, s)), "false", "off")
+    }
+  }
+
+  managers = try(yamldecode(file("${local.root}/inventory/managers.yaml")).managers, {})
+  gm_sites = [for name, m in local.managers : name if try(m.role, "lm") == "gm"]
+  lm_sites = [for name, m in local.managers : name if try(m.role, "lm") != "gm"]
+
+  # Files adopted from NSX: what they break is a finding, never a failure.
+  adopted = toset(try(jsondecode(file("${local.root}/data/.import-manifest.json")).imported, []))
+
+  policies = {
+    for f in fileset(local.root, "data/policies/*.yaml") : f => try(yamldecode(file("${local.root}/${f}")), {})
+  }
+  group_files = fileset(local.root, "data/groups/*.yaml")
+  groups = merge([
+    for f in local.group_files : {
+      for k, g in try(yamldecode(file("${local.root}/${f}")).groups, {}) : k => merge(g, { file = f })
+    }
+  ]...)
+  references = merge([
+    for f in local.group_files : try(yamldecode(file("${local.root}/${f}")).references, {})
+  ]...)
+  exclusions = {
+    for f in fileset(local.root, "data/exclude-list/*.yaml") : f => try(yamldecode(file("${local.root}/${f}")).members, {})
+  }
+
+  today = formatdate("YYYY-MM-DD", plantimestamp())
+}
+SCAFFOLD_EOF
+
+write_file guardrails/tests.tf <<'SCAFFOLD_EOF'
+# Each guardrail's test. A candidate is one rule, policy, group or exclusion a
+# guardrail catches; verdict.tf decides what becomes of it.
+
+locals {
+  # The managers a policy is planned on.
+  policy_sites = {
+    for f, doc in local.policies : f => (
+      try(doc.policy.owner, "lm") == "gm" ? local.gm_sites :
+      contains(try(doc.policy.sites, []), "*") ? local.lm_sites :
+      [for s in try(doc.policy.sites, []) : s if s != "*"]
+    )
+  }
+
+  # The environments a group's tag conditions name (env|prod: prod).
+  envs = {
+    for k, g in local.groups : k => toset([
+      for c in flatten([for cr in try(g.criteria, []) : try(cr.conditions, [])]) :
+      trimprefix(tostring(c.value), "${local.env_scope}|")
+      if try(c.key, "Tag") == "Tag" && startswith(tostring(try(c.value, "")), "${local.env_scope}|")
+    ])
+  }
+
+  # A rule's facts, once. ANY is dropped: an empty list means "any".
+  rules = flatten([
+    for f, doc in local.policies : [
+      for key, r in try(doc.rules, {}) : {
+        file      = f
+        label     = "rules.${key}"
+        sites     = local.policy_sites[f]
+        action    = try(r.action, "")
+        src       = [for s in try(r.source_groups, []) : s if s != "ANY"]
+        dst       = [for s in try(r.destination_groups, []) : s if s != "ANY"]
+        svc       = concat([for s in try(r.services, []) : s if s != "ANY"], keys(try(r.service_entries, {})))
+        logged    = try(r.logged, true) != false
+        wide      = length([for s in concat(try(r.scope, []), try(doc.policy.scope, [])) : s if s != "ANY"]) == 0
+        exception = try(r.exception, null)
+      } if can(keys(r))
+    ]
+  ])
+
+  # Production on one side, anything else on the other: " (prod -> dev)"; "" if not.
+  crossing = [
+    for r in local.rules : [
+      for pair in [{
+        src = setunion([], [for n in r.src : try(local.envs[n], [])]...)
+        dst = setunion([], [for n in r.dst : try(local.envs[n], [])]...)
+        }] : length(pair.src) > 0 && length(pair.dst) > 0 && (
+        (length(setintersection(pair.src, local.production)) > 0 && length(setsubtract(pair.dst, local.production)) > 0) ||
+        (length(setintersection(pair.dst, local.production)) > 0 && length(setsubtract(pair.src, local.production)) > 0)
+      ) ? " (${join(", ", sort(pair.src))} -> ${join(", ", sort(pair.dst))})" : ""
+    ][0]
+  ]
+
+  # An address, CIDR or range (a-b, or a - b as the NSX UI writes it) where a group belongs.
+  known_groups = setunion(keys(local.groups), keys(local.references))
+  is_address = {
+    for name in distinct(flatten([for r in local.rules : concat(r.src, r.dst)])) :
+    name => !contains(local.known_groups, name) && trimspace(name) == name && alltrue([
+      for part in split("-", name) :
+      can(cidrhost(trimspace(part), 0)) || can(cidrhost("${trimspace(part)}/32", 0)) || can(cidrhost("${trimspace(part)}/128", 0))
+    ])
+  }
+
+  rule_candidates = flatten([
+    for i, r in local.rules : [
+      for g, caught in {
+        any-any-any      = r.action == "ALLOW" && length(concat(r.src, r.dst, r.svc)) == 0
+        any-service      = r.action == "ALLOW" && length(r.svc) == 0 && length(concat(r.src, r.dst)) > 0
+        any-source       = r.action == "ALLOW" && length(r.src) == 0 && length(concat(r.dst, r.svc)) > 0
+        any-destination  = r.action == "ALLOW" && length(r.dst) == 0 && length(concat(r.src, r.svc)) > 0
+        dfw-wide-allow   = r.action == "ALLOW" && r.wide
+        allow-not-logged = r.action == "ALLOW" && !r.logged
+        deny-not-logged  = contains(["DROP", "REJECT"], r.action) && !r.logged
+        prod-nonprod     = r.action == "ALLOW" && local.crossing[i] != ""
+        ip-literals      = anytrue([for s in concat(r.src, r.dst) : local.is_address[s]])
+        } : {
+        guardrail = g, file = r.file, label = r.label, sites = r.sites, exception = r.exception
+        detail    = g == "prod-nonprod" ? local.crossing[i] : ""
+      } if caught
+    ]
+  ])
+
+  # An Application policy whose last rule, by sequence number, is not a DROP or REJECT.
+  policy_candidates = [
+    for f, doc in local.policies : {
+      guardrail = "no-default-deny", file = f, label = "policy", sites = local.policy_sites[f], exception = null, detail = ""
+      } if try(doc.policy.category, "") == "Application" && length(try(doc.rules, {})) > 0 && !contains(["DROP", "REJECT"], try(
+        doc.rules[reverse(sort([
+          for k, r in doc.rules : k if try(r.sequence_number, 0) == max([for x in values(doc.rules) : try(x.sequence_number, 0)]...)
+        ]))[0]].action, ""
+    ))
+  ]
+
+  # A group of addresses or picked VMs: every criterion static.
+  group_candidates = [
+    for k, g in local.groups : {
+      guardrail = "static-membership", file = g.file, label = "group ${k}", exception = null, detail = ""
+      sites     = try(g.owner, "lm") == "gm" ? local.gm_sites : [for s in try(g.sites, []) : s if s != "*"]
+      } if length(try(g.criteria, [])) > 0 && alltrue([
+        for c in try(g.criteria, []) : length(concat(try(c.ip_addresses, []), try(c.external_ids, []), try(c.mac_addresses, []))) > 0
+    ])
+  ]
+
+  # A group in a manager's DFW exclusion list (data/exclude-list/<manager>.yaml).
+  exclusion_candidates = flatten([
+    for f, members in local.exclusions : [
+      for name, m in members : {
+        guardrail = "exclusion-list", file = f, label = "members.${name}", detail = ""
+        sites     = [trimsuffix(basename(f), ".yaml")], exception = try(m.exception, null)
+      }
+    ]
+  ])
+
+  candidates = concat(local.rule_candidates, local.policy_candidates, local.group_candidates, local.exclusion_candidates)
+}
+SCAFFOLD_EOF
+
+write_file guardrails/verdict.tf <<'SCAFFOLD_EOF'
+# What becomes of each candidate: its level (the strictest of the managers it
+# is planned on), less a current exception naming the guardrail. Written here:
+# enforce fails the plan, warn warns. Adopted from NSX: a finding.
+
+locals {
+  # An exception lets a rule off the guardrails it names: owned, tracked, ending.
+  exceptions = [
+    for x in concat(
+      [for r in local.rules : { file = r.file, label = r.label, e = r.exception } if r.exception != null],
+      [for c in local.exclusion_candidates : { file = c.file, label = c.label, e = c.exception } if c.exception != null],
+      ) : merge(x, {
+        missing = [for f in ["guardrails", "owner", "ticket", "expires"] : f if try(length(x.e[f]), length(tostring(x.e[f])), 0) == 0]
+        ends    = substr(tostring(try(x.e.expires, "")), 0, 10) # a YAML date may come back with a time
+        unknown = sort(setsubtract(try(x.e.guardrails, []), keys(local.catalog)))
+    })
+  ]
+  exception_problems = flatten([
+    for x in local.exceptions : compact([
+      length(x.missing) > 0 ? "${x.file}: ${x.label}.exception: needs ${join(", ", x.missing)}: an exception is owned, tracked and ends" :
+      !can(timecmp("${x.ends}T00:00:00Z", plantimestamp())) ? "${x.file}: ${x.label}.exception.expires: not a date (YYYY-MM-DD)" :
+      timecmp("${x.ends}T00:00:00Z", "${local.today}T00:00:00Z") < 0 ? "${x.file}: ${x.label}.exception expired on ${x.ends}: renew it, or bring it within the guardrails" : "",
+      length(x.unknown) > 0 ? "${x.file}: ${x.label}.exception: unknown guardrail(s) ${join(", ", x.unknown)}" : "",
+    ])
+  ])
+  exempt = {
+    for x in local.exceptions : "${x.file}|${x.label}" => x.e.guardrails
+    if length(x.missing) == 0 && can(timecmp("${x.ends}T00:00:00Z", plantimestamp())) && try(timecmp("${x.ends}T00:00:00Z", "${local.today}T00:00:00Z") >= 0, false)
+  }
+
+  checked = [
+    for c in local.candidates : merge(c, {
+      # An unknown level is an error (settings_problems); meanwhile, the strictest.
+      level = try([for l in ["enforce", "warn", "off"] : l if contains(
+        length(c.sites) > 0 ? [for s in c.sites : try(local.site_levels[s][c.guardrail], local.levels[c.guardrail])] : [local.levels[c.guardrail]], l
+      )][0], "enforce")
+      exempt  = contains(try(local.exempt["${c.file}|${c.label}"], []), c.guardrail)
+      adopted = contains(local.adopted, c.file)
+      text    = "${c.file}: ${c.label}: guardrail ${c.guardrail} (${local.catalog[c.guardrail].nist}): ${local.catalog[c.guardrail].means}${c.detail}"
+    })
+  ]
+
+  settings_problems = concat(
+    [for g in keys(try(local.settings.guardrails, {})) : "data/guardrails.yaml: unknown guardrail ${g} (known: ${join(", ", keys(local.catalog))})" if !contains(keys(local.catalog), g)],
+    [for g, l in local.levels : "data/guardrails.yaml: ${g}: level ${l} is not enforce, warn or off" if !contains(keys(local.rank), l)],
+    flatten([for s, o in local.site_levels : [
+      for g, l in o : "data/guardrails.yaml: sites.${s}.${g}: unknown guardrail or level" if !contains(keys(local.catalog), g) || !contains(keys(local.rank), l)
+    ]]),
+  )
+
+  failures = concat(
+    local.settings_problems,
+    local.exception_problems,
+    [for c in local.checked : "${c.text}. Change the rule, or record an exception (owner, ticket, expires)." if c.level == "enforce" && !c.exempt && !c.adopted],
+  )
+  warnings = [for c in local.checked : c.text if c.level == "warn" && !c.exempt && !c.adopted]
+  findings = [for c in local.checked : c if c.level != "off" && !c.exempt && c.adopted]
+}
+
+output "verdict" {
+  description = "Failures, warnings, and findings in what was adopted from NSX."
+  value       = "${length(local.failures)} failure(s), ${length(local.warnings)} warning(s), ${length(local.findings)} finding(s) in rules adopted from NSX"
+
+  precondition {
+    condition = length(local.failures) == 0
+    error_message = join("\n", concat(
+      ["Guardrails failed. Change each rule, or record an exception (owner, ticket, expires) naming the guardrail:", ""],
+      local.failures,
+      length(local.warnings) > 0 ? ["", "Warnings, not blocking:", ""] : [],
+      local.warnings,
+    ))
+  }
+}
+
+output "findings" {
+  description = "What rules adopted from NSX break, per guardrail: a backlog to work down, never a failed pipeline."
+  value       = { for g in distinct([for c in local.findings : c.guardrail]) : g => [for c in local.findings : c.text if c.guardrail == g] }
+}
+
+check "warnings" {
+  assert {
+    condition     = length(local.warnings) == 0
+    error_message = "Guardrail warnings:\n\n${join("\n", local.warnings)}"
+  }
+}
+SCAFFOLD_EOF
+
 write_file data/guardrails.yaml <<'SCAFFOLD_EOF'
 # Zero-trust guardrails: every merge request is checked against them by
-# scripts/validate-data.py. docs/GUARDRAILS.md has what each one means and the
-# NIST control behind it.
+# Terraform itself (guardrails/, the 'data' job; locally: make guardrails).
+# docs/GUARDRAILS.md has what each one means and the NIST control behind it.
 #
 #   enforce   the merge request fails until the rule complies or carries an
 #             exception (owner, ticket, expires) naming the guardrail

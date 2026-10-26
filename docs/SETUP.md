@@ -14,7 +14,7 @@ manager" is offline.
 ```bash
 bash          # 4.x or later
 coreutils
-python3       # 3.9+. PyYAML optional — there is a fallback parser.
+python3       # 3.9+, with PyYAML (pip install pyyaml; the CI image has it)
 terraform     # 1.9+
 git
 ```

@@ -21,10 +21,13 @@
 #   CONFLICT   both changed it, or no record of last time    kept unless
 #                                                            --overwrite-unknown
 #
+#   RETIRED    the generator no longer writes it, and you    removed
+#              did not change it
+#
 # Estate data (data/, inventory/, envs/) is never changed: a starter file a new
-# release introduces there is created only when the tree has none. Nothing
-# is ever deleted. Every file that is overwritten is first copied to
-# .nsx-update-backup/<timestamp>/ in your tree.
+# release introduces there is created only when the tree has none. A retired
+# file you changed is kept, and listed. Every file that is overwritten or
+# removed is first copied to .nsx-update-backup/<timestamp>/ in your tree.
 #
 #   --remote NAME|URL   where to pull this repository from   (default: origin)
 #   --branch NAME       branch to pull                        (default: main)
@@ -290,6 +293,20 @@ while IFS= read -r rel; do
 	fi
 done < <(cd "$FRESH" && find . -type f -not -path './.git/*' | LC_ALL=C sort)
 
+# What the generator wrote last time and writes no more (a script folded into
+# another, say): removed when you did not change it, listed when you did.
+RETIRED=() RETIRED_KEPT=()
+if [ -f "$TARGET/$BASELINE" ]; then
+	while read -r base rel; do
+		[ -e "$FRESH/$rel" ] || [ ! -f "$TARGET/$rel" ] || is_estate_data "$rel" && continue
+		if [ "$(hash_of "$TARGET/$rel")" = "$base" ]; then
+			RETIRED+=("$rel")
+		else
+			RETIRED_KEPT+=("$rel")
+		fi
+	done <"$TARGET/$BASELINE"
+fi
+
 show_diff() { diff -u --label "your tree: $1" --label "generator now: $1" "$TARGET/$1" "$FRESH/$1" | sed 's/^/    /' || true; }
 
 say ""
@@ -298,7 +315,7 @@ say "generator   $GEN_ROOT @ $GEN_REV (release $GEN_VERSION)"
 say "tree        is at release ${TREE_VERSION:-unrecorded}"
 release_notes
 say ""
-say "  ${#NEW[@]} new   ${#UPDATE[@]} update   ${#LOCAL[@]} yours, kept   ${#CONFLICT[@]} conflict   ${#SAME[@]} unchanged"
+say "  ${#NEW[@]} new   ${#UPDATE[@]} update   ${#RETIRED[@]} retired   ${#LOCAL[@]} yours, kept   ${#CONFLICT[@]} conflict   ${#SAME[@]} unchanged"
 say "  (data/, inventory/ and envs/ are never changed; a starter file missing there is created)"
 
 if [ "${#NEW[@]}" -gt 0 ]; then
@@ -313,6 +330,17 @@ if [ "${#UPDATE[@]}" -gt 0 ]; then
 		say "  ~ $r"
 		[ "$SUMMARY" = 1 ] || show_diff "$r"
 	done
+fi
+if [ "${#RETIRED[@]}" -gt 0 ]; then
+	say ""
+	say "RETIRED — the generator no longer writes these, and you did not change them; will be removed"
+	printf '  - %s\n' "${RETIRED[@]}"
+fi
+if [ "${#RETIRED_KEPT[@]}" -gt 0 ]; then
+	say ""
+	say "RETIRED, BUT YOURS — the generator no longer writes these, and you changed them; left alone."
+	say "                    Remove each once nothing of yours needs it."
+	printf '  = %s\n' "${RETIRED_KEPT[@]}"
 fi
 if [ "${#CONFLICT[@]}" -gt 0 ]; then
 	say ""
@@ -353,7 +381,7 @@ report_kept() {
 TO_APPLY=(${NEW[@]+"${NEW[@]}"} ${UPDATE[@]+"${UPDATE[@]}"})
 [ "$OVERWRITE_UNKNOWN" = 1 ] && TO_APPLY+=(${CONFLICT[@]+"${CONFLICT[@]}"})
 
-if [ "${#TO_APPLY[@]}" -eq 0 ]; then
+if [ "${#TO_APPLY[@]}" -eq 0 ] && [ "${#RETIRED[@]}" -eq 0 ]; then
 	say ""
 	if [ "${#CONFLICT[@]}" -gt 0 ]; then
 		say "nothing is applied automatically. Review the CONFLICT files above."
@@ -377,7 +405,7 @@ fi
 
 if [ "$CHECK" = 1 ]; then
 	say ""
-	say "${#TO_APPLY[@]} change(s) pending. Run scripts/update.sh to apply."
+	say "$((${#TO_APPLY[@]} + ${#RETIRED[@]})) change(s) pending. Run scripts/update.sh to apply."
 	converge >/dev/null 2>&1 || true
 	exit 3
 fi
@@ -387,7 +415,7 @@ fi
 if [ "$YES" != 1 ]; then
 	[ -t 0 ] || die "no terminal to ask on. Review with --check, then pass --yes."
 	say ""
-	printf 'Apply %d change(s) to %s? [y/N] ' "${#TO_APPLY[@]}" "$TARGET"
+	printf 'Apply %d change(s) to %s? [y/N] ' "$((${#TO_APPLY[@]} + ${#RETIRED[@]}))" "$TARGET"
 	reply=""
 	IFS= read -r reply
 	case "$reply" in
@@ -426,6 +454,12 @@ for r in "${TO_APPLY[@]}"; do
 		die "could not write $r. Originals are in $BACKUP; nothing else was changed after this point."
 done
 
+for r in ${RETIRED[@]+"${RETIRED[@]}"}; do
+	mkdir -p "$BACKUP/$(dirname "$r")"
+	cp -p "$TARGET/$r" "$BACKUP/$r" && rm -f "$TARGET/$r" ||
+		die "could not remove $r. Originals are in $BACKUP; nothing else was changed after this point."
+done
+
 # Record what the generator wrote, for every file now identical to it, so the
 # next update can tell its own changes from yours. A file that stayed as yours
 # keeps the record it already had.
@@ -433,7 +467,7 @@ done
 	for rel in ${SAME[@]+"${SAME[@]}"} ${TO_APPLY[@]+"${TO_APPLY[@]}"}; do
 		printf '%s  %s\n' "$(hash_of "$FRESH/$rel")" "$rel"
 	done
-	for rel in ${LOCAL[@]+"${LOCAL[@]}"} ${CONFLICT[@]+"${CONFLICT[@]}"}; do
+	for rel in ${LOCAL[@]+"${LOCAL[@]}"} ${CONFLICT[@]+"${CONFLICT[@]}"} ${RETIRED_KEPT[@]+"${RETIRED_KEPT[@]}"}; do
 		cmp -s "$FRESH/$rel" "$TARGET/$rel" && continue
 		b="$(baseline_of "$rel")"
 		[ -n "$b" ] && printf '%s  %s\n' "$b" "$rel"
@@ -448,7 +482,7 @@ if [ -d "$BACKUP" ]; then
 	say "originals saved in $BACKUP"
 fi
 say ""
-say "applied ${#TO_APPLY[@]} change(s)."
+say "applied $((${#TO_APPLY[@]} + ${#RETIRED[@]})) change(s)."
 
 # Things that need a human to act, not an update to do silently.
 followups=()
@@ -471,7 +505,7 @@ crc=$?
 
 if [ "$COMMIT" = 1 ]; then
 	# Only the files this run wrote, never whatever else is lying around.
-	for r in ${TO_APPLY[@]+"${TO_APPLY[@]}"} "$BASELINE" "$VERSION_FILE"; do
+	for r in ${TO_APPLY[@]+"${TO_APPLY[@]}"} ${RETIRED[@]+"${RETIRED[@]}"} "$BASELINE" "$VERSION_FILE"; do
 		git -C "$TARGET" add -- "$r" 2>/dev/null
 	done
 	# The same update on the same parent gives the same commit id on every server

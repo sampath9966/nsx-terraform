@@ -13,6 +13,56 @@ running `scripts/converge.sh`, which brings the host (CI image, runner, GitLab
 container) to what the release expects and tells you plainly about anything it
 cannot fix itself. Run it again after fixing whatever it reported.
 
+## 2.0.0
+
+**A release that deletes.** Same behaviour, less to read (the generated
+scripts: 44 files and 7,243 lines of Python before, 37 and 5,885 now), and every
+piece where you would look for it.
+
+**The guardrails are Terraform.** `guardrails/` is a root module with no
+provider, no state and no credentials. On every merge request (the `data` job;
+locally `make guardrails`) it checks every rule in data/ against
+`data/guardrails.yaml`: an enforced guardrail is a precondition that fails the
+plan, a warning is a `check` block, and what was adopted from NSX is listed in
+the `findings` output. Each guardrail is one readable line of HCL in
+`guardrails/tests.tf`. One change in meaning: a rule planned on several
+managers gets the strictest level among them (before, a manager with no
+override of its own could be passed over).
+
+**One library, thin commands.** `scripts/nsxlib/` holds the logic once:
+`inventory`, `model` (data/), `nsx` (reading NSX), `convert`, `adopt`, `drift`,
+`schedules`, `gitlab`, `yamlio`. Every script is a command line over it and none
+loads another script. `import-estate.py` went from 1,650 lines to 370.
+
+**Fewer commands.**
+- `scripts/drift.py watch | changed | mirror | accept` replaces `nsx-watch.py`,
+  `drift-issue.py` and `accept-drift.py`.
+- `scripts/schedule.py convert` replaces `convert-time-windows.py`.
+- `scripts/nsxlib/inventory.py` replaces `ci_matrix_lib.py`.
+
+**Deleted, because something else already does it.**
+- The refresh-only drift check (the `drift` job, `DRIFT_SITE`, `drift.sh`,
+  `drift-job.sh`): the change watch finds the same changes for one API call
+  instead of a full refresh of every stack, and plan-guard refuses to undo any
+  of them. A pipeline schedule still setting `DRIFT_SITE` now fails at once and
+  says so, instead of planning every manager. `make drift` still runs a
+  refresh-only plan by hand.
+- Plans without a refresh (`NSX_PLAN_REFRESH=changed`, `revision-check.py`):
+  the watch already reports every change made in NSX.
+- The fallback YAML reader (`yamlcompat.py`): PyYAML is required, and the CI
+  image has always had it.
+
+**`update.sh` removes what a release retires**: a file the generator no longer
+writes is removed if you never changed it (backed up first, like everything it
+replaces); one you changed is kept and listed.
+
+After upgrading: delete any pipeline schedule that sets `DRIFT_SITE`. The
+`watch` schedules (`WATCH_SITE`, every 5 minutes, and `WATCH_FULL=1` nightly,
+docs/WATCH.md) cover it.
+
+**Fixed:** `modules/dfw-policy/main.tf` was not in `terraform fmt` form, so
+`fmt-check` failed on a fresh tree.
+
 ## 1.9.0
 
 **Cut over in slices.** `CUTOVER_POLICY` (with `CUTOVER_SITE`) cuts over only the named policies: their files become ordinary data files and the manager becomes `mode: hybrid`. The policies cut over are managed (plans, applies, guardrails, drift); everything else stays mirrored from the UI, and plan-guard refuses any apply that would change it. The mirror leaves the policies cut over to their files; the watch and the drift check leave what is still mirrored to the mirror. Proven with the real provider. The last cutover makes the manager `mode: managed`.

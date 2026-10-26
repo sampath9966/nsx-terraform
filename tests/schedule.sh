@@ -118,9 +118,10 @@ YAML
 
 echo "the schedule itself"
 python3 - <<'PY'
-import importlib.util, sys
+import sys
 from datetime import datetime, timezone
-spec = importlib.util.spec_from_file_location("s", "scripts/schedule.py"); s = importlib.util.module_from_spec(spec); spec.loader.exec_module(s)
+sys.path.insert(0, "scripts")
+from nsxlib import schedules as s
 office = {"timezone": "Asia/Kolkata", "windows": [{"days": ["MON", "TUE", "WED", "THU", "FRI"], "from": "09:00", "to": "18:00"}], "owner": "x"}
 night = {"timezone": "Asia/Kolkata", "windows": [{"days": ["SAT"], "from": "22:00", "to": "02:00"}], "owner": "x",
          "starts": "2026-11-01", "expires": "2026-12-31 18:00"}
@@ -147,8 +148,9 @@ sys.exit(1 if bad else 0)
 PY
 check "windows, days, past midnight, starts and expires, in the schedule's own zone" test $? -eq 0
 python3 - <<'PY'
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location("s", "scripts/schedule.py"); s = importlib.util.module_from_spec(spec); spec.loader.exec_module(s)
+import sys
+sys.path.insert(0, "scripts")
+from nsxlib import schedules as s
 p = s.problems({"timezone": "Mars/Olympus", "owner": "x"})
 q = s.problems({"timezone": "UTC", "windows": [{"days": ["FUNDAY"], "from": "9", "to": "25:00"}], "starts": "2026-12-01", "expires": "2026-11-01"})
 ok = "unknown time zone" in p[0] and any("owner is required" in x for x in q) and any("FUNDAY" in x for x in q) \
@@ -207,26 +209,8 @@ check "...as is a change to any other resource" bash -c '! python3 scripts/plan-
 check "...and a create or a delete" bash -c '! python3 scripts/plan-guard.py --site lon1 --stack local-security --schedule <<<"$1" && ! python3 scripts/plan-guard.py --site lon1 --stack local-security --schedule <<<"$2"' _ "$(guard_plan create nsxt_policy_security_policy_rule disabled)" "$(guard_plan delete nsxt_policy_security_policy_rule disabled)"
 check "the follower plans only the rules to switch, without reading NSX, and passes the guard" bash -c 'grep -q "run plan -refresh=false -out=tfplan -input=false \"\${targets\[@\]}\"" scripts/tf.sh && grep -q "guard --schedule" scripts/tf.sh && grep -q "NSX not contacted" scripts/tf.sh'
 
-echo "the drift check knows the schedules"
-python3 - <<'PY'
-import importlib.util, json, os, sys
-os.environ["NSX_SCHEDULE_NOW"] = "2026-11-07T17:00:00Z"  # Saturday night: office-hours is off
-spec = importlib.util.spec_from_file_location("d", "scripts/drift-issue.py"); d = importlib.util.module_from_spec(spec); spec.loader.exec_module(d)
-def res(rule, disabled): return {"address": f'module.policies["erp"].nsxt_policy_security_policy_rule.this["{rule}"]',
-                                 "type": "nsxt_policy_security_policy_rule", "values": {"disabled": disabled}}
-plan = {"prior_state": {"values": {"root_module": {"child_modules": [{"resources": [
-    res("office-hours", False), res("night-maintenance", True), res("always", False)]}]}}}}
-items = []
-d.schedule_items("lon1", "local-security", plan, items)
-by = {i["key"].split('"')[3]: i for i in items}
-ok = set(by) == {"office-hours", "night-maintenance"} and by["office-hours"]["severity"] == "high" \
-    and "ON outside its schedule" in by["office-hours"]["detail"] and "OFF inside its schedule" in by["night-maintenance"]["detail"] \
-    and by["night-maintenance"].get("severity") != "high"
-sys.exit(0 if ok else 1)
-PY
-check "a rule on outside its schedule is high severity; one off inside it, or a missed switch, is raised too" test $? -eq 0
-check "the drift check reads the plan with no drift too, for a missed switch" bash -c 'grep -q "\[ \"\$status\" = 0 \]" scripts/tf.sh && grep -q "0 | 2)" scripts/drift-job.sh'
-check "a high-severity drift issue says so in its title and label" bash -c 'grep -q "\[HIGH\] " scripts/drift-issue.py && grep -q "severity::high" scripts/drift-issue.py'
+echo "the change watch knows the schedules"
+check "a high-severity drift issue says so in its title and label (tests/watch.sh: a rule on outside its window)" bash -c 'grep -q "\[HIGH\] " scripts/nsxlib/drift.py && grep -q "severity::high" scripts/nsxlib/drift.py'
 
 echo "expiry"
 out="$(NSX_SCHEDULE_NOW=2026-12-28T00:00:00Z python3 scripts/schedule.py report)"
@@ -290,18 +274,19 @@ sch = {"results": [
      "start_date": "2026-11-10", "start_time": "20:00", "end_date": "2026-11-11", "end_time": "04:00", "time_zone": "UTC"}]}
 json.dump(dump, open("reports/lon1-raw.json", "w")); json.dump(sch, open("reports/lon1-sch.json", "w"))
 PY
-out="$(python3 scripts/convert-time-windows.py --site lon1 --from-dump reports/lon1-raw.json --schedulers reports/lon1-sch.json 2>&1)"
+out="$(python3 scripts/schedule.py convert --site lon1 --from-dump reports/lon1-raw.json --schedulers reports/lon1-sch.json 2>&1)"
 R="$(cat reports/time-windows-lon1.md 2>/dev/null)"
 check "a recurring window becomes windows, starts and an expiry the day after its end date" bash -c 'grep -q "## data/policies/pay.yaml, rule Vendor-Night (Vendor Night)" <<<"$1" && grep -q "days: \[SAT, SUN\]" <<<"$1" && grep -q "from: \"22:00\"" <<<"$1" && grep -q "expires: 2027-01-01" <<<"$1"' _ "$R"
 check "a window set on a policy is converted for each of its rules; a one-off one by starts and expires" bash -c 'grep -q "windowed.yaml, rule a" <<<"$1" && grep -q "windowed.yaml, rule b" <<<"$1" && grep -q "starts: \"2026-11-10 20:00\"" <<<"$1"' _ "$R"
 check "a window in the manager's local time is not guessed: it asks for --timezone" bash -c 'grep -q "NOT CONVERTED  data/policies/pay.yaml, rule local: .*--timezone" <<<"$1"' _ "$out"
 check "a window with a field this does not know is not converted, and says which" grep -q "rule odd: its time window odd carries interval_minutes" <<<"$out"
 check "owner is left for a person to fill in" grep -q "owner: \"TODO" <<<"$R"
-out="$(python3 scripts/convert-time-windows.py --site lon1 --from-dump reports/lon1-raw.json --schedulers reports/lon1-sch.json --timezone Asia/Kolkata 2>&1)"
+out="$(python3 scripts/schedule.py convert --site lon1 --from-dump reports/lon1-raw.json --schedulers reports/lon1-sch.json --timezone Asia/Kolkata 2>&1)"
 check "...and with --timezone it is converted in that zone" bash -c 'grep -q "timezone: Asia/Kolkata" reports/time-windows-lon1.md && ! grep -q "rule local:" <<<"$1"' _ "$out"
 check "a converted block, owner filled in, validates" python3 - <<'PY'
-import importlib.util, re, sys
-spec = importlib.util.spec_from_file_location("s", "scripts/schedule.py"); s = importlib.util.module_from_spec(spec); spec.loader.exec_module(s)
+import re, sys
+sys.path.insert(0, "scripts")
+from nsxlib import schedules as s
 import yaml
 text = open("reports/time-windows-lon1.md").read()
 blocks = [yaml.safe_load(b) for b in re.findall(r"```yaml\n(.*?)```", text, re.S)]

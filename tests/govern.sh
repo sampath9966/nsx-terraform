@@ -53,6 +53,21 @@ rule() { # key action src dst services [extra yaml lines]
 	printf '  %s:\n    sequence_number: %s\n    action: %s\n    direction: IN_OUT\n    source_groups: [%s]\n    destination_groups: [%s]\n    services: [%s]\n    scope: [web-prod]\n%s' \
 		"$1" "$2" "$3" "$4" "$5" "$6" "${7:-}"
 }
+guard() { # the guardrails' verdict (guardrails/, Terraform): one ERROR or warning line each
+	terraform -chdir=guardrails init -backend=false -input=false >/dev/null 2>&1
+	terraform -chdir=guardrails plan -input=false -lock=false -json 2>/dev/null | python3 -c '
+import json, sys
+for line in sys.stdin:
+    d = json.loads(line).get("diagnostic") or {}
+    tag = "ERROR   " if d.get("severity") == "error" else "warning "
+    for text in (d.get("detail") or "").splitlines():
+        if text == "Warnings, not blocking:":
+            tag = "warning "
+        elif text and not text.startswith(("Guardrails failed", "Guardrail warnings", "Warnings")):
+            print(tag, text)
+'
+}
+export -f guard
 write_policy() { # name, then rules on stdin
 	{ printf 'policy:\n  id: %s\n  name: %s\n  category: Application\n  owner: lm\n  sites: [lon1]\n  scope: [web-prod]\n  rule_management: standalone\nrules:\n' "$1" "$1"; cat; } >"data/policies/$1.yaml"
 }
@@ -68,7 +83,7 @@ $(rule quiet-drop 600 DROP ANY ANY ANY "    logged: false
 ")
 YAML
 printf 'predefined_ids:\n  HTTPS: HTTPS\n' >data/services/predefined.yaml
-out="$(python3 scripts/validate-data.py 2>&1)"
+out="$(guard)"
 check "an ALLOW any to any on any service is refused, naming the NIST control" grep -q "ERROR .*rules.any-any: guardrail any-any-any (SP 800-207 tenet 3; 800-53 AC-3, AC-6)" <<<"$out"
 check "an ALLOW from non-production to production is refused" grep -q "ERROR .*rules.cross-env: guardrail prod-nonprod .*(dev -> prod)" <<<"$out"
 check "any service, an address, a quiet drop, no final deny: warnings" bash -c 'grep -q "warning .*rules.any-svc: guardrail any-service" <<<"$1" && grep -q "warning .*rules.addresses: guardrail ip-literals" <<<"$1" && grep -q "warning .*rules.quiet-drop: guardrail deny-not-logged" <<<"$1"' _ "$out"
@@ -80,7 +95,7 @@ cat >>data/policies/app.yaml <<'YAML'
     direction: IN_OUT
     scope: [web-prod]
 YAML
-check "...and a policy ending in a DROP satisfies no-default-deny" bash -c '! python3 scripts/validate-data.py 2>&1 | grep -q "no-default-deny"'
+check "...and a policy ending in a DROP satisfies no-default-deny" bash -c '! guard | grep -q "no-default-deny"'
 
 echo "exceptions: owned, tracked, ending"
 python3 - <<'PY'
@@ -89,11 +104,11 @@ t = t.replace("  any-any:\n", "  any-any:\n    exception:\n      guardrails: [an
 t = t.replace("  cross-env:\n", "  cross-env:\n    exception:\n      guardrails: [prod-nonprod]\n      owner: net-team\n      ticket: CHG2\n      expires: 2020-01-01\n", 1)
 open("data/policies/app.yaml", "w").write(t)
 PY
-out="$(python3 scripts/validate-data.py 2>&1)"
+out="$(guard)"
 check "a current exception lets the rule off that guardrail" bash -c '! grep -q "rules.any-any: guardrail any-any-any" <<<"$1"' _ "$out"
 check "an expired one does not, and is itself an error" bash -c 'grep -q "rules.cross-env.exception expired on 2020-01-01" <<<"$1" && grep -q "rules.cross-env: guardrail prod-nonprod" <<<"$1"' _ "$out"
 sed -i 's/      ticket: CHG1//' data/policies/app.yaml
-check "an exception without its ticket is an error" bash -c 'python3 scripts/validate-data.py 2>&1 | grep -q "rules.any-any.exception: needs ticket"'
+check "an exception without its ticket is an error" bash -c 'guard | grep -q "rules.any-any.exception: needs ticket"'
 
 echo "levels: admins decide, per manager too"
 cat >data/guardrails.yaml <<'YAML'
@@ -104,30 +119,33 @@ sites:
   lon1:
     any-service: {level: warn}
 YAML
-out="$(python3 scripts/validate-data.py 2>&1)"
+out="$(guard)"
 check "a guardrail turned off, even written bare (YAML's false), is not checked" bash -c '! grep -q "ip-literals" <<<"$1"' _ "$out"
 check "a manager's own level wins: any-service is a warning on lon1 though enforced elsewhere" grep -q "warning .*rules.any-svc: guardrail any-service" <<<"$out"
 printf 'guardrails:\n  made-up: {level: enforce}\n  any-source: {level: maybe}\n' >data/guardrails.yaml
-out="$(python3 scripts/validate-data.py 2>&1)"
-check "an unknown guardrail or level is an error" bash -c 'grep -q "unknown guardrail .made-up." <<<"$1" && grep -q "any-source: level .maybe. is not enforce, warn or off" <<<"$1"' _ "$out"
+out="$(guard)"
+check "an unknown guardrail or level is an error" bash -c 'grep -q "unknown guardrail made-up" <<<"$1" && grep -q "any-source: level maybe is not enforce, warn or off" <<<"$1"' _ "$out"
 rm data/guardrails.yaml
 
 echo "rules adopted from NSX: findings, never a failed pipeline"
 cp data/policies/app.yaml data/policies/adopted.yaml
 sed -i 's/^  id: app$/  id: adopted/; s/^  name: app$/  name: adopted/; /exception:/,/expires:/d' data/policies/adopted.yaml
 python3 -c "import json;json.dump({'version':1,'imported':['data/policies/adopted.yaml'],'sources':[]},open('data/.import-manifest.json','w'))"
-out="$(python3 scripts/validate-data.py 2>&1)"
-check "the same violations in an adopted file are counted as findings, not errors" bash -c '! grep -q "ERROR .*adopted.yaml.*guardrail" <<<"$1" && grep -q "guardrails: [0-9]* finding(s) in rules adopted from NSX, a backlog, never a failed pipeline: " <<<"$1"' _ "$out"
-check "--findings lists them" bash -c 'python3 scripts/validate-data.py --findings 2>&1 | grep -q "^finding  data/policies/adopted.yaml: rules.any-any: guardrail any-any-any"'
+mv data/policies/app.yaml "$SCRATCH/app.yaml" # only the adopted file
+out="$(guard)"
+plan="$(terraform -chdir=guardrails plan -input=false -lock=false -no-color 2>&1)"
+mv "$SCRATCH/app.yaml" data/policies/app.yaml
+check "the same violations in an adopted file are findings, not errors" bash -c '! grep -q "ERROR .*adopted.yaml" <<<"$1" && grep -q "[1-9][0-9]* finding(s) in rules adopted from NSX" <<<"$2"' _ "$out" "$plan"
+check "...listed per guardrail in the plan's findings output" grep -q '"data/policies/adopted.yaml: rules.any-any: guardrail any-any-any' <<<"$plan"
 rm data/policies/adopted.yaml data/.import-manifest.json
 
 echo "the DFW exclusion list"
 mkdir -p data/exclude-list
 printf 'members:\n  legacy:\n    why: an appliance the DFW breaks\n' >data/exclude-list/lon1.yaml
-out="$(python3 scripts/validate-data.py 2>&1)"
+out="$(guard)"
 check "a group excluded from the DFW without an exception is refused" grep -q "ERROR .*data/exclude-list/lon1.yaml: members.legacy: guardrail exclusion-list" <<<"$out"
 printf 'members:\n  legacy:\n    why: an appliance the DFW breaks\n    exception:\n      guardrails: [exclusion-list]\n      owner: net-team\n      ticket: CHG9\n      expires: 2099-01-01\n' >data/exclude-list/lon1.yaml
-check "...accepted with one, owned, tracked and ending" bash -c '! python3 scripts/validate-data.py 2>&1 | grep -q "exclude-list/lon1.yaml"'
+check "...accepted with one, owned, tracked and ending" bash -c '! { guard; python3 scripts/validate-data.py; } 2>&1 | grep -q "exclude-list/lon1.yaml"'
 printf 'members:\n  nope:\n    why: x\n' >data/exclude-list/lon1.yaml
 check "a member that is no group in data/ is an error" bash -c 'python3 scripts/validate-data.py 2>&1 | grep -q "members.nope: no group .nope. in data/"'
 rm -r data/exclude-list
@@ -146,7 +164,7 @@ print(json.dumps({"resource_drift": [{"address": A, "change": {"actions": ["upda
 PY
 }
 out="$(plan_json ALLOW | python3 scripts/plan-guard.py --site lon1 --stack local-security 2>&1)"
-check "a plan putting back what someone changed in NSX is refused, saying what and how to decide" bash -c 'grep -q "would undo a change made in NSX outside this repository: action: NSX has \"DROP\", the plan sets it back to \"ALLOW\"" <<<"$1" && grep -q "scripts/accept-drift.py" <<<"$1" && grep -q "allow-revert.txt" <<<"$1"' _ "$out"
+check "a plan putting back what someone changed in NSX is refused, saying what and how to decide" bash -c 'grep -q "would undo a change made in NSX outside this repository: action: NSX has \"DROP\", the plan sets it back to \"ALLOW\"" <<<"$1" && grep -q "scripts/drift.py accept" <<<"$1" && grep -q "allow-revert.txt" <<<"$1"' _ "$out"
 printf 'lon1 local-security module.policies["app"].nsxt_policy_security_policy_rule.this["ok"]\n' >allow-revert.txt
 check "...allowed once the revert is approved in allow-revert.txt, in the merge request" bash -c 'python3 scripts/plan-guard.py --site lon1 --stack local-security <<<"$1"' _ "$(plan_json ALLOW)"
 rm allow-revert.txt

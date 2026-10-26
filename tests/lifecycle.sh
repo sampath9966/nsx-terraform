@@ -73,6 +73,23 @@ check "no banner once nothing was kept" bash -c '! grep -q ATTENTION <<<"$1"' _ 
 "$UP" --no-converge --no-pull --dir "$A" --check >/dev/null 2>&1
 check "after --overwrite-unknown: up to date" test $? -eq 0
 
+# A release that stops writing two scripts: one untouched here, one changed.
+echo "# my change" >>"$A/scripts/hand-back.py"
+python3 - "$GEN" <<'PY'
+import re, sys
+p = sys.argv[1] + "/scripts/bootstrap.sh"
+s = open(p).read()
+for rel in ("scripts/tag-vm.py", "scripts/hand-back.py"):
+    s = re.sub(r"write_file " + re.escape(rel) + r" <<'SCAFFOLD_EOF'\n.*?\nSCAFFOLD_EOF\n(mark_executable " + re.escape(rel) + r"\n)?", "", s, flags=re.S)
+open(p, "w").write(s)
+PY
+ret_out="$("$UP" --no-converge --no-pull --dir "$A" --yes --summary 2>&1)"
+check "a file the generator no longer writes, unchanged here, is removed (RETIRED)" bash -c 'grep -q "  - scripts/tag-vm.py" <<<"$1" && ! test -e "$2/scripts/tag-vm.py"' _ "$ret_out" "$A"
+check "...backed up first" test -n "$(find "$A/.nsx-update-backup" -name tag-vm.py)"
+check "...and one you changed is kept, and listed" bash -c 'grep -q "  = scripts/hand-back.py" <<<"$1" && test -e "$2/scripts/hand-back.py"' _ "$ret_out" "$A"
+ret_out="$("$UP" --no-converge --no-pull --dir "$A" --check --summary 2>&1)"
+check "...still listed on the next run, and nothing is pending" bash -c 'grep -q "  = scripts/hand-back.py" <<<"$1"' _ "$ret_out"
+
 # Concurrency: hold the lock, a second run must refuse rather than interleave.
 echo "concurrency"
 (

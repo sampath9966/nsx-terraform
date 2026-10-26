@@ -18,7 +18,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-      - name: Run offline tests (also as a CI image without PyYAML reads YAML)
+      - uses: hashicorp/setup-terraform@v3 # the guardrails are a Terraform root
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+      - name: Run offline tests
         run: tests/run.sh
 
   provider:

@@ -123,18 +123,16 @@ check "a system-owned policy is refused" bash -c '! python3 scripts/import-estat
 
 echo "importer: reading a large estate"
 check "capture follows the API cursor across pages" python3 - <<'PY'
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location("imp", "scripts/import-estate.py")
-m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-calls = []
-def fake(host, path, *a):
-    calls.append(path)
+import sys
+sys.path.insert(0, "scripts")
+from nsxlib.nsx import Client, LM_BASE
+def fake(self, path, missing_ok=False):
     if path.endswith("/groups"): return {"results": [{"id": "a"}], "cursor": "c1"}
     if "cursor=c1" in path: return {"results": [{"id": "b"}], "cursor": "c2"}
     if "cursor=c2" in path: return {"results": [{"id": "c"}]}
     return {"results": []}
-m.api_get = fake
-estate = m.fetch_estate("h", "u", "p", "/policy/api/v1/infra", "default", False)
+Client.get = fake
+estate = Client("lon1", "h", "u", "p")._read_paged(LM_BASE, "default")
 sys.exit(0 if [g["id"] for g in estate["groups"]] == ["a", "b", "c"] else 1)
 PY
 
@@ -186,7 +184,7 @@ adopt() { env -u SSL_CERT_FILE -u NSX_CA_FILE NSX_CA_FILE_LON1="$SCRATCH/mine-ca
 	NSX_ADOPT_REMOTE="$SCRATCH/remote.git" NSX_ADOPT_TOKEN=SECRET-ADOPT-TOKEN CI_API_V4_URL="http://127.0.0.1:$api_port/api/v4" \
 	CI_PROJECT_ID=7 CI_DEFAULT_BRANCH=main ADOPT_SITE=lon1 "$@" scripts/adopt.sh 2>&1; }
 out="$(adopt)"
-check "a survey lists the policies and their status" bash -c 'grep -q "policy/policies on lon1" <<<"$1" && grep -q "fresh-app" <<<"$1" && grep -q "not adoptable: Apply To uses Mac" <<<"$1"' _ "$out"
+check "a survey lists the policies and their status" bash -c 'grep -q "policy/policies on lon1" <<<"$1" && grep -q "fresh-app" <<<"$1" && grep -q "not adoptable: its Apply To uses Mac" <<<"$1"' _ "$out"
 check "...and changes nothing" bash -c '[ -z "$(git status --porcelain)" ] && [ "$(git -C "$1" branch --list "adopt/*")" = "" ]' _ "$SCRATCH/remote.git"
 out="$(adopt ADOPT_POLICY=fresh-app)"
 check "an adoption pushes a branch adopt/<site>-<tranche>" git -C "$SCRATCH/remote.git" rev-parse -q --verify refs/heads/adopt/lon1-fresh-app
@@ -690,13 +688,14 @@ check "the policy module takes an address in a rule without looking it up as a g
 cp data/policies/g-pol.yaml "$SCRATCH/g-pol.yaml"
 cp data/groups/imported-gm1-mirror.yaml "$SCRATCH/gm1-groups.yaml"
 python3 - <<'PY'
-import importlib.util, yaml
-spec = importlib.util.spec_from_file_location("ie", "scripts/import-estate.py"); ie = importlib.util.module_from_spec(spec); spec.loader.exec_module(ie)
+import sys, yaml
+sys.path.insert(0, "scripts")
+from nsxlib.yamlio import to_yaml
 # Written as the repository writes YAML, so any of its readers takes it.
 d = yaml.safe_load(open("data/policies/g-pol.yaml")); d["rules"]["ips"]["scope"] = ["10.9.9.9"]
-open("data/policies/g-pol.yaml", "w").write(ie.to_yaml(d))
+open("data/policies/g-pol.yaml", "w").write(to_yaml(d))
 d = yaml.safe_load(open("data/groups/imported-gm1-mirror.yaml")); del d["groups"]["VM-Jump"]["criteria"][0]["member_type"]
-open("data/groups/imported-gm1-mirror.yaml", "w").write(ie.to_yaml(d))
+open("data/groups/imported-gm1-mirror.yaml", "w").write(to_yaml(d))
 PY
 out="$(python3 scripts/validate-data.py 2>&1)"
 check "an address in an Apply To is refused, and says where addresses are allowed" grep -q "not in its Apply To" <<<"$out"
@@ -738,37 +737,40 @@ d["groups"] += groups; d["services"] += svc; d["policies"] += [pol("CSS"), pol("
 json.dump(d, open("reports/gm1.json", "w"))
 PY
 out="$(mir gm1)"
-check "names NSX allows (quotes, commas, a leading '-', a number, ': ') are written as YAML both parsers read the same" python3 - <<'PY'
-import glob, os, sys, yaml
-sys.path.insert(0, "scripts")
-os.environ["NSX_YAML_FALLBACK"] = "1"
-from yamlcompat import load_yaml
-bad = [f for f in glob.glob("data/*/*.yaml") if yaml.safe_load(open(f)) != load_yaml(open(f).read())]
+check "names NSX allows (quotes, commas, a leading '-', a number, ': ', y/n) read the same in PyYAML and Terraform" python3 - <<'PY'
+import glob, json, shutil, subprocess, sys, yaml
+files = sorted(glob.glob("data/*/*.yaml"))
+if not shutil.which("terraform"):
+    sys.exit(0)  # the provider suite reads them with Terraform too
+expr = "jsonencode({" + ", ".join(f'"{f}" = yamldecode(file("{f}"))' for f in files) + "})"
+out = subprocess.run(["terraform", "console"], input=expr, capture_output=True, text=True, check=True).stdout
+tf = json.loads(json.loads(out))
+bad = [f for f in files if json.loads(json.dumps(yaml.safe_load(open(f)), default=str)) != tf[f]]
 print(bad, file=sys.stderr)
 sys.exit(1 if bad else 0)
 PY
 check "...the odd names reach the copy intact" python3 -c "import yaml,sys;g=yaml.safe_load(open('data/groups/imported-gm1-mirror.yaml'))['groups'];sys.exit(0 if {\"Azure-AD-IP's\",'100','-lead','a,b [c]','say \"hi\"','back\\\\slash','#hash','@at','x: y','n','Y'} <= set(g) and g['100']['description']=='line one\nline \'two\'\ttab' else 1)"
-check "two policies NSX holds under one display name are both taken, and validate without PyYAML too" bash -c 'test -f data/policies/CSS.yaml && test -f data/policies/CSS-LbTAAIz-d.yaml && ! NSX_YAML_FALLBACK=1 python3 scripts/validate-data.py 2>&1 | grep -q "^ERROR"'
+check "two policies NSX holds under one display name are both taken, and validate" bash -c 'test -f data/policies/CSS.yaml && test -f data/policies/CSS-LbTAAIz-d.yaml && ! python3 scripts/validate-data.py 2>&1 | grep -q "^ERROR"'
 check "imported rules' sequence numbers are taken as they are, without a warning each" bash -c '! python3 scripts/validate-data.py 2>&1 | grep -q "CSS.yaml.*not a multiple of 100"'
 check "...and validate: an adopted object keeps its own id" bash -c '! python3 scripts/validate-data.py 2>&1 | grep -q "^ERROR"'
 printf 'groups:\n  _new one:\n    display_name: x\n    owner: gm\n    criteria:\n      - conditions:\n          - {key: Tag, member_type: VirtualMachine, operator: EQUALS, value: "app|x"}\n' >data/groups/authored.yaml
 check "a new object written here is still held to letters, digits, '.', '_' and '-'" bash -c 'python3 scripts/validate-data.py 2>&1 | grep -q "a new object.s id is letters, digits"'
 rm data/groups/authored.yaml
 python3 - <<'PY'
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location("ie", "scripts/import-estate.py"); ie = importlib.util.module_from_spec(spec); spec.loader.exec_module(ie)
+import sys
+sys.path.insert(0, "scripts")
+from nsxlib.nsx import GM_BASE, LM_BASE, Client
 calls = []
-def fake(host, path, *a):
+def fake(self, path, missing_ok=False):
     calls.append(path)
     if path.endswith("/global-infra/domains"): return {"results": [{"id": "default"}, {"id": "WL-Mum"}]}
     if path.endswith("/groups"): return {"results": [{"id": "g", "path": path + "/g"}]}
     return {"results": []}
-ie.api_get = fake
-sys.stderr = open("/dev/null", "w")
-e = ie.fetch_estate("h", "u", "p", ie.GM_BASE, "default", False)
+Client.get = fake
+e = Client("gm1", "h", "u", "p")._read_paged(GM_BASE, "default")
 ok = e["domains"] == ["default", "WL-Mum"] and len(e["groups"]) == 2 and any("/domains/WL-Mum/security-policies" in c for c in calls)
 calls.clear()
-e = ie.fetch_estate("h", "u", "p", ie.LM_BASE, "default", False)
+e = Client("lon1", "h", "u", "p")._read_paged(LM_BASE, "default")
 ok = ok and e["domains"] == ["default"] and not any(c.endswith("/domains") for c in calls)
 sys.exit(0 if ok else 1)
 PY
@@ -846,9 +848,8 @@ check "fields at their unset value, and known metadata, block nothing" bash -c '
 check "who creates what is reported, with the verdict" bash -c 'grep -q "who creates what on own1" <<<"$1" && grep -q "wcp-cluster-user-x .* owned elsewhere" <<<"$1"' _ "$out"
 check "the DFW exclusion list is taken: groups by their keys, another tool's by reference" bash -c 'python3 -c "import yaml,sys;d=yaml.safe_load(open(\"data/exclude-list/own1.yaml\"));sys.exit(0 if set(d[\"members\"])=={\"plain-id\",\"tkg-ns-1\"} else 1)" && grep -q "nsxt_policy_firewall_exclude_list_member.this\[each.key\]" stacks/local-security/import-own1-mirror.tf'
 check "...a member that is not a group, or whose group is not taken, stays in the UI, and says why" bash -c 'grep -q "NOT ADOPTED  exclusion-list member /infra/segments/seg1: not a group" <<<"$1" && grep -q "NOT ADOPTED  exclusion-list member odd-field: its group is not adopted" <<<"$1"' _ "$out"
-check "...and as adopted, its members are findings of the exclusion-list guardrail, not errors" bash -c 'python3 scripts/validate-data.py --findings 2>&1 | grep -q "^finding  data/exclude-list/own1.yaml: members.plain-id: guardrail exclusion-list"'
+check "...and as adopted, its members are findings of the exclusion-list guardrail, not errors" bash -c 'command -v terraform >/dev/null || exit 0; terraform -chdir=guardrails init -backend=false >/dev/null && terraform -chdir=guardrails plan -lock=false -no-color 2>&1 | grep -q "\"data/exclude-list/own1.yaml: members.plain-id: guardrail exclusion-list"'
 check "it validates, references included" python3 scripts/validate-data.py
-check "...and without PyYAML" bash -c '! NSX_YAML_FALLBACK=1 NSX_YAML_NO_TERRAFORM=1 python3 scripts/validate-data.py 2>&1 | grep -q "^ERROR"'
 check "the stacks resolve references by NSX id and never manage them" bash -c 'grep -q "reference_paths" stacks/local-security/main.tf && grep -q "reference_paths" stacks/global-security/main.tf && grep -q "nsx_id       = try(each.value.nsx_id, each.key)" modules/dfw-policy/main.tf'
 before="$(cat data/groups/*.yaml data/policies/*.yaml stacks/*/import-*.tf | sha256sum)"
 python3 - <<'PY'

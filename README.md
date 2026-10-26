@@ -146,7 +146,7 @@ instance, not a production one.
 
 The per-manager jobs come from `inventory/managers.yaml`, so adding an eleventh
 Local Manager stays a data change. GitLab and GitHub read the same
-`scripts/ci_matrix_lib.py` and cannot drift apart.
+`scripts/nsxlib/inventory.py` and cannot drift apart.
 
 ## Why the state is split five ways
 
